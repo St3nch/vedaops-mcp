@@ -17,7 +17,7 @@ The MCP is not a general shell, workflow database, GitHub replacement, project P
 
 ## MCP-01 read/orientation plane
 
-This repository currently implements the MCP-01 foundation: a stdio MCP server that can start deterministically, identify the running instance and authenticated principal, load operator policy from outside managed project roots, apply project-manifest narrowing, and expose bounded project/Git reads.
+This repository currently implements the MCP-01 foundation: a stdio MCP server that can start deterministically, identify the running instance, bind to a launcher-configured principal, load operator policy from outside managed project roots, apply project-manifest narrowing, and expose bounded project/Git reads.
 
 It does not execute project code, accept caller-selected commands, mutate repositories, push, talk to GitHub, or replace the live `linux-vedaops-mcp` control plane.
 
@@ -29,7 +29,9 @@ export VEDAOPS_PROJECTS_REGISTRY=/absolute/path/to/projects.toml
 uv run vedaops-mcp stdio
 ```
 
-A declared principal must exist in operator policy. Effective permission is the intersection of that principal's grant, the operator project ceiling, and the untrusted project manifest.
+The trusted launcher sets `VEDAOPS_AGENT_ID`. That binds this MCP process to a configured principal in operator policy. MCP-01 does not independently cryptographically authenticate the human or model behind the launcher.
+
+A configured principal must exist in operator policy. Effective permission is the intersection of that principal's grant, the operator project ceiling, and the untrusted project manifest.
 
 ## Development principle
 

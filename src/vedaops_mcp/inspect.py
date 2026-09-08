@@ -298,8 +298,7 @@ def project_search(
 ) -> ProjectSearchResult:
     """Search tracked and unignored UTF-8 files for literal text."""
     project = _readable_project(registry_path, principal_id, project_id)
-    normalized_query = query.strip() if isinstance(query, str) else ""
-    if not normalized_query or len(normalized_query.encode()) > 4096:
+    if not isinstance(query, str) or not query or len(query.encode()) > 4096:
         raise PolicyError("VEDAOPS_INVALID_ARGUMENT", "query must contain 1..4096 bytes")
     if (
         not isinstance(max_results, int)
@@ -356,7 +355,7 @@ def project_search(
             continue
         files_searched += 1
         for line_number, line in enumerate(content.splitlines(), start=1):
-            if normalized_query not in line:
+            if query not in line:
                 continue
             encoded = line.encode()
             clipped = encoded[:MAX_SEARCH_LINE_BYTES]
@@ -381,7 +380,7 @@ def project_search(
     return ProjectSearchResult(
         project_id=project.id,
         workspace_id=project.workspace_id,
-        query=normalized_query,
+        query=query,
         matches=matches,
         returned_count=len(matches),
         files_searched=files_searched,

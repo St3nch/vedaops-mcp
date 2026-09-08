@@ -84,6 +84,41 @@ def test_search_is_literal_and_bounded(tmp_path: Path):
     assert empty.truncated is False
 
 
+def test_search_preserves_leading_and_trailing_spaces_in_the_query(tmp_path: Path):
+    root = tmp_path / "project"
+    init_project(root, files={"notes.txt": "hello world\nxx hello yy\n"})
+    registry = write_registry(tmp_path / "projects.toml", root=root)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_INVALID_ARGUMENT"):
+        project_search(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            query="",
+        )
+
+    literal = project_search(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        query=" hello ",
+    )
+    assert literal.query == " hello "
+    assert literal.returned_count == 1
+    assert literal.matches[0].path == "notes.txt"
+    assert literal.matches[0].line == 2
+    assert "xx hello yy" in literal.matches[0].text
+
+    unpadded = project_search(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        query="hello",
+    )
+    assert unpadded.query == "hello"
+    assert unpadded.returned_count >= 2
+
+
 def test_tree_truncation_flag(tmp_path: Path):
     root = tmp_path / "project"
     files = {f"src/file{i:02d}.txt": f"n={i}\n" for i in range(8)}

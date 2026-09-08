@@ -118,7 +118,12 @@ def normalize_relative(value: str, *, allow_root: bool = False) -> str:
     """Return a normalized POSIX-relative project path, or refuse it."""
     if not isinstance(value, str):
         raise PolicyError("VEDAOPS_PATH_INVALID", "path must be a string")
-    normalized = value.strip()
+    if value != value.strip():
+        raise PolicyError(
+            "VEDAOPS_PATH_INVALID",
+            "path must not have leading or trailing whitespace",
+        )
+    normalized = value
     if allow_root and normalized in {"", "."}:
         return ""
     if not normalized or len(normalized) > MAX_RELATIVE_PATH_CHARS:
@@ -260,7 +265,12 @@ def ensure_git_repository(root: Path) -> None:
 
 
 def ensure_safe_local_git_config(root: Path) -> None:
-    """Refuse repository-local Git configuration outside a strict inert allowlist."""
+    """Refuse repository-local Git configuration outside a strict inert allowlist.
+
+    Inspection uses ``--no-includes``. Include and includeIf keys fail closed so
+    a managed repository cannot point Git at operator configuration outside the
+    root.
+    """
     ensure_git_repository(root)
     config_path = root / ".git" / "config"
     try:
@@ -282,7 +292,7 @@ def ensure_safe_local_git_config(root: Path) -> None:
                 root,
                 "config",
                 "--local",
-                "--includes",
+                "--no-includes",
                 "--null",
                 "--name-only",
                 "--list",
@@ -445,6 +455,13 @@ def _git_command(root: Path, *args: str) -> list[str]:
 
 
 def _safe_local_git_config_key(key: str) -> bool:
+    if (
+        key == "include"
+        or key == "includeif"
+        or key.startswith("include.")
+        or key.startswith("includeif.")
+    ):
+        return False
     if key in SAFE_LOCAL_GIT_CONFIG_KEYS:
         return True
     parts = key.split(".")

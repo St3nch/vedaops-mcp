@@ -84,7 +84,7 @@ class Settings:
 
 
 def validate_principal_id(value: object, *, source: str) -> str:
-    """Validate one declared agent identity."""
+    """Validate one launcher-configured principal identity."""
     if not isinstance(value, str):
         raise IdentityError("VEDAOPS_IDENTITY_INVALID", f"{source} must be a string")
     normalized = value.strip()
@@ -106,7 +106,7 @@ def _required_principal_id() -> str:
     if value is None or not str(value).strip():
         raise IdentityError(
             "VEDAOPS_IDENTITY_UNAVAILABLE",
-            f"{AGENT_ID_ENVIRONMENT_VARIABLE} must name the authenticated principal",
+            f"{AGENT_ID_ENVIRONMENT_VARIABLE} must name the launcher-configured principal",
         )
     return validate_principal_id(value, source=AGENT_ID_ENVIRONMENT_VARIABLE)
 

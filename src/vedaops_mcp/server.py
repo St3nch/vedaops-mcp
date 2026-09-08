@@ -136,16 +136,18 @@ def build_server(settings: Settings) -> FastMCP:
         name=SERVER_NAME,
         version=package_version(),
         instructions=(
-            "VedaOps MCP-01 read/orientation plane. Identify the authenticated "
-            "principal, registered project/workspace, effective permissions, and "
-            "bounded repository/Git facts. This server does not execute project "
-            "code, run a general shell, or perform mutations."
+            "VedaOps MCP-01 read/orientation plane. The trusted launcher binds "
+            "this process to a configured principal via VEDAOPS_AGENT_ID. Identify "
+            "that principal, registered project/workspace, effective permissions, "
+            "and bounded repository/Git facts. This server does not independently "
+            "cryptographically authenticate the human or model behind the launcher, "
+            "execute project code, run a general shell, or perform mutations."
         ),
     )
 
     @mcp.tool(name="vedaops_server_info", annotations=READ_ONLY)
     async def vedaops_server_info_tool(ctx: Context) -> ServerInfo:
-        """Report this server instance, loaded policy, tool catalog, and principal grants."""
+        """Report instance, policy, tool catalog, and launcher-configured principal grants."""
         client_params = ctx.session.client_params
         requested_version = str(client_params.protocolVersion) if client_params else None
         protocol_value = (
@@ -257,7 +259,7 @@ def build_server(settings: Settings) -> FastMCP:
         file_pattern: str = "*",
         max_results: int = 100,
     ) -> ProjectSearchResult:
-        """Search bounded project files for literal text."""
+        """Search bounded project files for the exact literal query text."""
         with _stable_errors():
             return await asyncio.to_thread(
                 project_search,

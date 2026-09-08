@@ -1,6 +1,10 @@
 # MCP-02 — Restricted Development Check Runner
 
-Status: independent review reconciled; follow-up exact-revision review pending Product acceptance.
+Status: Product accepted by CHAZ on 2026-09-08.
+
+Accepted candidate: `02252c503ae0a37fdbe71deba9da5526f99fcd1e`
+
+Independent follow-up verdict: `READY WITH NON-BLOCKING NOTES`; no acceptance blockers remain.
 
 ## Problem
 

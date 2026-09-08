@@ -1,6 +1,6 @@
 """Restricted execution of operator-approved project checks.
 
-MCP-02 executes only exact commit snapshots and only operator-defined argv.
+MCP-02 executes only commit-derived snapshots and only operator-defined argv.
 Project code runs inside a Linux bubblewrap namespace with no operator home,
 controller configuration, other projects, Docker socket, SSH agent, or network.
 """
@@ -82,7 +82,7 @@ def project_check_run(
     check_id: str,
     timeout_seconds: int | None = None,
 ) -> CheckRunResult:
-    """Run one operator-approved check against one exact disposable commit snapshot."""
+    """Run one operator-approved check against one bounded commit-derived snapshot."""
     project, check = get_authorized_check(
         registry_path,
         principal_id=principal_id,

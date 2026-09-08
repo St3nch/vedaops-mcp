@@ -33,7 +33,7 @@ The trusted launcher sets `VEDAOPS_AGENT_ID`. That binds this MCP process to a c
 
 MCP-02 adds one execution surface: `project_check_run`. Callers select only an operator-approved check ID, an exact current Git HEAD, and optionally a shorter timeout. They cannot supply argv.
 
-The runner materializes the exact commit into a disposable snapshot and executes it under the `linux-bwrap-v1` profile with network denied, a synthetic home, no controller or SSH environment, no other project mounts, no Docker socket, bounded process resources/output, and explicit cleanup evidence. Dirty and untracked working-tree content is excluded from the exercised subject.
+The runner materializes a bounded snapshot directly from Git tree/blob objects and executes it under the `linux-bwrap-v1` profile with network denied, a synthetic home, no controller or SSH environment, no other project mounts, no Docker socket, bounded process resources/output, and explicit cleanup evidence. The receipt reports `exact_commit_snapshot` only when every supported commit entry was materialized; otherwise it reports explicit exclusions. Dirty and untracked working-tree content is never part of the exercised commit subject.
 
 Effective permission is the intersection of the principal grant, operator project ceiling, project-manifest narrowing, and operation-specific restrictions.
 

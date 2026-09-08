@@ -148,7 +148,7 @@ def build_server(settings: Settings) -> FastMCP:
             "launcher binds this process to a configured principal via VEDAOPS_AGENT_ID. "
             "Identify that principal, registered project/workspace, effective permissions, "
             "available check IDs, and bounded repository/Git facts. Project code executes "
-            "only through operator-approved checks in an isolated exact-commit sandbox. "
+            "only through operator-approved checks in an isolated commit-derived sandbox. "
             "This server does not independently cryptographically authenticate the human "
             "or model behind the launcher, run a general shell, or mutate source workspaces."
         ),
@@ -318,7 +318,7 @@ def build_server(settings: Settings) -> FastMCP:
         check_id: str,
         timeout_seconds: int | None = None,
     ) -> CheckRunResult:
-        """Run one operator-approved check in the restricted exact-commit sandbox."""
+        """Run one operator-approved check in the restricted commit-derived sandbox."""
         with _stable_errors():
             return await asyncio.to_thread(
                 project_check_run,

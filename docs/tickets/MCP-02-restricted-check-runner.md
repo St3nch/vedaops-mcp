@@ -1,6 +1,6 @@
 # MCP-02 — Restricted Development Check Runner
 
-Status: commissioned by CHAZ after MCP-01 acceptance; implementation candidate in progress.
+Status: implementation candidate complete; exact-revision independent review pending Product acceptance.
 
 ## Problem
 

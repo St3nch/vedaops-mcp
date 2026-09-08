@@ -25,7 +25,13 @@ from pydantic import BaseModel, ConfigDict
 
 from vedaops_mcp.authority import Limitation, RegisteredCheck, get_authorized_check
 from vedaops_mcp.errors import AuthorityError, PolicyError
-from vedaops_mcp.policy import normalize_relative, protected_reason, run_git_bytes, run_git_text
+from vedaops_mcp.policy import (
+    normalize_relative,
+    protected_reason,
+    read_git_blobs_batch,
+    run_git_bytes,
+    run_git_text,
+)
 
 RUNNER_PROFILE = "linux-bwrap-v1"
 BWRAP_PATH = Path("/usr/bin/bwrap")
@@ -38,8 +44,8 @@ MAX_SNAPSHOT_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_CAPTURE_BYTES = 1024 * 1024
 MAX_RETURN_BYTES = 128 * 1024
 MAX_FILE_SIZE_LIMIT = 32 * 1024 * 1024
-MAX_CHECK_PROCESSES = 8
 PROCESS_GRACE_SECONDS = 2.0
+SUBJECT_CAPTURE_TIMEOUT_SECONDS = 30
 
 
 class CheckRunResult(BaseModel):
@@ -152,7 +158,9 @@ def project_check_run(
                 exit_code = process.wait(timeout=effective_timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                _terminate_process(process)
+                if not _terminate_process(process):
+                    uncertain_effects = True
+                    _append_termination_limitation(limitations)
                 exit_code = process.returncode
             duration_ms = max(0, int((time.monotonic() - started) * 1000))
             stdout, stdout_truncated = _read_output(stdout_file)
@@ -165,8 +173,9 @@ def project_check_run(
         else:
             outcome = "failed"
     finally:
-        if process is not None and process.poll() is None:
-            _terminate_process(process)
+        if process is not None and process.poll() is None and not _terminate_process(process):
+            uncertain_effects = True
+            _append_termination_limitation(limitations)
         try:
             shutil.rmtree(snapshot_dir)
         except OSError:
@@ -293,12 +302,12 @@ def _materialize_snapshot(
     destination: Path,
 ) -> tuple[str, int, list[str]]:
     digest = hashlib.sha256()
-    files = 0
     total_bytes = 0
     excluded = 0
     exclusion_kinds: set[str] = {"working_tree_and_untracked_changes"}
+    materialized: list[tuple[str, str, str]] = []
     for mode, object_type, object_id, raw_path in _tree_entries(tree_listing):
-        if files >= MAX_SNAPSHOT_FILES:
+        if len(materialized) >= MAX_SNAPSHOT_FILES:
             raise PolicyError(
                 "VEDAOPS_CHECK_SUBJECT_TOO_LARGE",
                 f"check snapshot exceeds {MAX_SNAPSHOT_FILES} files",
@@ -322,22 +331,23 @@ def _materialize_snapshot(
             else:
                 exclusion_kinds.add("unsupported_git_entries")
             continue
-        try:
-            content = run_git_bytes(
-                root,
-                "cat-file",
-                "blob",
-                object_id,
-                limit_bytes=MAX_SNAPSHOT_FILE_BYTES,
-                timeout_seconds=10,
-            )
-        except PolicyError as exc:
-            if exc.code == "VEDAOPS_GIT_OUTPUT_TOO_LARGE":
-                raise PolicyError(
-                    "VEDAOPS_CHECK_SUBJECT_TOO_LARGE",
-                    f"check snapshot file {relative!r} exceeds the per-file bound",
-                ) from exc
-            raise
+        materialized.append((relative, mode, object_id))
+
+    try:
+        blobs = read_git_blobs_batch(
+            root,
+            [object_id for _relative, _mode, object_id in materialized],
+            max_blob_bytes=MAX_SNAPSHOT_FILE_BYTES,
+            max_batch_bytes=MAX_SNAPSHOT_TOTAL_BYTES,
+            timeout_seconds=SUBJECT_CAPTURE_TIMEOUT_SECONDS,
+        )
+    except PolicyError as exc:
+        if exc.code == "VEDAOPS_GIT_OUTPUT_TOO_LARGE":
+            raise PolicyError("VEDAOPS_CHECK_SUBJECT_TOO_LARGE", exc.detail) from exc
+        raise
+
+    for relative, mode, object_id in materialized:
+        content = blobs[object_id]
         total_bytes += len(content)
         if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES:
             raise PolicyError(
@@ -356,7 +366,6 @@ def _materialize_snapshot(
         digest.update(mode_bytes)
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
-        files += 1
     return digest.hexdigest(), excluded, sorted(exclusion_kinds)
 
 
@@ -374,6 +383,10 @@ def _sandbox_argv(
         "--die-with-parent",
         "--new-session",
         "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--hostname",
+        "vedaops-check",
         "--ro-bind",
         "/usr",
         "/usr",
@@ -427,7 +440,6 @@ def _sandbox_argv(
             "--",
             str(prlimit),
             f"--as={memory_bytes}",
-            f"--nproc={MAX_CHECK_PROCESSES}",
             "--nofile=256",
             f"--fsize={MAX_FILE_SIZE_LIMIT}",
             f"--cpu={timeout_seconds + 2}",
@@ -439,24 +451,36 @@ def _sandbox_argv(
     return command
 
 
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+def _terminate_process(process: subprocess.Popen[bytes]) -> bool:
     if process.poll() is not None:
-        return
+        return True
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
+        return process.poll() is not None
     try:
         process.wait(timeout=PROCESS_GRACE_SECONDS)
-        return
+        return True
     except subprocess.TimeoutExpired:
         pass
     with suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
     try:
         process.wait(timeout=PROCESS_GRACE_SECONDS)
+        return True
     except subprocess.TimeoutExpired:
+        return process.poll() is not None
+
+
+def _append_termination_limitation(limitations: list[Limitation]) -> None:
+    if any(item.code == "VEDAOPS_CHECK_TERMINATION_UNCERTAIN" for item in limitations):
         return
+    limitations.append(
+        Limitation(
+            code="VEDAOPS_CHECK_TERMINATION_UNCERTAIN",
+            detail="the sandbox process could not be conclusively reaped after termination",
+        )
+    )
 
 
 def _read_output(handle) -> tuple[str, bool]:

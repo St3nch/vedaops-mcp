@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from support import init_project, write_registry
+from support import git, init_project, write_registry
 
 from vedaops_mcp.checks import project_check_run
 from vedaops_mcp.errors import AuthorityError, PolicyError
@@ -151,6 +151,62 @@ def test_commit_capture_ignores_git_archive_export_attributes(tmp_path: Path):
     assert result.outcome == "passed", result.stderr
     assert result.stdout.strip() == "$Format:%H$"
     assert result.subject_kind == "exact_commit_snapshot"
+
+
+@pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
+def test_commit_capture_ignores_git_replace_refs(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(
+        root,
+        capabilities=("read", "check"),
+        files={
+            "check.py": 'print("MALICIOUS")\n',
+            "clean.py": 'print("CLEAN")\n',
+        },
+    )
+    malicious_blob = git(root, "rev-parse", f"{head}:check.py")
+    clean_blob = git(root, "rev-parse", f"{head}:clean.py")
+    git(root, "replace", malicious_blob, clean_blob)
+    registry = _registry_with_check(tmp_path, root)
+
+    result = project_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="isolation",
+    )
+
+    assert result.outcome == "passed", result.stderr
+    assert result.stdout.strip() == "MALICIOUS"
+    assert result.subject_kind == "exact_commit_snapshot"
+    assert result.captured_commit == head
+
+
+@pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
+def test_sandbox_allows_normal_child_process_creation(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(root, capabilities=("read", "check"))
+    registry = _registry_with_check(
+        tmp_path,
+        root,
+        check_id="spawn",
+        argv=(
+            "/usr/bin/python3",
+            "-c",
+            "import subprocess; subprocess.run(['/usr/bin/python3','-c','print(42)'], check=True)",
+        ),
+    )
+
+    result = project_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="spawn",
+    )
+    assert result.outcome == "passed", result.stderr
+    assert result.stdout.strip() == "42"
 
 
 def test_caller_cannot_select_an_unapproved_check(tmp_path: Path):

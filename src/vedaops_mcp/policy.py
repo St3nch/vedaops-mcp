@@ -12,6 +12,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 
 from vedaops_mcp.errors import PolicyError
@@ -365,6 +366,7 @@ def git_environment() -> dict[str, str]:
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_PAGER"] = "cat"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     return environment
 
 
@@ -419,6 +421,91 @@ def run_git_text(root: Path, *args: str, allow_exit_1: bool = False) -> str:
         raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git output was not UTF-8") from exc
 
 
+def read_git_blobs_batch(
+    root: Path,
+    object_ids: list[str],
+    *,
+    max_blob_bytes: int,
+    max_batch_bytes: int,
+    timeout_seconds: int,
+) -> dict[str, bytes]:
+    """Read exact Git blobs in two bounded batch calls with replacement refs disabled."""
+    unique_ids = list(dict.fromkeys(object_ids))
+    if not unique_ids:
+        return {}
+    request = b"".join(object_id.encode("ascii") + b"\n" for object_id in unique_ids)
+    deadline = time.monotonic() + timeout_seconds
+
+    def _run(*args: str) -> bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob capture timed out")
+        try:
+            ensure_safe_local_git_config(root)
+            completed = subprocess.run(
+                _git_command(root, *args),
+                input=request,
+                capture_output=True,
+                timeout=remaining,
+                check=False,
+                shell=False,
+                env=git_environment(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob capture failed") from exc
+        if completed.returncode != 0:
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob capture failed")
+        return completed.stdout
+
+    checked = _run("cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+    lines = checked.splitlines()
+    if len(lines) != len(unique_ids):
+        raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob metadata was malformed")
+    total = 0
+    expected_sizes: dict[str, int] = {}
+    for requested, line in zip(unique_ids, lines, strict=True):
+        try:
+            actual, object_type, raw_size = line.decode("ascii").split(" ", 2)
+            size = int(raw_size)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob metadata was malformed") from exc
+        if actual != requested or object_type != "blob" or size < 0:
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob metadata was malformed")
+        if size > max_blob_bytes:
+            raise PolicyError("VEDAOPS_GIT_OUTPUT_TOO_LARGE", "Git blob exceeded the hard limit")
+        total += size
+        if total > max_batch_bytes:
+            raise PolicyError(
+                "VEDAOPS_GIT_OUTPUT_TOO_LARGE",
+                "Git blob batch exceeded the hard limit",
+            )
+        expected_sizes[requested] = size
+
+    raw = _run("cat-file", "--batch")
+    cursor = 0
+    result: dict[str, bytes] = {}
+    for requested in unique_ids:
+        newline = raw.find(b"\n", cursor)
+        if newline < 0:
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob batch was malformed")
+        try:
+            actual, object_type, raw_size = raw[cursor:newline].decode("ascii").split(" ", 2)
+            size = int(raw_size)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob batch was malformed") from exc
+        if actual != requested or object_type != "blob" or size != expected_sizes[requested]:
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob batch was malformed")
+        start = newline + 1
+        end = start + size
+        if end >= len(raw) or raw[end : end + 1] != b"\n":
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob batch was malformed")
+        result[requested] = raw[start:end]
+        cursor = end + 1
+    if cursor != len(raw):
+        raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git blob batch was malformed")
+    return result
+
+
 def decode_bounded_utf8(raw: bytes, *, may_end_mid_codepoint: bool) -> tuple[str, int]:
     """Decode bytes as UTF-8, trimming at most three trailing partial bytes."""
     candidate = raw
@@ -447,7 +534,7 @@ def bounded_text(raw: bytes, limit: int) -> tuple[str, int, bool]:
 
 
 def _git_command(root: Path, *args: str) -> list[str]:
-    command = ["git", "-C", str(root)]
+    command = ["git", "--no-replace-objects", "-C", str(root)]
     for key, value in GIT_CONFIG_OVERRIDES:
         command.extend(["-c", f"{key}={value}"])
     command.extend(args)

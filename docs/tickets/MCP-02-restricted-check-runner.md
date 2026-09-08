@@ -1,6 +1,6 @@
 # MCP-02 — Restricted Development Check Runner
 
-Status: implementation candidate complete; exact-revision independent review pending Product acceptance.
+Status: independent review reconciled; follow-up exact-revision review pending Product acceptance.
 
 ## Problem
 

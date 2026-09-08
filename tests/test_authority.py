@@ -265,3 +265,45 @@ def test_check_capability_resolves_only_operator_defined_checks(tmp_path: Path):
         get_authorized_check(
             registry, principal_id="test-agent", project_id="example", check_id="missing"
         )
+
+
+def test_check_capability_can_be_denied_by_principal_grant(tmp_path: Path):
+    root = tmp_path / "project"
+    init_project(root, capabilities=("read", "check"))
+    registry = write_registry(
+        tmp_path / "projects.toml",
+        root=root,
+        capabilities=("read", "check"),
+        principal_capabilities=("read",),
+        checks_toml=(
+            "\n[[projects.checks]]\n"
+            "id = 'syntax'\n"
+            "argv = ['/usr/bin/python3', '-m', 'compileall', '-q', 'src']\n"
+        ),
+    )
+
+    with pytest.raises(AuthorityError, match="VEDAOPS_CAPABILITY_DENIED"):
+        get_authorized_check(
+            registry, principal_id="test-agent", project_id="example", check_id="syntax"
+        )
+
+
+def test_check_capability_can_be_denied_by_project_manifest(tmp_path: Path):
+    root = tmp_path / "project"
+    init_project(root, capabilities=("read",))
+    registry = write_registry(
+        tmp_path / "projects.toml",
+        root=root,
+        capabilities=("read", "check"),
+        principal_capabilities=("read", "check"),
+        checks_toml=(
+            "\n[[projects.checks]]\n"
+            "id = 'syntax'\n"
+            "argv = ['/usr/bin/python3', '-m', 'compileall', '-q', 'src']\n"
+        ),
+    )
+
+    with pytest.raises(AuthorityError, match="VEDAOPS_CAPABILITY_DENIED"):
+        get_authorized_check(
+            registry, principal_id="test-agent", project_id="example", check_id="syntax"
+        )

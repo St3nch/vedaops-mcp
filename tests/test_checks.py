@@ -127,6 +127,32 @@ def test_check_executes_commit_snapshot_not_dirty_working_tree(tmp_path: Path):
     assert "dirty" not in result.stdout
 
 
+@pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
+def test_commit_capture_ignores_git_archive_export_attributes(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(
+        root,
+        capabilities=("read", "check"),
+        files={
+            "check.py": 'print("$Format:%H$")\n',
+            ".gitattributes": "check.py export-ignore export-subst\n",
+        },
+    )
+    registry = _registry_with_check(tmp_path, root)
+
+    result = project_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="isolation",
+    )
+
+    assert result.outcome == "passed", result.stderr
+    assert result.stdout.strip() == "$Format:%H$"
+    assert result.subject_kind == "exact_commit_snapshot"
+
+
 def test_caller_cannot_select_an_unapproved_check(tmp_path: Path):
     root = tmp_path / "project"
     head = init_project(root, capabilities=("read", "check"))

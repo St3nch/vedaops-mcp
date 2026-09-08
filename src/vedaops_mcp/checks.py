@@ -8,7 +8,6 @@ controller configuration, other projects, Docker socket, SSH agent, or network.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 import re
@@ -16,7 +15,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import tarfile
 import tempfile
 import time
 import uuid
@@ -33,7 +31,7 @@ RUNNER_PROFILE = "linux-bwrap-v1"
 BWRAP_PATH = Path("/usr/bin/bwrap")
 PRLIMIT_PATH = Path("/usr/bin/prlimit")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
+MAX_TREE_LIST_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_FILES = 5000
 MAX_SNAPSHOT_FILE_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_TOTAL_BYTES = 32 * 1024 * 1024
@@ -102,12 +100,13 @@ def project_check_run(
     bwrap = _required_executable(BWRAP_PATH, "bubblewrap")
     prlimit = _required_executable(PRLIMIT_PATH, "prlimit")
 
-    archive = run_git_bytes(
+    tree_listing = run_git_bytes(
         project.root,
-        "archive",
-        "--format=tar",
+        "ls-tree",
+        "-rz",
+        "--full-tree",
         expected,
-        limit_bytes=MAX_ARCHIVE_BYTES,
+        limit_bytes=MAX_TREE_LIST_BYTES,
         timeout_seconds=30,
     )
     tree = run_git_text(project.root, "rev-parse", f"{expected}^{{tree}}")
@@ -119,7 +118,11 @@ def project_check_run(
     limitations: list[Limitation] = []
     uncertain_effects = False
     try:
-        captured_digest, excluded_count, exclusions = _materialize_snapshot(archive, snapshot_dir)
+        captured_digest, excluded_count, exclusions = _materialize_snapshot(
+            project.root,
+            tree_listing,
+            snapshot_dir,
+        )
         argv = _sandbox_argv(
             bwrap=bwrap,
             prlimit=prlimit,
@@ -184,7 +187,9 @@ def project_check_run(
         requested_git_head=expected,
         captured_commit=expected,
         captured_tree=tree,
-        subject_kind="exact_commit_snapshot",
+        subject_kind=(
+            "commit_snapshot_with_exclusions" if excluded_count else "exact_commit_snapshot"
+        ),
         captured_input_sha256=captured_digest,
         excluded_count=excluded_count,
         exclusions=exclusions,
@@ -264,76 +269,94 @@ def _check_definition_sha256(check: RegisteredCheck) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _open_archive(archive: bytes) -> tarfile.TarFile:
+def _tree_entries(tree_listing: bytes) -> list[tuple[str, str, str, bytes]]:
+    entries: list[tuple[str, str, str, bytes]] = []
     try:
-        return tarfile.open(fileobj=io.BytesIO(archive), mode="r:")
-    except tarfile.TarError as exc:
-        raise PolicyError("VEDAOPS_CHECK_SUBJECT_UNAVAILABLE", "Git archive was invalid") from exc
+        records = tree_listing.split(b"\x00")
+        for record in records:
+            if not record:
+                continue
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, object_type, object_id = metadata.decode("ascii").split(" ", 2)
+            entries.append((mode, object_type, object_id, raw_path))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise PolicyError(
+            "VEDAOPS_CHECK_SUBJECT_UNAVAILABLE",
+            "Git tree listing was malformed",
+        ) from exc
+    return entries
 
 
-def _materialize_snapshot(archive: bytes, destination: Path) -> tuple[str, int, list[str]]:
+def _materialize_snapshot(
+    root: Path,
+    tree_listing: bytes,
+    destination: Path,
+) -> tuple[str, int, list[str]]:
     digest = hashlib.sha256()
     files = 0
     total_bytes = 0
     excluded = 0
     exclusion_kinds: set[str] = {"working_tree_and_untracked_changes"}
-    with _open_archive(archive) as opened:
-        for member in opened:
-            if member.isdir():
-                continue
-            if files >= MAX_SNAPSHOT_FILES:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_SUBJECT_TOO_LARGE",
-                    f"check snapshot exceeds {MAX_SNAPSHOT_FILES} files",
-                )
-            try:
-                relative = normalize_relative(member.name)
-            except PolicyError:
-                excluded += 1
-                exclusion_kinds.add("unsupported_paths")
-                continue
-            if protected_reason(relative) is not None:
-                excluded += 1
-                exclusion_kinds.add("protected_paths")
-                continue
-            if not member.isfile():
-                excluded += 1
-                exclusion_kinds.add("symlinks_or_special_entries")
-                continue
-            if member.size > MAX_SNAPSHOT_FILE_BYTES:
+    for mode, object_type, object_id, raw_path in _tree_entries(tree_listing):
+        if files >= MAX_SNAPSHOT_FILES:
+            raise PolicyError(
+                "VEDAOPS_CHECK_SUBJECT_TOO_LARGE",
+                f"check snapshot exceeds {MAX_SNAPSHOT_FILES} files",
+            )
+        try:
+            relative = normalize_relative(raw_path.decode("utf-8"))
+        except (UnicodeDecodeError, PolicyError):
+            excluded += 1
+            exclusion_kinds.add("unsupported_paths")
+            continue
+        if protected_reason(relative) is not None:
+            excluded += 1
+            exclusion_kinds.add("protected_paths")
+            continue
+        if object_type != "blob" or mode not in {"100644", "100755"}:
+            excluded += 1
+            if mode == "120000":
+                exclusion_kinds.add("symlinks")
+            elif mode == "160000":
+                exclusion_kinds.add("gitlinks")
+            else:
+                exclusion_kinds.add("unsupported_git_entries")
+            continue
+        try:
+            content = run_git_bytes(
+                root,
+                "cat-file",
+                "blob",
+                object_id,
+                limit_bytes=MAX_SNAPSHOT_FILE_BYTES,
+                timeout_seconds=10,
+            )
+        except PolicyError as exc:
+            if exc.code == "VEDAOPS_GIT_OUTPUT_TOO_LARGE":
                 raise PolicyError(
                     "VEDAOPS_CHECK_SUBJECT_TOO_LARGE",
                     f"check snapshot file {relative!r} exceeds the per-file bound",
-                )
-            total_bytes += member.size
-            if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_SUBJECT_TOO_LARGE",
-                    "check snapshot exceeds the total materialized byte bound",
-                )
-            source = opened.extractfile(member)
-            if source is None:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_SUBJECT_UNAVAILABLE",
-                    f"check snapshot file {relative!r} could not be read",
-                )
-            content = source.read(MAX_SNAPSHOT_FILE_BYTES + 1)
-            if len(content) != member.size:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_SUBJECT_UNAVAILABLE",
-                    f"check snapshot file {relative!r} changed during capture",
-                )
-            target = destination.joinpath(*Path(relative).parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-            target.chmod(0o755 if member.mode & 0o111 else 0o644)
-            path_bytes = relative.encode("utf-8")
-            digest.update(len(path_bytes).to_bytes(4, "big"))
-            digest.update(path_bytes)
-            digest.update((1 if member.mode & 0o111 else 0).to_bytes(1, "big"))
-            digest.update(len(content).to_bytes(8, "big"))
-            digest.update(content)
-            files += 1
+                ) from exc
+            raise
+        total_bytes += len(content)
+        if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES:
+            raise PolicyError(
+                "VEDAOPS_CHECK_SUBJECT_TOO_LARGE",
+                "check snapshot exceeds the total materialized byte bound",
+            )
+        target = destination.joinpath(*Path(relative).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o755 if mode == "100755" else 0o644)
+        path_bytes = relative.encode("utf-8")
+        mode_bytes = mode.encode("ascii")
+        digest.update(len(path_bytes).to_bytes(4, "big"))
+        digest.update(path_bytes)
+        digest.update(len(mode_bytes).to_bytes(1, "big"))
+        digest.update(mode_bytes)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+        files += 1
     return digest.hexdigest(), excluded, sorted(exclusion_kinds)
 
 

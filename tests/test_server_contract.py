@@ -1,4 +1,4 @@
-"""MCP-03 tool catalog, refusals, and server identity contract."""
+"""MCP-04 tool catalog, refusals, and server identity contract."""
 
 from __future__ import annotations
 
@@ -16,10 +16,6 @@ FORBIDDEN_TOOLS = {
     "host_command_run",
     "project_command_run",
     "project_task_run",
-    "project_patch_apply",
-    "project_text_replace",
-    "project_git_commit",
-    "project_git_diff",
     "project_review_run",
     "project_health",
     "project_checkpoint_create",
@@ -28,6 +24,21 @@ FORBIDDEN_TOOLS = {
     "project_desk_verify",
     "project_desk_report",
     "project_desk_walkback",
+    "project_git_push",
+    "project_git_fetch",
+    "project_git_pull",
+}
+CHECK_TOOLS = {"project_check_run", "project_postgres_check_run"}
+CHANGE_TOOLS = {
+    "project_file_write",
+    "project_text_replace",
+    "project_patch_apply",
+    "project_file_delete",
+    "project_git_commit",
+    "project_git_branch_create",
+    "project_git_switch",
+    "project_git_merge_ff",
+    "project_git_branch_delete",
 }
 
 
@@ -43,7 +54,7 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 @pytest.mark.asyncio
-async def test_tool_catalog_is_exactly_the_mcp03_read_and_check_plane(tmp_path: Path):
+async def test_tool_catalog_is_exactly_the_mcp04_core_plane(tmp_path: Path):
     async with Client(build_server(_settings(tmp_path))) as client:
         tools = await client.list_tools()
         names = [tool.name for tool in tools]
@@ -51,13 +62,18 @@ async def test_tool_catalog_is_exactly_the_mcp03_read_and_check_plane(tmp_path: 
         assert FORBIDDEN_TOOLS.isdisjoint(names)
         by_name = {tool.name: tool for tool in tools}
         for name, tool in by_name.items():
-            assert tool.annotations.destructiveHint is False
             assert tool.annotations.openWorldHint is False
-            if name in {"project_check_run", "project_postgres_check_run"}:
+            if name in CHECK_TOOLS:
                 assert tool.annotations.readOnlyHint is False
+                assert tool.annotations.destructiveHint is False
+                assert tool.annotations.idempotentHint is False
+            elif name in CHANGE_TOOLS:
+                assert tool.annotations.readOnlyHint is False
+                assert tool.annotations.destructiveHint is True
                 assert tool.annotations.idempotentHint is False
             else:
                 assert tool.annotations.readOnlyHint is True
+                assert tool.annotations.destructiveHint is False
                 assert tool.annotations.idempotentHint is True
 
 

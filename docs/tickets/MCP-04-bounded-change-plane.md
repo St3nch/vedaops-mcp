@@ -1,6 +1,6 @@
 # MCP-04 — Bounded Change Plane
 
-Status: commissioned by CHAZ on 2026-09-08. This is the final currently expected core build ticket before whole-Product review and cutover assessment.
+Status: candidate implemented on `ticket/MCP-04-bounded-change-plane`; verification green; independent review pending Product acceptance.
 
 ## Product reason
 
@@ -165,6 +165,17 @@ Prove at minimum:
 16. ordinary Orient/Inspect/Check/PostgreSQL behavior remains intact;
 17. tool catalog exposes no general shell, arbitrary Git, or push capability;
 18. a complete local ticket cycle can be performed through the MCP without CHAZ typing routine local Git commands.
+
+## Candidate evidence
+
+- `ruff check .`: pass.
+- Full repository suite: 79 passed in 17.95s after final uncertainty, protected-transition, and unsupported-entry hardening.
+- The focused Change suite proves `change` capability intersection plus mutable-project gating, exact file hashes, authority-path protection, validated patch paths/headers, bounded native diff, exact commit path sets, unrelated dirty-file preservation, repository-hook suppression, and refusal of pre-existing staged state.
+- A complete local ticket lifecycle is exercised without operator Git commands: create/switch ticket branch, edit, exact commit, switch target, refuse premature deletion, fast-forward-only integration, and safe merged-branch deletion.
+- Dirty branch switching and non-fast-forward integration are refused without changing the intended target state; branch transitions also refuse mutation-protected paths and unsupported Git entry types such as symlinks/gitlinks.
+- Post-effect Git verification failures are represented as `VEDAOPS_GIT_EFFECT_UNCERTAIN`, instructing callers to inspect branch/HEAD/index/worktree before retrying rather than assuming the effect did not occur.
+- The server catalog includes no general shell, caller-selected Git argv, fetch, pull, or push surface. Remote publication remains outside MCP-04.
+- The live `.vedaops/project.toml` remains an intentional legacy-control-plane working-tree change and is excluded from the MCP-04 candidate commit.
 
 ## Completion / cutover relevance
 

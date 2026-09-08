@@ -1,4 +1,4 @@
-"""FastMCP server for the MCP-03 repository/check plane."""
+"""FastMCP server for the MCP-04 repository/change/check plane."""
 
 from __future__ import annotations
 
@@ -24,6 +24,27 @@ from vedaops_mcp.authority import (
     load_registry,
     policy_sha256,
     require_principal,
+)
+from vedaops_mcp.change import (
+    BranchChangeResult,
+    BranchDeleteResult,
+    BranchListResult,
+    FileChangeResult,
+    GitCommitResult,
+    GitDiffResult,
+    GitMergeResult,
+    PatchApplyResult,
+    project_file_delete,
+    project_file_write,
+    project_git_branch_create,
+    project_git_branch_delete,
+    project_git_branches,
+    project_git_commit,
+    project_git_diff,
+    project_git_merge_ff,
+    project_git_switch,
+    project_patch_apply,
+    project_text_replace,
 )
 from vedaops_mcp.checks import CheckRunResult, project_check_run
 from vedaops_mcp.errors import VedaOpsError
@@ -56,6 +77,17 @@ TOOL_CATALOG = (
     "project_search",
     "project_git_status",
     "project_git_compare",
+    "project_git_diff",
+    "project_git_branches",
+    "project_file_write",
+    "project_text_replace",
+    "project_patch_apply",
+    "project_file_delete",
+    "project_git_commit",
+    "project_git_branch_create",
+    "project_git_switch",
+    "project_git_merge_ff",
+    "project_git_branch_delete",
     "project_check_run",
     "project_postgres_check_run",
 )
@@ -68,6 +100,12 @@ READ_ONLY = {
 CHECK_EXECUTION = {
     "readOnlyHint": False,
     "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+CHANGE_MUTATION = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
     "idempotentHint": False,
     "openWorldHint": False,
 }
@@ -146,15 +184,14 @@ def build_server(settings: Settings) -> FastMCP:
         name=SERVER_NAME,
         version=package_version(),
         instructions=(
-            "VedaOps MCP-03 repository and restricted-check plane. The trusted launcher "
-            "binds this process to a configured principal via VEDAOPS_AGENT_ID. Identify "
-            "that principal, registered project/workspace, effective permissions, available "
-            "check IDs, and bounded repository/Git facts. Project code executes only through "
-            "operator-approved checks in an isolated commit-derived sandbox. Approved "
-            "PostgreSQL checks may receive one disposable PostgreSQL 18 Unix socket. This "
-            "server does not independently cryptographically authenticate the human or model "
-            "behind the launcher, expose Docker control, run a general shell, or mutate source "
-            "workspaces."
+            "VedaOps MCP-04 governed repository/change/check plane. The trusted launcher binds "
+            "this process to a configured principal via VEDAOPS_AGENT_ID. Use bounded reads, "
+            "preconditioned local file/Git mutations, and operator-approved isolated checks. "
+            "Local branch creation/switching, exact commits, and fast-forward-only integration "
+            "preserve native Git semantics. Remote publication is not exposed: push remains an "
+            "explicit operator action. Approved PostgreSQL checks may receive one disposable "
+            "PostgreSQL 18 Unix socket. This server does not expose Docker control, a general "
+            "shell, arbitrary Git argv, remote Git writes, or Product authority."
         ),
     )
 
@@ -313,6 +350,211 @@ def build_server(settings: Settings) -> FastMCP:
                 base_commit=base_commit,
                 head_commit=head_commit,
                 path=path,
+            )
+
+    @mcp.tool(name="project_git_diff", annotations=READ_ONLY)
+    async def project_git_diff_tool(
+        project_id: str,
+        staged: bool = False,
+        path: str | None = None,
+    ) -> GitDiffResult:
+        """Return one bounded native working-tree or staged Git diff."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_git_diff,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                staged=staged,
+                path=path,
+            )
+
+    @mcp.tool(name="project_git_branches", annotations=READ_ONLY)
+    async def project_git_branches_tool(project_id: str) -> BranchListResult:
+        """List local branches and exact local tip commits."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_git_branches,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+            )
+
+    @mcp.tool(name="project_file_write", annotations=CHANGE_MUTATION)
+    async def project_file_write_tool(
+        project_id: str,
+        expected_git_head: str,
+        path: str,
+        content: str,
+        expected_sha256: str | None = None,
+    ) -> FileChangeResult:
+        """Create or replace one bounded UTF-8 file under exact preconditions."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_file_write,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                path=path,
+                content=content,
+                expected_sha256=expected_sha256,
+            )
+
+    @mcp.tool(name="project_text_replace", annotations=CHANGE_MUTATION)
+    async def project_text_replace_tool(
+        project_id: str,
+        expected_git_head: str,
+        path: str,
+        expected_sha256: str,
+        find: str,
+        replacement: str,
+    ) -> FileChangeResult:
+        """Replace exactly one text occurrence with file-hash protection."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_text_replace,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                path=path,
+                expected_sha256=expected_sha256,
+                find=find,
+                replacement=replacement,
+            )
+
+    @mcp.tool(name="project_patch_apply", annotations=CHANGE_MUTATION)
+    async def project_patch_apply_tool(
+        project_id: str,
+        expected_git_head: str,
+        patch: str,
+    ) -> PatchApplyResult:
+        """Apply one bounded Git-compatible text patch after path validation."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_patch_apply,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                patch=patch,
+            )
+
+    @mcp.tool(name="project_file_delete", annotations=CHANGE_MUTATION)
+    async def project_file_delete_tool(
+        project_id: str,
+        expected_git_head: str,
+        path: str,
+        expected_sha256: str,
+    ) -> FileChangeResult:
+        """Delete one bounded regular file after exact hash verification."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_file_delete,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                path=path,
+                expected_sha256=expected_sha256,
+            )
+
+    @mcp.tool(name="project_git_commit", annotations=CHANGE_MUTATION)
+    async def project_git_commit_tool(
+        project_id: str,
+        expected_git_head: str,
+        paths: list[str],
+        message: str,
+    ) -> GitCommitResult:
+        """Commit exactly named changed files and refuse pre-existing staged state."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_git_commit,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                paths=paths,
+                message=message,
+            )
+
+    @mcp.tool(name="project_git_branch_create", annotations=CHANGE_MUTATION)
+    async def project_git_branch_create_tool(
+        project_id: str,
+        expected_git_head: str,
+        branch: str,
+    ) -> BranchChangeResult:
+        """Create and switch to one new local branch from exact current HEAD."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_git_branch_create,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                branch=branch,
+            )
+
+    @mcp.tool(name="project_git_switch", annotations=CHANGE_MUTATION)
+    async def project_git_switch_tool(
+        project_id: str,
+        expected_git_head: str,
+        expected_current_branch: str,
+        branch: str,
+    ) -> BranchChangeResult:
+        """Safely switch between existing local branches with no implicit stash."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_git_switch,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                expected_current_branch=expected_current_branch,
+                branch=branch,
+            )
+
+    @mcp.tool(name="project_git_merge_ff", annotations=CHANGE_MUTATION)
+    async def project_git_merge_ff_tool(
+        project_id: str,
+        expected_git_head: str,
+        expected_target_branch: str,
+        source_branch: str,
+        expected_source_head: str,
+    ) -> GitMergeResult:
+        """Fast-forward the current local target to one exact local source branch tip."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_git_merge_ff,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                expected_target_branch=expected_target_branch,
+                source_branch=source_branch,
+                expected_source_head=expected_source_head,
+            )
+
+    @mcp.tool(name="project_git_branch_delete", annotations=CHANGE_MUTATION)
+    async def project_git_branch_delete_tool(
+        project_id: str,
+        expected_git_head: str,
+        expected_current_branch: str,
+        branch: str,
+        expected_branch_head: str,
+    ) -> BranchDeleteResult:
+        """Delete one non-current local branch only after Git proves it merged."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_git_branch_delete,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                expected_current_branch=expected_current_branch,
+                branch=branch,
+                expected_branch_head=expected_branch_head,
             )
 
     @mcp.tool(name="project_check_run", annotations=CHECK_EXECUTION)

@@ -41,6 +41,14 @@ MCP-03 adds `project_postgres_check_run` for operator-approved checks whose poli
 
 PostgreSQL readiness uses `pg_isready`, major version 18 is verified independently, and the receipt identifies the image, image ID, server version, captured runtime, outcome, truncation, and cleanup. Project virtual environments are not mounted from operator home: installed project packages are copied into a sanitized temporary venv built from trusted system Python and identified in the receipt. Temporary PostgreSQL DSNs/passwords are scrubbed from returned stdout/stderr.
 
+## MCP-04 bounded Change plane
+
+MCP-04 adds the missing core Change responsibility. A project must be mutable and grant `change` through the principal, operator policy, and project-manifest intersection before any mutation is available. The ordinary Change plane can create/write/delete bounded UTF-8 files, perform exact hash-protected text replacement, apply validated bounded patches to existing regular UTF-8 files, inspect native working-tree/index diffs and local branch tips, and commit exactly named paths.
+
+Local Git lifecycle operations are deliberately narrow: create/switch ordinary local branches, fast-forward-only local integration, and safe deletion of an already-merged non-current branch. Branch/ref mutations refuse dirty state, exact commits refuse pre-existing staged state, repository-controlled hooks are disabled, and post-effect verification failures return an explicit recovery-required uncertainty rather than inviting an automatic retry. Branch switching/integration also refuses any commit-tree transition that would change a mutation-protected path. `.vedaops/project.toml` remains readable authority but is not writable directly or indirectly through ordinary Change.
+
+The MCP does not expose shell access, caller-selected Git argv, fetch, pull, push, force operations, rebase, stash, or remote Git mutation. `git push` remains an explicit CHAZ/operator action outside the MCP.
+
 Effective permission is the intersection of the principal grant, operator project ceiling, project-manifest narrowing, and operation-specific restrictions.
 
 ## Development principle
@@ -58,7 +66,9 @@ The intended early sequence is:
 1. `MCP-01` — core foundation and read/orientation plane.
 2. `MCP-02` — restricted development-check runner.
 3. `MCP-03` — disposable PostgreSQL check substrate, exercised immediately against Discrepancy Desk.
-4. Later capabilities are commissioned only after the core boundary is proven.
+4. `MCP-04` — bounded local Change plane, including the ordinary native Git lifecycle while remote push remains operator-controlled.
+
+After MCP-04 acceptance, the declared Orient / Inspect / Change / Check core is complete. Whole-Product review and explicit cutover assessment follow; future capability is not unfinished core work.
 
 Substantive capabilities are developed on dedicated ticket branches/workspaces and are merged only after verification, independent review, and native acceptance.
 

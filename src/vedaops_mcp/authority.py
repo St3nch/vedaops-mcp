@@ -37,7 +37,7 @@ MAX_CHECKS = 64
 MAX_CHECK_ARGV = 32
 PROJECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 ACTIVE_STATUSES = frozenset({"active"})
-KNOWN_CAPABILITIES = frozenset({"check", "read"})
+KNOWN_CAPABILITIES = frozenset({"change", "check", "read"})
 WORKSPACE_KIND = "ordinary"
 
 

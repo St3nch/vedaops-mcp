@@ -11,7 +11,8 @@
 # VedaOps refuses to load a registry that resolves inside a registered project
 # root. Leaving a real registry inside a managed repository cannot work.
 #
-# MCP-03 understands capabilities "read" and "check" only. Unknown capabilities fail closed.
+# MCP-04 understands capabilities "read", "change", and "check" only. Unknown capabilities fail closed.
+# Change requires mutable=true in both operator policy and the project manifest, plus "change" in the principal/project intersection.
 # Check argv/runtime/substrate are operator-defined; callers select only a check ID and may only narrow its timeout.
 
 schema_version = 1
@@ -22,8 +23,8 @@ name = "Example Project"
 status = "active"
 root = "/absolute/path/to/example-project"
 workspace_id = "primary"
-mutable = false
-capabilities = ["read", "check"]
+mutable = true
+capabilities = ["read", "change", "check"]
 context_files = ["AGENTS.md", "README.md"]
 
 [[projects.checks]]
@@ -47,4 +48,4 @@ substrate = "postgres18"
 
 [[principals]]
 id = "example-agent"
-projects = { "example-project" = ["read", "check"] }
+projects = { "example-project" = ["read", "change", "check"] }

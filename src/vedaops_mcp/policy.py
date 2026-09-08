@@ -113,6 +113,7 @@ SENSITIVE_FILENAMES = frozenset(
 )
 SENSITIVE_FILENAME_PREFIXES = (".env.",)
 SENSITIVE_SUFFIXES = frozenset({".jks", ".key", ".keystore", ".p12", ".pem", ".pfx", ".ppk"})
+MUTATION_PROTECTED_PATHS = frozenset({".vedaops/project.toml"})
 
 
 def normalize_relative(value: str, *, allow_root: bool = False) -> str:
@@ -169,6 +170,16 @@ def ensure_not_protected(relative_path: str) -> None:
     reason = protected_reason(relative_path)
     if reason is not None:
         raise PolicyError("VEDAOPS_PATH_FORBIDDEN", f"{relative_path} is a {reason}")
+
+
+def ensure_mutation_path(relative_path: str) -> None:
+    """Refuse paths that are readable but not mutable through the Change plane."""
+    ensure_not_protected(relative_path)
+    if relative_path.casefold() in MUTATION_PROTECTED_PATHS:
+        raise PolicyError(
+            "VEDAOPS_PATH_FORBIDDEN",
+            f"{relative_path} is project mechanical authority and is not agent-writable",
+        )
 
 
 def resolve_within_root(root: Path, relative_path: str, *, must_exist: bool) -> Path:
@@ -419,6 +430,45 @@ def run_git_text(root: Path, *args: str, allow_exit_1: bool = False) -> str:
         return raw.decode("utf-8").strip()
     except UnicodeDecodeError as exc:
         raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git output was not UTF-8") from exc
+
+
+def run_git_input(
+    root: Path,
+    *args: str,
+    input_bytes: bytes,
+    limit_bytes: int = MAX_GIT_RESULT_BYTES,
+    timeout_seconds: int = GIT_TIMEOUT_SECONDS,
+) -> bytes:
+    """Run one bounded Git command with bounded stdin and return bounded stdout."""
+    if len(input_bytes) > MAX_GIT_RESULT_BYTES:
+        raise PolicyError("VEDAOPS_INVALID_ARGUMENT", "Git input exceeded the hard limit")
+    try:
+        with tempfile.TemporaryFile() as out_handle, tempfile.TemporaryFile() as err_handle:
+            ensure_safe_local_git_config(root)
+            completed = subprocess.run(
+                _git_command(root, *args),
+                input=input_bytes,
+                stdout=out_handle,
+                stderr=err_handle,
+                timeout=timeout_seconds,
+                check=False,
+                shell=False,
+                env=git_environment(),
+            )
+            out_handle.seek(0)
+            raw = out_handle.read(limit_bytes + 1)
+            err_handle.seek(0)
+            error_text = err_handle.read(2048).decode("utf-8", errors="replace")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git command failed") from exc
+    if completed.returncode != 0:
+        detail = _first_line(error_text) or "Git command failed"
+        if str(root) in detail:
+            detail = "Git command failed for the managed project"
+        raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", detail)
+    if len(raw) > limit_bytes:
+        raise PolicyError("VEDAOPS_GIT_OUTPUT_TOO_LARGE", "Git output exceeded the hard limit")
+    return raw
 
 
 def read_git_blobs_batch(

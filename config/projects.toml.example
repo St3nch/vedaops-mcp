@@ -11,7 +11,8 @@
 # VedaOps refuses to load a registry that resolves inside a registered project
 # root. Leaving a real registry inside a managed repository cannot work.
 #
-# MCP-01 understands capability "read" only. Unknown capabilities fail closed.
+# MCP-02 understands capabilities "read" and "check" only. Unknown capabilities fail closed.
+# Check argv is operator-defined; callers select only a check ID and may only narrow its timeout.
 
 schema_version = 1
 
@@ -22,9 +23,15 @@ status = "active"
 root = "/absolute/path/to/example-project"
 workspace_id = "primary"
 mutable = false
-capabilities = ["read"]
+capabilities = ["read", "check"]
 context_files = ["AGENTS.md", "README.md"]
+
+[[projects.checks]]
+id = "syntax"
+argv = ["/usr/bin/python3", "-m", "compileall", "-q", "src", "tests"]
+timeout_seconds = 30
+memory_mb = 512
 
 [[principals]]
 id = "example-agent"
-projects = { "example-project" = ["read"] }
+projects = { "example-project" = ["read", "check"] }

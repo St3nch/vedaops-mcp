@@ -1,4 +1,4 @@
-"""FastMCP server for the MCP-01 read/orientation plane."""
+"""FastMCP server for the MCP-02 read/orientation and restricted-check plane."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from vedaops_mcp.authority import (
     policy_sha256,
     require_principal,
 )
+from vedaops_mcp.checks import CheckRunResult, project_check_run
 from vedaops_mcp.errors import VedaOpsError
 from vedaops_mcp.inspect import (
     GitCompareResult,
@@ -54,11 +55,18 @@ TOOL_CATALOG = (
     "project_search",
     "project_git_status",
     "project_git_compare",
+    "project_check_run",
 )
 READ_ONLY = {
     "readOnlyHint": True,
     "destructiveHint": False,
     "idempotentHint": True,
+    "openWorldHint": False,
+}
+CHECK_EXECUTION = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
     "openWorldHint": False,
 }
 
@@ -136,12 +144,13 @@ def build_server(settings: Settings) -> FastMCP:
         name=SERVER_NAME,
         version=package_version(),
         instructions=(
-            "VedaOps MCP-01 read/orientation plane. The trusted launcher binds "
-            "this process to a configured principal via VEDAOPS_AGENT_ID. Identify "
-            "that principal, registered project/workspace, effective permissions, "
-            "and bounded repository/Git facts. This server does not independently "
-            "cryptographically authenticate the human or model behind the launcher, "
-            "execute project code, run a general shell, or perform mutations."
+            "VedaOps MCP-02 read/orientation and restricted-check plane. The trusted "
+            "launcher binds this process to a configured principal via VEDAOPS_AGENT_ID. "
+            "Identify that principal, registered project/workspace, effective permissions, "
+            "available check IDs, and bounded repository/Git facts. Project code executes "
+            "only through operator-approved checks in an isolated exact-commit sandbox. "
+            "This server does not independently cryptographically authenticate the human "
+            "or model behind the launcher, run a general shell, or mutate source workspaces."
         ),
     )
 
@@ -300,6 +309,25 @@ def build_server(settings: Settings) -> FastMCP:
                 base_commit=base_commit,
                 head_commit=head_commit,
                 path=path,
+            )
+
+    @mcp.tool(name="project_check_run", annotations=CHECK_EXECUTION)
+    async def project_check_run_tool(
+        project_id: str,
+        expected_git_head: str,
+        check_id: str,
+        timeout_seconds: int | None = None,
+    ) -> CheckRunResult:
+        """Run one operator-approved check in the restricted exact-commit sandbox."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_check_run,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                check_id=check_id,
+                timeout_seconds=timeout_seconds,
             )
 
     return mcp

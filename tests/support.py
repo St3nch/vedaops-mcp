@@ -97,6 +97,7 @@ def write_registry(
     mutable: bool = False,
     capabilities: tuple[str, ...] = DEFAULT_CAPABILITIES,
     context_files: tuple[str, ...] = (),
+    checks_toml: str = "",
     principal_id: str = "test-agent",
     principal_capabilities: tuple[str, ...] | None = None,
     extra_project: str = "",
@@ -122,6 +123,7 @@ def write_registry(
         f"mutable = {str(mutable).lower()}\n"
         f"capabilities = [{grants}]\n"
         f"context_files = [{documents}]\n"
+        f"{checks_toml}"
         f"{extra_project}\n"
         "[[principals]]\n"
         f"id = {principal_id!r}\n"

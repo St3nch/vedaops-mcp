@@ -32,10 +32,41 @@ MANIFEST_RELATIVE_PATH = Path(".vedaops/project.toml")
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_PROJECT_ID_LENGTH = 128
 MAX_CONTEXT_FILES = 16
+MAX_CHECKS = 64
+MAX_CHECK_ARGV = 32
 PROJECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 ACTIVE_STATUSES = frozenset({"active"})
-KNOWN_CAPABILITIES = frozenset({"read"})
+KNOWN_CAPABILITIES = frozenset({"check", "read"})
 WORKSPACE_KIND = "ordinary"
+
+
+class RegisteredCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        min_length=1,
+        max_length=MAX_PROJECT_ID_LENGTH,
+        pattern=PROJECT_ID_PATTERN.pattern,
+    )
+    argv: list[str] = Field(min_length=1, max_length=MAX_CHECK_ARGV)
+    timeout_seconds: int = Field(default=120, ge=1, le=120)
+    memory_mb: int = Field(default=512, ge=64, le=1024)
+
+    @field_validator("argv")
+    @classmethod
+    def argv_is_bounded_and_explicit(cls, value: list[str]) -> list[str]:
+        for argument in value:
+            if (
+                not isinstance(argument, str)
+                or not argument
+                or len(argument) > 1024
+                or "\x00" in argument
+                or any(ord(character) < 32 for character in argument)
+            ):
+                raise ValueError("check argv must contain bounded non-empty strings")
+        if not value[0].startswith("/"):
+            raise ValueError("check executable must be an absolute sandbox path")
+        return value
 
 
 class RegisteredProject(BaseModel):
@@ -57,6 +88,7 @@ class RegisteredProject(BaseModel):
     mutable: bool = False
     capabilities: list[str] = Field(default_factory=list)
     context_files: list[str] = Field(default_factory=list, max_length=MAX_CONTEXT_FILES)
+    checks: list[RegisteredCheck] = Field(default_factory=list, max_length=MAX_CHECKS)
 
     @field_validator("capabilities")
     @classmethod
@@ -78,6 +110,14 @@ class RegisteredProject(BaseModel):
                 or path.as_posix() != configured_path
             ):
                 raise ValueError("context_files must contain normalized relative paths")
+        return value
+
+    @field_validator("checks")
+    @classmethod
+    def checks_have_unique_ids(cls, value: list[RegisteredCheck]) -> list[RegisteredCheck]:
+        ids = [item.id for item in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError("check IDs must be unique within a project")
         return value
 
     @field_validator("root")
@@ -212,6 +252,7 @@ class ProjectDetail(ProjectSummary):
 
     principal_id: str
     authority_sources: dict[str, str | list[str]]
+    check_ids: list[str]
     git: GitOrientation
     limitations: list[Limitation]
 
@@ -279,6 +320,33 @@ def get_authorized_project(
         context_files=tuple(entry.context_files),
         principal_id=principal.id,
     )
+
+
+def get_authorized_check(
+    registry_path: Path,
+    *,
+    principal_id: str,
+    project_id: str,
+    check_id: str,
+) -> tuple[AuthorizedProject, RegisteredCheck]:
+    """Resolve one operator-defined check after project capability authorization."""
+    project = get_authorized_project(
+        registry_path,
+        principal_id=principal_id,
+        project_id=project_id,
+        capability="check",
+    )
+    registry = _load_registry(registry_path)
+    entry = next((item for item in registry.projects if item.id == project.id), None)
+    if entry is None:
+        raise AuthorityError("VEDAOPS_PROJECT_NOT_AUTHORIZED", project.id)
+    check = next((item for item in entry.checks if item.id == check_id), None)
+    if check is None:
+        raise AuthorityError(
+            "VEDAOPS_CHECK_NOT_AUTHORIZED",
+            f"check {check_id!r} is not operator-approved for project {project.id!r}",
+        )
+    return project, check
 
 
 def list_authorized_projects(
@@ -363,6 +431,11 @@ def get_project_detail(
             "project_manifest": MANIFEST_RELATIVE_PATH.as_posix(),
             "context_files": list(entry.context_files),
         },
+        check_ids=(
+            sorted(item.id for item in entry.checks)
+            if "check" in summary.effective_capabilities
+            else []
+        ),
         git=git_orientation,
         limitations=limitations,
     )

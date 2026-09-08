@@ -17,9 +17,7 @@ The MCP is not a general shell, workflow database, GitHub replacement, project P
 
 ## MCP-01 read/orientation plane
 
-This repository currently implements the MCP-01 foundation: a stdio MCP server that can start deterministically, identify the running instance, bind to a launcher-configured principal, load operator policy from outside managed project roots, apply project-manifest narrowing, and expose bounded project/Git reads.
-
-It does not execute project code, accept caller-selected commands, mutate repositories, push, talk to GitHub, or replace the live `linux-vedaops-mcp` control plane.
+MCP-01 established the stdio controller foundation: deterministic start, launcher-bound principal identity, external operator policy, project-manifest narrowing, bounded project/Git reads, and exact commit comparison.
 
 Operator policy defaults to `~/.config/vedaops/mcp/projects.toml`, which is distinct from the live legacy registry. See `config/projects.toml.example`.
 
@@ -29,9 +27,15 @@ export VEDAOPS_PROJECTS_REGISTRY=/absolute/path/to/projects.toml
 uv run vedaops-mcp stdio
 ```
 
-The trusted launcher sets `VEDAOPS_AGENT_ID`. That binds this MCP process to a configured principal in operator policy. MCP-01 does not independently cryptographically authenticate the human or model behind the launcher.
+The trusted launcher sets `VEDAOPS_AGENT_ID`. That binds this MCP process to a configured principal in operator policy. The controller does not independently cryptographically authenticate the human or model behind the launcher.
 
-A configured principal must exist in operator policy. Effective permission is the intersection of that principal's grant, the operator project ceiling, and the untrusted project manifest.
+## MCP-02 restricted checks
+
+MCP-02 adds one execution surface: `project_check_run`. Callers select only an operator-approved check ID, an exact current Git HEAD, and optionally a shorter timeout. They cannot supply argv.
+
+The runner materializes the exact commit into a disposable snapshot and executes it under the `linux-bwrap-v1` profile with network denied, a synthetic home, no controller or SSH environment, no other project mounts, no Docker socket, bounded process resources/output, and explicit cleanup evidence. Dirty and untracked working-tree content is excluded from the exercised subject.
+
+Effective permission is the intersection of the principal grant, operator project ceiling, project-manifest narrowing, and operation-specific restrictions.
 
 ## Development principle
 

@@ -8,6 +8,7 @@ import pytest
 from support import init_project, write_manifest, write_registry
 
 from vedaops_mcp.authority import (
+    get_authorized_check,
     get_authorized_project,
     get_project_detail,
     list_authorized_projects,
@@ -224,3 +225,43 @@ def test_effective_authority_is_the_three_way_intersection(tmp_path: Path):
     assert authorized.workspace_id == "primary"
     assert authorized.workspace_kind == "ordinary"
     assert authorized.principal_id == "test-agent"
+
+
+def test_check_capability_resolves_only_operator_defined_checks(tmp_path: Path):
+    root = tmp_path / "project"
+    init_project(root, capabilities=("read", "check"))
+    registry = write_registry(
+        tmp_path / "projects.toml",
+        root=root,
+        capabilities=("read", "check"),
+        principal_capabilities=("read", "check"),
+        checks_toml=(
+            "\n[[projects.checks]]\n"
+            "id = 'syntax'\n"
+            "argv = ['/usr/bin/python3', '-m', 'compileall', '-q', 'src']\n"
+            "timeout_seconds = 30\n"
+            "memory_mb = 512\n"
+        ),
+    )
+
+    project, check = get_authorized_check(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        check_id="syntax",
+    )
+    assert "check" in project.capabilities
+    assert check.argv[0] == "/usr/bin/python3"
+    assert check.timeout_seconds == 30
+    detail = get_project_detail(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        git_orientation=observe_git(root),
+    )
+    assert detail.check_ids == ["syntax"]
+
+    with pytest.raises(AuthorityError, match="VEDAOPS_CHECK_NOT_AUTHORIZED"):
+        get_authorized_check(
+            registry, principal_id="test-agent", project_id="example", check_id="missing"
+        )

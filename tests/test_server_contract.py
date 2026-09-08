@@ -1,4 +1,4 @@
-"""MCP-01 tool catalog, refusals, and server identity contract."""
+"""MCP-02 tool catalog, refusals, and server identity contract."""
 
 from __future__ import annotations
 
@@ -43,17 +43,22 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 @pytest.mark.asyncio
-async def test_tool_catalog_is_exactly_the_mcp01_read_plane(tmp_path: Path):
+async def test_tool_catalog_is_exactly_the_mcp02_read_and_check_plane(tmp_path: Path):
     async with Client(build_server(_settings(tmp_path))) as client:
         tools = await client.list_tools()
         names = [tool.name for tool in tools]
         assert names == list(TOOL_CATALOG)
         assert FORBIDDEN_TOOLS.isdisjoint(names)
-        for tool in tools:
-            assert tool.annotations.readOnlyHint is True
+        by_name = {tool.name: tool for tool in tools}
+        for name, tool in by_name.items():
             assert tool.annotations.destructiveHint is False
-            assert tool.annotations.idempotentHint is True
             assert tool.annotations.openWorldHint is False
+            if name == "project_check_run":
+                assert tool.annotations.readOnlyHint is False
+                assert tool.annotations.idempotentHint is False
+            else:
+                assert tool.annotations.readOnlyHint is True
+                assert tool.annotations.idempotentHint is True
 
 
 @pytest.mark.asyncio

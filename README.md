@@ -15,6 +15,22 @@ The core Product has four responsibilities:
 
 The MCP is not a general shell, workflow database, GitHub replacement, project Product authority, autonomous manager, or institutional-memory system.
 
+## MCP-01 read/orientation plane
+
+This repository currently implements the MCP-01 foundation: a stdio MCP server that can start deterministically, identify the running instance and authenticated principal, load operator policy from outside managed project roots, apply project-manifest narrowing, and expose bounded project/Git reads.
+
+It does not execute project code, accept caller-selected commands, mutate repositories, push, talk to GitHub, or replace the live `linux-vedaops-mcp` control plane.
+
+Operator policy defaults to `~/.config/vedaops/mcp/projects.toml`, which is distinct from the live legacy registry. See `config/projects.toml.example`.
+
+```bash
+export VEDAOPS_AGENT_ID=your-agent
+export VEDAOPS_PROJECTS_REGISTRY=/absolute/path/to/projects.toml
+uv run vedaops-mcp stdio
+```
+
+A declared principal must exist in operator policy. Effective permission is the intersection of that principal's grant, the operator project ceiling, and the untrusted project manifest.
+
 ## Development principle
 
 VedaOps uses **VedaOps Discipline** (internally nicknamed **VedaOps Disapline™**):

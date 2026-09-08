@@ -1,4 +1,4 @@
-"""FastMCP server for the MCP-02 read/orientation and restricted-check plane."""
+"""FastMCP server for the MCP-03 repository/check plane."""
 
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ from vedaops_mcp.inspect import (
     project_search,
     project_tree,
 )
+from vedaops_mcp.postgres import PostgresCheckRunResult, project_postgres_check_run
 from vedaops_mcp.settings import Settings
 
 SERVER_NAME = "vedaops-mcp"
@@ -56,6 +57,7 @@ TOOL_CATALOG = (
     "project_git_status",
     "project_git_compare",
     "project_check_run",
+    "project_postgres_check_run",
 )
 READ_ONLY = {
     "readOnlyHint": True,
@@ -144,13 +146,15 @@ def build_server(settings: Settings) -> FastMCP:
         name=SERVER_NAME,
         version=package_version(),
         instructions=(
-            "VedaOps MCP-02 read/orientation and restricted-check plane. The trusted "
-            "launcher binds this process to a configured principal via VEDAOPS_AGENT_ID. "
-            "Identify that principal, registered project/workspace, effective permissions, "
-            "available check IDs, and bounded repository/Git facts. Project code executes "
-            "only through operator-approved checks in an isolated commit-derived sandbox. "
-            "This server does not independently cryptographically authenticate the human "
-            "or model behind the launcher, run a general shell, or mutate source workspaces."
+            "VedaOps MCP-03 repository and restricted-check plane. The trusted launcher "
+            "binds this process to a configured principal via VEDAOPS_AGENT_ID. Identify "
+            "that principal, registered project/workspace, effective permissions, available "
+            "check IDs, and bounded repository/Git facts. Project code executes only through "
+            "operator-approved checks in an isolated commit-derived sandbox. Approved "
+            "PostgreSQL checks may receive one disposable PostgreSQL 18 Unix socket. This "
+            "server does not independently cryptographically authenticate the human or model "
+            "behind the launcher, expose Docker control, run a general shell, or mutate source "
+            "workspaces."
         ),
     )
 
@@ -322,6 +326,25 @@ def build_server(settings: Settings) -> FastMCP:
         with _stable_errors():
             return await asyncio.to_thread(
                 project_check_run,
+                settings.registry_path,
+                principal_id=settings.principal_id,
+                project_id=project_id,
+                expected_git_head=expected_git_head,
+                check_id=check_id,
+                timeout_seconds=timeout_seconds,
+            )
+
+    @mcp.tool(name="project_postgres_check_run", annotations=CHECK_EXECUTION)
+    async def project_postgres_check_run_tool(
+        project_id: str,
+        expected_git_head: str,
+        check_id: str,
+        timeout_seconds: int | None = None,
+    ) -> PostgresCheckRunResult:
+        """Run one approved check against the disposable PostgreSQL 18 substrate."""
+        with _stable_errors():
+            return await asyncio.to_thread(
+                project_postgres_check_run,
                 settings.registry_path,
                 principal_id=settings.principal_id,
                 project_id=project_id,

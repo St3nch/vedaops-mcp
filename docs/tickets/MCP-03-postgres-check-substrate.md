@@ -1,6 +1,6 @@
 # MCP-03 — Disposable PostgreSQL Check Substrate
 
-Status: early NEXT direction. Not commissioned until MCP-02's restricted runner is accepted.
+Status: candidate implemented on `ticket/MCP-03-postgres-check-substrate`; verification green; independent review pending Product acceptance.
 
 ## Product reason
 
@@ -67,6 +67,17 @@ Prove:
 9. no credentials in tool results or audit;
 10. correct source/runtime/client catalog exposure;
 11. removal of the PostgreSQL component leaves ordinary MCP core operations working.
+
+## Candidate evidence
+
+- `ruff check .`: pass.
+- Full repository suite: 67 passed.
+- MCP-03 focused suite: 4 passed, covering success, check failure, timeout cleanup, ordinary-runner refusal, Unix-socket-only worker connectivity, denied IP network, Docker-socket absence, PostgreSQL 18 identity, and credential scrubbing.
+- The first real tracer used Discrepancy Desk exact HEAD `73941507f2511aca3af8abcf47799bd016c687bf` in an automatically removed local clone, with DD's real provisioned dependency environment as runtime input and its accepted `postgres-foundation-proofs` argv. The check exited 0 against PostgreSQL 18.6 (`180006`) through the MCP-03 Unix socket; PostgreSQL and host-workspace cleanup both reported `removed`; `uncertain_effects` was false.
+- The live DD working tree remained clean. Its legacy `.vedaops/project.toml` was not cut over; the tracer used a temporary new-MCP `read/check` manifest only in the disposable clone because the legacy controller remains live until explicit cutover.
+- The FastMCP contract test exposes `project_postgres_check_run` as non-read-only, non-idempotent, non-open-world execution and keeps Docker control absent from the tool catalog.
+
+The DD proof report intentionally names the environment-variable identifier `VEDAOPS_POSTGRES_URL`; that identifier is not a credential. Raw temporary DSNs and passwords are scrubbed from MCP-returned stdout/stderr.
 
 ## Out of scope
 

@@ -95,6 +95,11 @@ def project_check_run(
         project_id=project_id,
         check_id=check_id,
     )
+    if check.substrate is not None:
+        raise PolicyError(
+            "VEDAOPS_CHECK_PROFILE_MISMATCH",
+            "this check requires its configured substrate-specific runner",
+        )
     expected = _validated_commit(project.root, expected_git_head)
     current = run_git_text(project.root, "rev-parse", "HEAD")
     if current != expected:
@@ -376,8 +381,14 @@ def _sandbox_argv(
     snapshot_dir: Path,
     check: RegisteredCheck,
     timeout_seconds: int,
+    extra_dirs: list[str] | None = None,
+    extra_ro_binds: list[tuple[Path, str]] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> list[str]:
     memory_bytes = check.memory_mb * 1024 * 1024
+    extra_dirs = [] if extra_dirs is None else extra_dirs
+    extra_ro_binds = [] if extra_ro_binds is None else extra_ro_binds
+    extra_env = {} if extra_env is None else extra_env
     command = [
         str(bwrap),
         "--die-with-parent",
@@ -416,6 +427,14 @@ def _sandbox_argv(
             "--bind",
             str(snapshot_dir),
             "/workspace",
+        ]
+    )
+    for directory in extra_dirs:
+        command.extend(["--dir", directory])
+    for source, target in extra_ro_binds:
+        command.extend(["--ro-bind", str(source), target])
+    command.extend(
+        [
             "--chdir",
             "/workspace",
             "--clearenv",
@@ -437,6 +456,12 @@ def _sandbox_argv(
             "--setenv",
             "LC_ALL",
             "C.UTF-8",
+        ]
+    )
+    for name, value in sorted(extra_env.items()):
+        command.extend(["--setenv", name, value])
+    command.extend(
+        [
             "--",
             str(prlimit),
             f"--as={memory_bytes}",

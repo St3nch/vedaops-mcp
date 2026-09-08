@@ -35,6 +35,12 @@ MCP-02 adds one execution surface: `project_check_run`. Callers select only an o
 
 The runner materializes a bounded snapshot directly from Git tree/blob objects and executes it under the `linux-bwrap-v1` profile with network denied, a synthetic home, no controller or SSH environment, no other project mounts, no Docker socket, bounded process resources/output, and explicit cleanup evidence. The receipt reports `exact_commit_snapshot` only when every supported commit entry was materialized; otherwise it reports explicit exclusions. Dirty and untracked working-tree content is never part of the exercised commit subject.
 
+## MCP-03 disposable PostgreSQL checks
+
+MCP-03 adds `project_postgres_check_run` for operator-approved checks whose policy selects `substrate = "postgres18"`. The controller starts only the fixed locally available `postgres:18-alpine` image with Docker networking disabled and tmpfs-backed database state. The restricted check worker receives no Docker control or IP network; it receives only a temporary PostgreSQL Unix socket.
+
+PostgreSQL readiness uses `pg_isready`, major version 18 is verified independently, and the receipt identifies the image, image ID, server version, captured runtime, outcome, truncation, and cleanup. Project virtual environments are not mounted from operator home: installed project packages are copied into a sanitized temporary venv built from trusted system Python and identified in the receipt. Temporary PostgreSQL DSNs/passwords are scrubbed from returned stdout/stderr.
+
 Effective permission is the intersection of the principal grant, operator project ceiling, project-manifest narrowing, and operation-specific restrictions.
 
 ## Development principle

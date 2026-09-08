@@ -11,8 +11,8 @@
 # VedaOps refuses to load a registry that resolves inside a registered project
 # root. Leaving a real registry inside a managed repository cannot work.
 #
-# MCP-02 understands capabilities "read" and "check" only. Unknown capabilities fail closed.
-# Check argv is operator-defined; callers select only a check ID and may only narrow its timeout.
+# MCP-03 understands capabilities "read" and "check" only. Unknown capabilities fail closed.
+# Check argv/runtime/substrate are operator-defined; callers select only a check ID and may only narrow its timeout.
 
 schema_version = 1
 
@@ -31,6 +31,19 @@ id = "syntax"
 argv = ["/usr/bin/python3", "-m", "compileall", "-q", "src", "tests"]
 timeout_seconds = 30
 memory_mb = 512
+runtime = "system"
+
+# PostgreSQL checks are still ordinary operator-approved checks. The substrate
+# choice is policy, not caller input. The project must already have a
+# provisioned .venv; MCP-03 captures its installed packages into a sanitized
+# temporary runtime and supplies only a disposable PostgreSQL Unix socket.
+[[projects.checks]]
+id = "postgres-proof"
+argv = ["/runtime/bin/uv", "run", "--offline", "--no-sync", "python", "-m", "example.postgres_proof"]
+timeout_seconds = 30
+memory_mb = 512
+runtime = "project_venv"
+substrate = "postgres18"
 
 [[principals]]
 id = "example-agent"

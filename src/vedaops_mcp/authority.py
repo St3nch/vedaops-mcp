@@ -22,6 +22,7 @@ import stat
 import tomllib
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -51,6 +52,8 @@ class RegisteredCheck(BaseModel):
     argv: list[str] = Field(min_length=1, max_length=MAX_CHECK_ARGV)
     timeout_seconds: int = Field(default=120, ge=1, le=120)
     memory_mb: int = Field(default=512, ge=64, le=1024)
+    runtime: Literal["system", "project_venv"] = "system"
+    substrate: Literal["postgres18"] | None = None
 
     @field_validator("argv")
     @classmethod

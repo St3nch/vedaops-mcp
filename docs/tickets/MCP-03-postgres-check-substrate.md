@@ -1,6 +1,10 @@
 # MCP-03 — Disposable PostgreSQL Check Substrate
 
-Status: candidate implemented on `ticket/MCP-03-postgres-check-substrate`; verification green; independent review pending Product acceptance.
+Status: Product accepted by CHAZ on 2026-09-08.
+
+Accepted candidate: `ff1ab6439d51489eadae64faed61f86674bce83e`
+
+Independent review verdict: `READY WITH NON-BLOCKING NOTES`; no acceptance blockers remain.
 
 ## Product reason
 

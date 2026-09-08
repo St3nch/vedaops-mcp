@@ -1,0 +1,30 @@
+# EXAMPLE ONLY - this file grants nothing.
+#
+# The authoritative operator policy must live outside every managed project root.
+# Copy this to ~/.config/vedaops/mcp/projects.toml (not group/world-writable)
+# or point VEDAOPS_PROJECTS_REGISTRY at an operator-owned path outside every root.
+#
+# This path is distinct from the live legacy controller's
+# ~/.config/vedaops/projects.toml. Do not point the new controller at the live
+# registry unless CHAZ explicitly authorizes that.
+#
+# VedaOps refuses to load a registry that resolves inside a registered project
+# root. Leaving a real registry inside a managed repository cannot work.
+#
+# MCP-01 understands capability "read" only. Unknown capabilities fail closed.
+
+schema_version = 1
+
+[[projects]]
+id = "example-project"
+name = "Example Project"
+status = "active"
+root = "/absolute/path/to/example-project"
+workspace_id = "primary"
+mutable = false
+capabilities = ["read"]
+context_files = ["AGENTS.md", "README.md"]
+
+[[principals]]
+id = "example-agent"
+projects = { "example-project" = ["read"] }

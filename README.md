@@ -33,13 +33,13 @@ The trusted launcher sets `VEDAOPS_AGENT_ID`. That binds this MCP process to a c
 
 MCP-02 adds one execution surface: `project_check_run`. Callers select only an operator-approved check ID, an exact current Git HEAD, and optionally a shorter timeout. They cannot supply argv.
 
-The runner materializes a bounded snapshot directly from Git tree/blob objects and executes it under the `linux-bwrap-v1` profile with network denied, a synthetic home, no controller or SSH environment, no other project mounts, no Docker socket, bounded process resources/output, and explicit cleanup evidence. The receipt reports `exact_commit_snapshot` only when every supported commit entry was materialized; otherwise it reports explicit exclusions. Dirty and untracked working-tree content is never part of the exercised commit subject.
+The runner materializes a bounded snapshot directly from Git tree/blob objects and executes it under the `linux-bwrap-systemd-v2` profile with network denied, a synthetic home, no controller or SSH environment, no other project mounts, no Docker socket, per-process limits, aggregate systemd-scope memory/task limits, bounded output, and explicit cleanup evidence. The snapshot is writable only as disposable check workspace state; it has no path back to the live project. The receipt reports `exact_commit_snapshot` only when every supported commit entry was materialized; otherwise it reports explicit exclusions. Dirty and untracked working-tree content is never part of the exercised commit subject.
 
 ## MCP-03 disposable PostgreSQL checks
 
 MCP-03 adds `project_postgres_check_run` for operator-approved checks whose policy selects `substrate = "postgres18"`. The controller starts only the fixed locally available `postgres:18-alpine` image with Docker networking disabled and tmpfs-backed database state. The restricted check worker receives no Docker control or IP network; it receives only a temporary PostgreSQL Unix socket.
 
-PostgreSQL readiness uses `pg_isready`, major version 18 is verified independently, and the receipt identifies the image, image ID, server version, captured runtime, outcome, truncation, and cleanup. Project virtual environments are not mounted from operator home: installed project packages are copied into a sanitized temporary venv built from trusted system Python and identified in the receipt. Temporary PostgreSQL DSNs/passwords are scrubbed from returned stdout/stderr.
+PostgreSQL readiness uses `pg_isready`, major version 18 is verified independently, and the receipt identifies the image, image ID, server version, captured runtime, outcome, truncation, and cleanup. Project virtual environments are not mounted from operator home: installed packages and bounded console executables are copied into a sanitized temporary venv built from trusted system Python and identified in the receipt. Editable-install path metadata that points inside the registered project is retargeted to the disposable `/workspace` snapshot, preserving installed-project behavior without exposing the live worktree. Temporary PostgreSQL DSNs/passwords are scrubbed from returned stdout/stderr.
 
 ## MCP-04 bounded Change plane
 
@@ -48,6 +48,10 @@ MCP-04 adds the missing core Change responsibility. A project must be mutable an
 Local Git lifecycle operations are deliberately narrow: create/switch ordinary local branches, fast-forward-only local integration, and safe deletion of an already-merged non-current branch. Branch/ref mutations refuse dirty state, exact commits refuse pre-existing staged state, repository-controlled hooks are disabled, and post-effect verification failures return an explicit recovery-required uncertainty rather than inviting an automatic retry. Branch switching/integration also refuses any commit-tree transition that would change a mutation-protected path. `.vedaops/project.toml` remains readable authority but is not writable directly or indirectly through ordinary Change.
 
 The MCP does not expose shell access, caller-selected Git argv, fetch, pull, push, force operations, rebase, stash, or remote Git mutation. `git push` remains an explicit CHAZ/operator action outside the MCP.
+
+Effecting file, Git, and check operations record a minimal durable operation journal outside managed project roots. A started operation is recorded before its first externally visible effect and reaches `succeeded`, `failed`, or `uncertain` only after terminal evidence. This is recovery evidence, not workflow state.
+
+`vedaops_server_info` distinguishes observed source-checkout revision from the runtime artifact actually loaded. It reports a deterministic loaded-package digest, Python executable path/digest, process ID, instance/start identity, policy fingerprint, tool-catalog fingerprint, and effective grants; client-advertised catalog state must still be verified separately during cutover.
 
 Effective permission is the intersection of the principal grant, operator project ceiling, project-manifest narrowing, and operation-specific restrictions.
 

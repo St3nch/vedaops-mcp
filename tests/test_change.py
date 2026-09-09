@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -590,3 +591,171 @@ def test_branch_transition_cannot_materialize_symlink_entry(tmp_path: Path):
     assert git(root, "rev-parse", "HEAD") == base_head
     assert not (root / "linked-readme").exists()
     assert not (root / "linked-readme").is_symlink()
+
+
+def test_patch_refuses_hidden_traditional_diff_after_git_hunk(tmp_path: Path):
+    root, registry, head = _change_project(tmp_path)
+    manifest = root / ".vedaops/project.toml"
+    before_manifest = manifest.read_text()
+    patch = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,2 @@
+ # Example
+-hello world
++hello patched
+--- .vedaops/project.toml
++++ .vedaops/project.toml
+@@ -1,5 +1,5 @@
+ schema_version = 1
+ id = 'example'
+-name = 'Example'
++name = 'Changed'
+ mutable = true
+ capabilities = ['read', 'change']
+"""
+
+    with pytest.raises(PolicyError, match="VEDAOPS_PATCH_INVALID"):
+        project_patch_apply(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            patch=patch,
+        )
+
+    assert (root / "README.md").read_text() == "# Example\nhello world\n"
+    assert manifest.read_text() == before_manifest
+
+
+def test_branch_switch_refuses_ignored_worktree_collision(tmp_path: Path):
+    root, registry, base_head = _change_project(tmp_path)
+    target_branch = git(root, "branch", "--show-current")
+
+    git(root, "switch", "-c", "ticket/tracks-ignored")
+    (root / "ignored.txt").write_text("tracked on source\n")
+    git(root, "add", "-f", "ignored.txt")
+    git(root, "commit", "-m", "track ignored path")
+    source_head = git(root, "rev-parse", "HEAD")
+    git(root, "switch", target_branch)
+    (root / "ignored.txt").write_text("valuable local ignored work\n")
+
+    with pytest.raises(PolicyError, match="VEDAOPS_WORKTREE_COLLISION"):
+        project_git_switch(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=base_head,
+            expected_current_branch=target_branch,
+            branch="ticket/tracks-ignored",
+        )
+
+    assert git(root, "branch", "--show-current") == target_branch
+    assert git(root, "rev-parse", "HEAD") == base_head
+    assert (root / "ignored.txt").read_text() == "valuable local ignored work\n"
+    assert source_head != base_head
+
+
+def test_ff_merge_uses_verified_branch_object_not_same_named_tag(tmp_path: Path):
+    root, registry, base_head = _change_project(tmp_path)
+    target_branch = git(root, "branch", "--show-current")
+
+    git(root, "switch", "-c", "ticket/exact-source")
+    (root / "README.md").write_text("# Example\nverified branch\n")
+    git(root, "add", "README.md")
+    git(root, "commit", "-m", "verified source")
+    source_head = git(root, "rev-parse", "HEAD")
+
+    git(root, "switch", "-c", "wrong-tag-target")
+    manifest = root / ".vedaops/project.toml"
+    manifest.write_text(manifest.read_text().replace("name = 'Example'", "name = 'WrongTag'"))
+    git(root, "add", ".vedaops/project.toml")
+    git(root, "commit", "-m", "wrong tag protected change")
+    wrong_head = git(root, "rev-parse", "HEAD")
+    git(root, "tag", "ticket/exact-source", wrong_head)
+    git(root, "switch", target_branch)
+
+    result = project_git_merge_ff(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=base_head,
+        expected_target_branch=target_branch,
+        source_branch="ticket/exact-source",
+        expected_source_head=source_head,
+    )
+
+    assert result.git_head == source_head
+    assert git(root, "rev-parse", "HEAD") == source_head
+    assert (root / "README.md").read_text() == "# Example\nverified branch\n"
+    assert "WrongTag" not in manifest.read_text()
+
+
+def test_commit_wrapper_failure_after_real_commit_is_effect_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, base_head = _change_project(tmp_path)
+    readme = root / "README.md"
+    project_text_replace(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=base_head,
+        path="README.md",
+        expected_sha256=_sha(readme),
+        find="hello world",
+        replacement="commit happened",
+    )
+
+    original = change_module.run_git_text
+
+    def fail_after_commit(project_root: Path, *args: str, **kwargs) -> str:
+        result = original(project_root, *args, **kwargs)
+        if args and args[0] == "commit":
+            raise PolicyError("VEDAOPS_TEST_AFTER_COMMIT", "simulated wrapper failure")
+        return result
+
+    monkeypatch.setattr(change_module, "run_git_text", fail_after_commit)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_GIT_EFFECT_UNCERTAIN"):
+        project_git_commit(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=base_head,
+            paths=["README.md"],
+            message="test: post commit failure",
+        )
+
+    assert git(root, "rev-parse", "HEAD") != base_head
+    records = [
+        json.loads(path.read_text())
+        for path in (registry.parent / "operations").glob("*.json")
+    ]
+    commit_records = [item for item in records if item["kind"] == "git_commit"]
+    assert commit_records[-1]["state"] == "uncertain"
+
+
+def test_manifest_alias_cannot_turn_ordinary_file_into_authority_mutation(tmp_path: Path):
+    root, registry, head = _change_project(tmp_path)
+    manifest = root / ".vedaops/project.toml"
+    alias = root / "authority-alias.toml"
+    alias.write_text(manifest.read_text())
+    manifest.unlink()
+    manifest.symlink_to("../authority-alias.toml")
+    before = alias.read_text()
+
+    with pytest.raises(AuthorityError, match="VEDAOPS_MANIFEST_UNAVAILABLE"):
+        project_text_replace(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="authority-alias.toml",
+            expected_sha256=_sha(alias),
+            find="name = 'Example'",
+            replacement="name = 'Escalated'",
+        )
+
+    assert alias.read_text() == before

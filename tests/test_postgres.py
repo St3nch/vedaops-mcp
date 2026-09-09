@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from support import init_project, write_registry
 
+import vedaops_mcp.postgres as postgres_module
 from vedaops_mcp.checks import project_check_run
 from vedaops_mcp.errors import PolicyError
 from vedaops_mcp.postgres import POSTGRES_IMAGE, project_postgres_check_run
@@ -169,6 +170,38 @@ def test_postgres_container_is_removed_after_timeout(tmp_path: Path):
     assert result.outcome == "timed_out"
     assert result.postgres_cleanup == "removed"
     assert result.cleanup == "removed"
+
+
+@pytest.mark.skipif(not POSTGRES_AVAILABLE, reason="local PostgreSQL 18 image unavailable")
+def test_postgres_cleanup_failure_returns_structured_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _root, registry, head = _project_with_postgres_check(
+        tmp_path,
+        script="print('done')\n",
+    )
+    original_remove = postgres_module._remove_container
+
+    def remove_then_fail(docker: Path, name: str) -> bool:
+        assert original_remove(docker, name) is True
+        raise PolicyError("TEST_CLEANUP_FAILURE", "simulated post-removal verification failure")
+
+    monkeypatch.setattr(postgres_module, "_remove_container", remove_then_fail)
+    result = project_postgres_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="postgres",
+    )
+
+    assert result.outcome == "passed"
+    assert result.postgres_cleanup == "uncertain"
+    assert result.uncertain_effects is True
+    assert any(
+        item.code == "VEDAOPS_POSTGRES_CLEANUP_UNCERTAIN" for item in result.limitations
+    )
 
 
 def test_ordinary_check_runner_refuses_postgres_bound_check(tmp_path: Path):

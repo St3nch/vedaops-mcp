@@ -16,15 +16,17 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
-import uuid
 from contextlib import suppress
+from functools import wraps
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
 from vedaops_mcp.authority import Limitation, RegisteredCheck, get_authorized_check
 from vedaops_mcp.errors import AuthorityError, PolicyError
+from vedaops_mcp.operations import start_operation
 from vedaops_mcp.policy import (
     normalize_relative,
     protected_reason,
@@ -32,10 +34,15 @@ from vedaops_mcp.policy import (
     run_git_bytes,
     run_git_text,
 )
+from vedaops_mcp.runtime import RUNTIME_VENV_RELATIVE, RuntimeIdentity, capture_project_runtime
 
-RUNNER_PROFILE = "linux-bwrap-v1"
+RUNNER_PROFILE = "linux-bwrap-systemd-v2"
 BWRAP_PATH = Path("/usr/bin/bwrap")
 PRLIMIT_PATH = Path("/usr/bin/prlimit")
+SYSTEMD_RUN_PATH = Path("/usr/bin/systemd-run")
+MAX_CONCURRENT_CHECKS = 2
+MAX_WORKER_TASKS = 128
+_CHECK_ADMISSION = threading.BoundedSemaphore(MAX_CONCURRENT_CHECKS)
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 MAX_TREE_LIST_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_FILES = 5000
@@ -67,6 +74,7 @@ class CheckRunResult(BaseModel):
     runner_profile: str
     runner_sha256: str
     limiter_sha256: str
+    aggregate_limiter_sha256: str
     outcome: str
     exit_code: int | None
     duration_ms: int
@@ -77,8 +85,27 @@ class CheckRunResult(BaseModel):
     cleanup: str
     limitations: list[Limitation]
     uncertain_effects: bool
+    runtime: RuntimeIdentity | None = None
 
 
+def admitted_check(function):
+    """Bound concurrent hostile check workloads across ordinary and PostgreSQL runners."""
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if not _CHECK_ADMISSION.acquire(blocking=False):
+            raise PolicyError(
+                "VEDAOPS_CHECK_CAPACITY_REACHED",
+                "the bounded concurrent-check limit is already in use",
+            )
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _CHECK_ADMISSION.release()
+
+    return wrapper
+
+
+@admitted_check
 def project_check_run(
     registry_path: Path,
     *,
@@ -110,6 +137,7 @@ def project_check_run(
     effective_timeout = _effective_timeout(check, timeout_seconds)
     bwrap = _required_executable(BWRAP_PATH, "bubblewrap")
     prlimit = _required_executable(PRLIMIT_PATH, "prlimit")
+    systemd_run = _required_executable(SYSTEMD_RUN_PATH, "systemd-run")
 
     tree_listing = run_git_bytes(
         project.root,
@@ -122,24 +150,58 @@ def project_check_run(
     )
     tree = run_git_text(project.root, "rev-parse", f"{expected}^{{tree}}")
     check_digest = _check_definition_sha256(check)
-    operation_id = uuid.uuid4().hex
-    snapshot_dir = Path(tempfile.mkdtemp(prefix="vedaops-check-"))
+    journal = start_operation(
+        registry_path,
+        kind="check_run",
+        project_id=project.id,
+        expected_git_head=expected,
+    )
+    operation_id = journal.operation_id
+    root: Path | None = None
     process: subprocess.Popen[bytes] | None = None
     cleanup = "removed"
     limitations: list[Limitation] = []
     uncertain_effects = False
+    runtime_identity: RuntimeIdentity | None = None
+    failure: Exception | None = None
     try:
+        root = Path(tempfile.mkdtemp(prefix="vedaops-check-"))
+        snapshot_dir = root / "snapshot"
+        runtime_dir = root / "runtime-venv"
+        uv_copy = root / "uv"
+        snapshot_dir.mkdir(mode=0o700)
         captured_digest, excluded_count, exclusions = _materialize_snapshot(
             project.root,
             tree_listing,
             snapshot_dir,
         )
+        extra_dirs: list[str] = []
+        extra_ro_binds: list[tuple[Path, str]] = []
+        extra_env: dict[str, str] = {}
+        if check.runtime == "project_venv":
+            if (snapshot_dir / RUNTIME_VENV_RELATIVE).exists():
+                raise PolicyError(
+                    "VEDAOPS_CHECK_RUNTIME_CONFLICT",
+                    "the committed subject already contains the reserved .venv runtime path",
+                )
+            runtime_identity = capture_project_runtime(project.root, runtime_dir, uv_copy)
+            (snapshot_dir / RUNTIME_VENV_RELATIVE).mkdir(mode=0o700)
+            extra_dirs = ["/runtime", "/runtime/bin"]
+            extra_ro_binds = [
+                (runtime_dir, "/workspace/.venv"),
+                (uv_copy, "/runtime/bin/uv"),
+            ]
+            extra_env = {"PATH": "/runtime/bin:/workspace/.venv/bin:/usr/bin:/bin"}
         argv = _sandbox_argv(
             bwrap=bwrap,
             prlimit=prlimit,
+            systemd_run=systemd_run,
             snapshot_dir=snapshot_dir,
             check=check,
             timeout_seconds=effective_timeout,
+            extra_dirs=extra_dirs,
+            extra_ro_binds=extra_ro_binds,
+            extra_env=extra_env,
         )
         started = time.monotonic()
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
@@ -150,7 +212,10 @@ def project_check_run(
                     stdout=stdout_file,
                     stderr=stderr_file,
                     cwd="/",
-                    env={"PATH": "/usr/bin:/bin"},
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+                    },
                     start_new_session=True,
                 )
             except OSError as exc:
@@ -177,21 +242,36 @@ def project_check_run(
             outcome = "passed"
         else:
             outcome = "failed"
+    except Exception as exc:
+        failure = exc
     finally:
         if process is not None and process.poll() is None and not _terminate_process(process):
             uncertain_effects = True
             _append_termination_limitation(limitations)
-        try:
-            shutil.rmtree(snapshot_dir)
-        except OSError:
-            cleanup = "uncertain"
-            uncertain_effects = True
-            limitations.append(
-                Limitation(
-                    code="VEDAOPS_CHECK_CLEANUP_UNCERTAIN",
-                    detail="disposable check workspace could not be fully removed",
+        if root is not None:
+            try:
+                shutil.rmtree(root)
+            except OSError:
+                cleanup = "uncertain"
+                uncertain_effects = True
+                limitations.append(
+                    Limitation(
+                        code="VEDAOPS_CHECK_CLEANUP_UNCERTAIN",
+                        detail="disposable check workspace could not be fully removed",
+                    )
                 )
-            )
+
+    if failure is not None:
+        if uncertain_effects or cleanup != "removed":
+            journal.terminal("uncertain", detail=str(failure))
+            raise PolicyError(
+                "VEDAOPS_CHECK_EFFECT_UNCERTAIN",
+                f"operation {operation_id} failed with uncertain cleanup/effects; "
+                "inspect before retrying",
+            ) from failure
+        journal.terminal("failed", detail=str(failure))
+        raise failure
+    journal.terminal("uncertain" if uncertain_effects else "succeeded")
 
     return CheckRunResult(
         operation_id=operation_id,
@@ -212,6 +292,7 @@ def project_check_run(
         runner_profile=RUNNER_PROFILE,
         runner_sha256=_sha256_file(bwrap),
         limiter_sha256=_sha256_file(prlimit),
+        aggregate_limiter_sha256=_sha256_file(systemd_run),
         outcome=outcome,
         exit_code=exit_code,
         duration_ms=duration_ms,
@@ -222,6 +303,7 @@ def project_check_run(
         cleanup=cleanup,
         limitations=limitations,
         uncertain_effects=uncertain_effects,
+        runtime=runtime_identity,
     )
 
 
@@ -378,6 +460,7 @@ def _sandbox_argv(
     *,
     bwrap: Path,
     prlimit: Path,
+    systemd_run: Path,
     snapshot_dir: Path,
     check: RegisteredCheck,
     timeout_seconds: int,
@@ -473,7 +556,17 @@ def _sandbox_argv(
             *check.argv,
         ]
     )
-    return command
+    return [
+        str(systemd_run),
+        "--user",
+        "--scope",
+        "--quiet",
+        f"--property=MemoryMax={memory_bytes}",
+        "--property=MemorySwapMax=0",
+        f"--property=TasksMax={MAX_WORKER_TASKS}",
+        "--",
+        *command,
+    ]
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> bool:

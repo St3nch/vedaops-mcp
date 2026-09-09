@@ -7,24 +7,22 @@ Bubblewrap worker; it receives neither Docker control nor network access.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import secrets
 import shutil
-import stat
 import subprocess
 import tempfile
 import time
-import uuid
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import ConfigDict
 
 from vedaops_mcp.authority import Limitation, get_authorized_check
 from vedaops_mcp.checks import (
     BWRAP_PATH,
     MAX_TREE_LIST_BYTES,
     PRLIMIT_PATH,
+    SYSTEMD_RUN_PATH,
     CheckRunResult,
     _append_termination_limitation,
     _check_definition_sha256,
@@ -36,9 +34,12 @@ from vedaops_mcp.checks import (
     _sha256_file,
     _terminate_process,
     _validated_commit,
+    admitted_check,
 )
 from vedaops_mcp.errors import AuthorityError, PolicyError
+from vedaops_mcp.operations import start_operation
 from vedaops_mcp.policy import run_git_bytes, run_git_text
+from vedaops_mcp.runtime import RUNTIME_VENV_RELATIVE, RuntimeIdentity, capture_project_runtime
 
 DOCKER_PATH = Path("/usr/bin/docker")
 POSTGRES_IMAGE = "postgres:18-alpine"
@@ -51,23 +52,6 @@ POSTGRES_PORT = 5432
 POSTGRES_START_TIMEOUT_SECONDS = 60
 POSTGRES_CONTAINER_MEMORY = "512m"
 POSTGRES_CONTAINER_PIDS = "128"
-RUNTIME_VENV_RELATIVE = Path(".venv")
-MAX_RUNTIME_FILES = 20_000
-MAX_RUNTIME_BYTES = 256 * 1024 * 1024
-RUNTIME_COPY_TIMEOUT_SECONDS = 30
-
-
-class RuntimeIdentity(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    kind: str
-    sha256: str
-    files: int
-    bytes: int
-    uv_sha256: str
-    python_sha256: str
-
-
 class PostgresCheckRunResult(CheckRunResult):
     model_config = ConfigDict(extra="forbid")
 
@@ -81,6 +65,7 @@ class PostgresCheckRunResult(CheckRunResult):
     runtime: RuntimeIdentity
 
 
+@admitted_check
 def project_postgres_check_run(
     registry_path: Path,
     *,
@@ -118,10 +103,9 @@ def project_postgres_check_run(
     effective_timeout = _effective_timeout(check, timeout_seconds)
     bwrap = _required_executable(BWRAP_PATH, "bubblewrap")
     prlimit = _required_executable(PRLIMIT_PATH, "prlimit")
+    systemd_run = _required_executable(SYSTEMD_RUN_PATH, "systemd-run")
     docker = _required_executable(DOCKER_PATH, "Docker")
     image_id = _local_image_id(docker)
-    uv_source = _trusted_uv_executable(project.root)
-    venv_source = _project_venv(project.root)
 
     tree_listing = run_git_bytes(
         project.root,
@@ -134,16 +118,14 @@ def project_postgres_check_run(
     )
     tree = run_git_text(project.root, "rev-parse", f"{expected}^{{tree}}")
     check_digest = _check_definition_sha256(check)
-    operation_id = uuid.uuid4().hex
-    root = Path(tempfile.mkdtemp(prefix="vedaops-pg-check-"))
-    snapshot_dir = root / "snapshot"
-    runtime_dir = root / "runtime-venv"
-    socket_dir = root / "socket"
-    uv_copy = root / "uv"
-    env_file = root / "postgres.env"
-    snapshot_dir.mkdir(mode=0o700)
-    socket_dir.mkdir(mode=0o777)
-    socket_dir.chmod(0o777)
+    journal = start_operation(
+        registry_path,
+        kind="postgres_check_run",
+        project_id=project.id,
+        expected_git_head=expected,
+    )
+    operation_id = journal.operation_id
+    root: Path | None = None
     process: subprocess.Popen[bytes] | None = None
     container_name: str | None = None
     cleanup = "removed"
@@ -160,8 +142,18 @@ def project_postgres_check_run(
     server_version_num = 0
     readiness = "unavailable"
     runtime_identity: RuntimeIdentity | None = None
+    failure: Exception | None = None
 
     try:
+        root = Path(tempfile.mkdtemp(prefix="vedaops-pg-check-"))
+        snapshot_dir = root / "snapshot"
+        runtime_dir = root / "runtime-venv"
+        socket_dir = root / "socket"
+        uv_copy = root / "uv"
+        env_file = root / "postgres.env"
+        snapshot_dir.mkdir(mode=0o700)
+        socket_dir.mkdir(mode=0o777)
+        socket_dir.chmod(0o777)
         captured_digest, excluded_count, exclusions = _materialize_snapshot(
             project.root,
             tree_listing,
@@ -172,10 +164,7 @@ def project_postgres_check_run(
                 "VEDAOPS_CHECK_RUNTIME_CONFLICT",
                 "the committed subject already contains the reserved .venv runtime path",
             )
-        _copy_runtime_venv(venv_source, runtime_dir)
-        shutil.copyfile(uv_source, uv_copy)
-        uv_copy.chmod(0o755)
-        runtime_identity = _runtime_identity(runtime_dir, uv_copy)
+        runtime_identity = capture_project_runtime(project.root, runtime_dir, uv_copy)
         (snapshot_dir / RUNTIME_VENV_RELATIVE).mkdir(mode=0o700)
 
         password = secrets.token_hex(24)
@@ -199,6 +188,7 @@ def project_postgres_check_run(
         argv = _sandbox_argv(
             bwrap=bwrap,
             prlimit=prlimit,
+            systemd_run=systemd_run,
             snapshot_dir=snapshot_dir,
             check=check,
             timeout_seconds=effective_timeout,
@@ -222,7 +212,10 @@ def project_postgres_check_run(
                     stdout=stdout_file,
                     stderr=stderr_file,
                     cwd="/",
-                    env={"PATH": "/usr/bin:/bin"},
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+                    },
                     start_new_session=True,
                 )
             except OSError as exc:
@@ -259,14 +252,18 @@ def project_postgres_check_run(
             outcome = "passed"
         else:
             outcome = "failed"
+    except Exception as exc:
+        failure = exc
     finally:
         if process is not None and process.poll() is None and not _terminate_process(process):
             uncertain_effects = True
             _append_termination_limitation(limitations)
         if container_name is not None:
-            postgres_cleanup = (
-                "removed" if _remove_container(docker, container_name) else "uncertain"
-            )
+            try:
+                removed = _remove_container(docker, container_name)
+            except Exception:
+                removed = False
+            postgres_cleanup = "removed" if removed else "uncertain"
             if postgres_cleanup != "removed":
                 uncertain_effects = True
                 limitations.append(
@@ -275,20 +272,36 @@ def project_postgres_check_run(
                         detail="disposable PostgreSQL container removal could not be verified",
                     )
                 )
-        try:
-            shutil.rmtree(root)
-        except OSError:
-            cleanup = "uncertain"
-            uncertain_effects = True
-            limitations.append(
-                Limitation(
-                    code="VEDAOPS_CHECK_CLEANUP_UNCERTAIN",
-                    detail="disposable PostgreSQL check workspace could not be fully removed",
+        if root is not None:
+            try:
+                shutil.rmtree(root)
+            except OSError:
+                cleanup = "uncertain"
+                uncertain_effects = True
+                limitations.append(
+                    Limitation(
+                        code="VEDAOPS_CHECK_CLEANUP_UNCERTAIN",
+                        detail="disposable PostgreSQL check workspace could not be fully removed",
+                    )
                 )
-            )
 
+    if failure is not None:
+        if uncertain_effects or cleanup != "removed" or postgres_cleanup == "uncertain":
+            journal.terminal("uncertain", detail=str(failure))
+            raise PolicyError(
+                "VEDAOPS_CHECK_EFFECT_UNCERTAIN",
+                f"operation {operation_id} failed with uncertain cleanup/effects; "
+                "inspect before retrying",
+            ) from failure
+        journal.terminal("failed", detail=str(failure))
+        raise failure
     if runtime_identity is None:
-        raise PolicyError("VEDAOPS_CHECK_RUNTIME_UNAVAILABLE", "runtime identity was unavailable")
+        journal.terminal("uncertain", detail="runtime identity unavailable after check execution")
+        raise PolicyError(
+            "VEDAOPS_CHECK_EFFECT_UNCERTAIN",
+            f"operation {operation_id} completed without runtime identity; inspect before retrying",
+        )
+    journal.terminal("uncertain" if uncertain_effects else "succeeded")
     return PostgresCheckRunResult(
         operation_id=operation_id,
         principal_id=project.principal_id,
@@ -305,9 +318,10 @@ def project_postgres_check_run(
         exclusions=exclusions,
         check_id=check.id,
         check_definition_sha256=check_digest,
-        runner_profile="linux-bwrap-postgres18-v1",
+        runner_profile="linux-bwrap-systemd-postgres18-v2",
         runner_sha256=_sha256_file(bwrap),
         limiter_sha256=_sha256_file(prlimit),
+        aggregate_limiter_sha256=_sha256_file(systemd_run),
         outcome=outcome,
         exit_code=exit_code,
         duration_ms=duration_ms,
@@ -338,210 +352,6 @@ def _local_image_id(docker: Path) -> str:
             "the fixed PostgreSQL 18 image is not already available locally",
         )
     return image_id
-
-
-def _trusted_uv_executable(project_root: Path) -> Path:
-    found = shutil.which("uv")
-    if not found:
-        raise PolicyError("VEDAOPS_CHECK_RUNTIME_UNAVAILABLE", "uv is unavailable")
-    path = Path(found).resolve()
-    try:
-        info = path.stat()
-    except OSError as exc:
-        raise PolicyError("VEDAOPS_CHECK_RUNTIME_UNAVAILABLE", "uv is unavailable") from exc
-    if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
-        raise PolicyError("VEDAOPS_CHECK_RUNTIME_UNAVAILABLE", "uv is unavailable")
-    root = project_root.resolve()
-    if path == root or root in path.parents:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "uv must come from the trusted controller environment, not the managed project",
-        )
-    return path
-
-
-def _project_venv(project_root: Path) -> Path:
-    path = project_root / RUNTIME_VENV_RELATIVE
-    try:
-        info = path.lstat()
-    except OSError as exc:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "the pre-provisioned project virtual environment is unavailable",
-        ) from exc
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "the project virtual environment must be a real directory",
-        )
-    return path
-
-
-def _copy_runtime_venv(source: Path, destination: Path) -> None:
-    system_python = Path("/usr/bin/python3")
-    try:
-        python_info = system_python.stat()
-    except OSError as exc:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "trusted system Python is unavailable",
-        ) from exc
-    if not stat.S_ISREG(python_info.st_mode) or not os.access(system_python, os.X_OK):
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "trusted system Python is unavailable",
-        )
-
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            [str(system_python), "-m", "venv", "--without-pip", str(destination)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=RUNTIME_COPY_TIMEOUT_SECONDS,
-            check=False,
-            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "sanitized runtime creation failed",
-        ) from exc
-    if completed.returncode != 0:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "sanitized runtime creation failed",
-        )
-
-    config_path = destination / "pyvenv.cfg"
-    try:
-        config_lines = config_path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "sanitized runtime metadata is unavailable",
-        ) from exc
-    normalized_lines: list[str] = []
-    for line in config_lines:
-        if line.startswith("home = "):
-            normalized_lines.append("home = /usr/bin")
-        elif line.startswith("executable = "):
-            normalized_lines.append("executable = /usr/bin/python3")
-        elif line.startswith("command = "):
-            normalized_lines.append("command = /usr/bin/python3 -m venv /workspace/.venv")
-        else:
-            normalized_lines.append(line)
-    config_path.write_text("\n".join(normalized_lines) + "\n", encoding="utf-8")
-
-    source_sites = sorted(source.glob("lib/python*/site-packages"))
-    target_sites = sorted(destination.glob("lib/python*/site-packages"))
-    if len(source_sites) != 1 or len(target_sites) != 1:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "runtime site-packages layout is unsupported",
-        )
-    source_site = source_sites[0]
-    target_site = target_sites[0]
-    if source_site.parent.name != target_site.parent.name:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "project runtime Python version does not match trusted system Python",
-        )
-
-    files = 0
-    total = 0
-    for current, directories, filenames in os.walk(
-        source_site,
-        topdown=True,
-        followlinks=False,
-    ):
-        if time.monotonic() - started > RUNTIME_COPY_TIMEOUT_SECONDS:
-            raise PolicyError(
-                "VEDAOPS_CHECK_RUNTIME_TOO_LARGE",
-                "runtime capture exceeded its deadline",
-            )
-        current_path = Path(current)
-        relative_dir = current_path.relative_to(source_site)
-        target_dir = target_site / relative_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        directories.sort()
-        filenames.sort()
-        for directory in directories:
-            source_dir = current_path / directory
-            info = source_dir.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                    "runtime packages contain an unsupported directory entry",
-                )
-        for filename in filenames:
-            source_file = current_path / filename
-            target_file = target_dir / filename
-            info = source_file.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                    "runtime packages contain an unsupported file entry",
-                )
-            files += 1
-            total += info.st_size
-            if files > MAX_RUNTIME_FILES or total > MAX_RUNTIME_BYTES:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_TOO_LARGE",
-                    "runtime packages exceed the capture bound",
-                )
-            shutil.copyfile(source_file, target_file)
-            target_file.chmod(stat.S_IMODE(info.st_mode) & 0o777)
-
-
-def _runtime_identity(runtime_dir: Path, uv_path: Path) -> RuntimeIdentity:
-    digest = hashlib.sha256()
-    files = 0
-    total = 0
-    for current, directories, filenames in os.walk(runtime_dir, topdown=True, followlinks=False):
-        directories.sort()
-        filenames.sort()
-        current_path = Path(current)
-        for directory in directories:
-            path = current_path / directory
-            if path.is_symlink():
-                relative = path.relative_to(runtime_dir).as_posix().encode()
-                target = os.readlink(path).encode()
-                digest.update(b"L" + len(relative).to_bytes(4, "big") + relative)
-                digest.update(len(target).to_bytes(4, "big") + target)
-        for filename in filenames:
-            path = current_path / filename
-            relative = path.relative_to(runtime_dir).as_posix().encode()
-            info = path.lstat()
-            files += 1
-            if stat.S_ISLNK(info.st_mode):
-                target = os.readlink(path).encode()
-                digest.update(b"L" + len(relative).to_bytes(4, "big") + relative)
-                digest.update(len(target).to_bytes(4, "big") + target)
-                continue
-            if not stat.S_ISREG(info.st_mode):
-                raise PolicyError("VEDAOPS_CHECK_RUNTIME_UNAVAILABLE", "runtime identity failed")
-            content = path.read_bytes()
-            total += len(content)
-            digest.update(b"F" + len(relative).to_bytes(4, "big") + relative)
-            digest.update(len(content).to_bytes(8, "big") + content)
-    python_path = runtime_dir / "bin" / "python"
-    try:
-        resolved_python = python_path.resolve(strict=True)
-    except OSError as exc:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "runtime Python is unavailable",
-        ) from exc
-    return RuntimeIdentity(
-        kind="project_venv_sanitized",
-        sha256=digest.hexdigest(),
-        files=files,
-        bytes=total,
-        uv_sha256=_sha256_file(uv_path),
-        python_sha256=_sha256_file(resolved_python),
-    )
 
 
 def _scrub_postgres_output(text: str, *, database_url: str, password: str) -> str:

@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import stat
+import sys
 import uuid
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -120,6 +123,26 @@ class EffectiveGrant(BaseModel):
     authorized: bool
 
 
+class ControllerArtifactIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    state: str
+    root: str | None
+    sha256: str | None
+    files: int
+    bytes: int
+
+
+class PythonRuntimeIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: str
+    executable: str
+    sha256: str | None
+    version: str
+
+
 class ServerInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -129,6 +152,9 @@ class ServerInfo(BaseModel):
     source_revision_state: str
     instance_id: str
     started_at: str
+    process_id: int
+    controller_artifact: ControllerArtifactIdentity
+    python_runtime: PythonRuntimeIdentity
     protocol_version: str
     transport: str
     config_source: list[str]
@@ -154,8 +180,89 @@ def tool_catalog_sha256() -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def controller_artifact_identity() -> ControllerArtifactIdentity:
+    """Digest the loaded controller package tree without claiming build attestation."""
+    root = Path(__file__).parent
+    try:
+        root_info = root.lstat()
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            raise OSError("controller package root is not a real directory")
+        digest = hashlib.sha256()
+        files = 0
+        total = 0
+        for current, directories, filenames in os.walk(root, topdown=True, followlinks=False):
+            current_path = Path(current)
+            directories[:] = sorted(item for item in directories if item != "__pycache__")
+            filenames.sort()
+            for directory in directories:
+                info = (current_path / directory).lstat()
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise OSError("controller package contains an aliased directory")
+            for filename in filenames:
+                if filename.endswith((".pyc", ".pyo")):
+                    continue
+                path = current_path / filename
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    raise OSError("controller package contains an unsupported entry")
+                raw = path.read_bytes()
+                relative = path.relative_to(root).as_posix().encode("utf-8")
+                files += 1
+                total += len(raw)
+                if files > 512 or total > 16 * 1024 * 1024:
+                    raise OSError("controller package exceeds identity bounds")
+                digest.update(len(relative).to_bytes(4, "big"))
+                digest.update(relative)
+                digest.update(len(raw).to_bytes(8, "big"))
+                digest.update(raw)
+        return ControllerArtifactIdentity(
+            kind="loaded_package_tree",
+            state="observed",
+            root=str(root.resolve()),
+            sha256=digest.hexdigest(),
+            files=files,
+            bytes=total,
+        )
+    except OSError:
+        return ControllerArtifactIdentity(
+            kind="loaded_package_tree",
+            state="unavailable",
+            root=None,
+            sha256=None,
+            files=0,
+            bytes=0,
+        )
+
+
+def python_runtime_identity() -> PythonRuntimeIdentity:
+    """Observe the Python executable actually hosting this controller process."""
+    executable = Path(sys.executable)
+    try:
+        resolved = executable.resolve(strict=True)
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK):
+            raise OSError("Python executable is unavailable")
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return PythonRuntimeIdentity(
+            state="observed",
+            executable=str(resolved),
+            sha256=digest.hexdigest(),
+            version=sys.version.split()[0],
+        )
+    except OSError:
+        return PythonRuntimeIdentity(
+            state="unavailable",
+            executable=str(executable),
+            sha256=None,
+            version=sys.version.split()[0],
+        )
+
+
 def controller_source_revision() -> tuple[str | None, str]:
-    """Observe this controller's Git HEAD when running from a real checkout."""
+    """Observe nearby checkout HEAD; this is not installed-artifact attestation."""
     from vedaops_mcp.errors import PolicyError
     from vedaops_mcp.policy import run_git_text
 
@@ -179,6 +286,8 @@ def build_server(settings: Settings) -> FastMCP:
     started_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     source_revision, source_revision_state = controller_source_revision()
     catalog_digest = tool_catalog_sha256()
+    artifact_identity = controller_artifact_identity()
+    python_identity = python_runtime_identity()
 
     mcp = FastMCP(
         name=SERVER_NAME,
@@ -212,6 +321,9 @@ def build_server(settings: Settings) -> FastMCP:
             started_at=started_at,
             source_revision=source_revision,
             source_revision_state=source_revision_state,
+            process_id=os.getpid(),
+            artifact_identity=artifact_identity,
+            python_identity=python_identity,
             protocol_version=protocol_value,
             transport=ctx.transport or "in-memory",
             catalog_digest=catalog_digest,
@@ -605,6 +717,9 @@ def _server_info(
     started_at: str,
     source_revision: str | None,
     source_revision_state: str,
+    process_id: int,
+    artifact_identity: ControllerArtifactIdentity,
+    python_identity: PythonRuntimeIdentity,
     protocol_version: str,
     transport: str,
     catalog_digest: str,
@@ -649,6 +764,9 @@ def _server_info(
         source_revision_state=source_revision_state,
         instance_id=instance_id,
         started_at=started_at,
+        process_id=process_id,
+        controller_artifact=artifact_identity,
+        python_runtime=python_identity,
         protocol_version=protocol_version,
         transport=transport,
         config_source=list(settings.config_source),

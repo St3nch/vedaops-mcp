@@ -90,6 +90,18 @@ async def test_server_info_reports_principal_policy_and_catalog(tmp_path: Path):
     assert info["tool_catalog"] == list(TOOL_CATALOG)
     assert info["instance_id"]
     assert info["started_at"]
+    assert info["process_id"] > 0
+    artifact = info["controller_artifact"]
+    assert artifact["state"] == "observed"
+    assert artifact["kind"] == "loaded_package_tree"
+    assert artifact["sha256"] and len(artifact["sha256"]) == 64
+    assert artifact["files"] > 0
+    assert artifact["bytes"] > 0
+    runtime = info["python_runtime"]
+    assert runtime["state"] == "observed"
+    assert runtime["sha256"] and len(runtime["sha256"]) == 64
+    assert runtime["executable"]
+    assert runtime["version"]
     grants = {item["project_id"]: item for item in info["effective_grants"]}
     assert grants["example"]["workspace_id"] == "primary"
     assert grants["example"]["authorized"] is True

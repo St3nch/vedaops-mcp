@@ -34,10 +34,15 @@ timeout_seconds = 30
 memory_mb = 512
 runtime = "system"
 
-# PostgreSQL checks are still ordinary operator-approved checks. The substrate
-# choice is policy, not caller input. The project must already have a
-# provisioned .venv; MCP-03 captures its installed packages into a sanitized
-# temporary runtime and supplies only a disposable PostgreSQL Unix socket.
+# `runtime = "project_venv"` is also valid for ordinary checks that need the
+# project's pinned installed dependencies or console executables. The project
+# must already have a provisioned .venv; VedaOps captures it into a sanitized
+# temporary runtime rather than mounting the live venv. Editable project paths
+# are retargeted to the disposable `/workspace` snapshot.
+#
+# PostgreSQL checks are ordinary operator-approved checks with an additional
+# fixed substrate selected by policy, not by the caller. They receive only a
+# disposable PostgreSQL Unix socket.
 [[projects.checks]]
 id = "postgres-proof"
 argv = ["/runtime/bin/uv", "run", "--offline", "--no-sync", "python", "-m", "example.postgres_proof"]

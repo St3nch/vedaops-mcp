@@ -204,3 +204,46 @@ def test_tree_skips_protected_tracked_secrets(tmp_path: Path):
     paths = {entry.path for entry in tree.entries}
     assert ".env" not in paths
     assert tree.skipped_count >= 1
+
+
+def test_git_refs_indirection_outside_project_is_refused(tmp_path: Path):
+    root = tmp_path / "project"
+    init_project(root)
+    refs = root / ".git" / "refs"
+    outside_refs = tmp_path / "outside-refs"
+    refs.rename(outside_refs)
+    refs.symlink_to(outside_refs, target_is_directory=True)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_PROJECT_CONFIG_UNSAFE"):
+        ensure_git_repository(root)
+
+    assert not (outside_refs / "heads" / "ticket" / "escape").exists()
+
+
+def test_promisor_partial_clone_configuration_fails_closed_before_git_reads(tmp_path: Path):
+    root = tmp_path / "project"
+    init_project(root)
+    registry = write_registry(tmp_path / "projects.toml", root=root)
+    git(root, "config", "remote.origin.url", str(tmp_path / "donor.git"))
+    git(root, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    git(root, "config", "remote.origin.promisor", "true")
+    git(root, "config", "remote.origin.partialCloneFilter", "blob:none")
+
+    with pytest.raises(PolicyError, match="VEDAOPS_PROJECT_CONFIG_UNSAFE"):
+        project_file_read(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            path="README.md",
+        )
+
+
+def test_git_object_alternates_are_refused(tmp_path: Path):
+    root = tmp_path / "project"
+    init_project(root)
+    alternates = root / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(str(tmp_path / "outside-objects") + "\n")
+
+    with pytest.raises(PolicyError, match="VEDAOPS_PROJECT_CONFIG_UNSAFE"):
+        ensure_git_repository(root)

@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import shutil
+import venv
 from pathlib import Path
 
 import pytest
 from support import git, init_project, write_registry
 
+import vedaops_mcp.checks as checks_module
+from vedaops_mcp.authority import RegisteredCheck
 from vedaops_mcp.checks import project_check_run
 from vedaops_mcp.errors import AuthorityError, PolicyError
+from vedaops_mcp.runtime import capture_project_runtime
 
-RUNNER_AVAILABLE = Path("/usr/bin/bwrap").is_file() and Path("/usr/bin/prlimit").is_file()
+RUNNER_AVAILABLE = all(
+    path.is_file()
+    for path in (
+        Path("/usr/bin/bwrap"),
+        Path("/usr/bin/prlimit"),
+        Path("/usr/bin/systemd-run"),
+    )
+)
 
 
 def _registry_with_check(
@@ -22,6 +33,7 @@ def _registry_with_check(
     argv: tuple[str, ...] = ("/usr/bin/python3", "check.py"),
     timeout_seconds: int = 10,
     memory_mb: int = 512,
+    runtime: str = "system",
 ) -> Path:
     argv_toml = ", ".join(repr(item) for item in argv)
     checks = (
@@ -30,6 +42,7 @@ def _registry_with_check(
         f"argv = [{argv_toml}]\n"
         f"timeout_seconds = {timeout_seconds}\n"
         f"memory_mb = {memory_mb}\n"
+        f"runtime = {runtime!r}\n"
     )
     return write_registry(
         tmp_path / "projects.toml",
@@ -97,7 +110,8 @@ print("sandbox-ok")
     assert result.captured_commit == head
     assert len(result.captured_input_sha256) == 64
     assert len(result.check_definition_sha256) == 64
-    assert result.runner_profile == "linux-bwrap-v1"
+    assert result.runner_profile == "linux-bwrap-systemd-v2"
+    assert len(result.aggregate_limiter_sha256) == 64
     assert result.cleanup == "removed"
     assert result.uncertain_effects is False
     assert "working_tree_and_untracked_changes" in result.exclusions
@@ -125,6 +139,37 @@ def test_check_executes_commit_snapshot_not_dirty_working_tree(tmp_path: Path):
     assert result.outcome == "passed", result.stderr
     assert result.stdout.strip() == "committed"
     assert "dirty" not in result.stdout
+
+
+@pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
+def test_check_workspace_is_writable_but_disposable(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(
+        root,
+        capabilities=("read", "check"),
+        files={
+            "check.py": (
+                "from pathlib import Path\n"
+                "path = Path('.tool-cache')\n"
+                "path.write_text('cache-ok')\n"
+                "print(path.read_text())\n"
+            )
+        },
+    )
+    registry = _registry_with_check(tmp_path, root)
+
+    result = project_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="isolation",
+    )
+
+    assert result.outcome == "passed", result.stderr
+    assert result.stdout.strip() == "cache-ok"
+    assert not (root / ".tool-cache").exists()
+    assert result.cleanup == "removed"
 
 
 @pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
@@ -281,6 +326,181 @@ def test_check_output_is_bounded_and_truncation_is_explicit(tmp_path: Path):
     assert result.stdout_truncated is True
     assert len(result.stdout.encode("utf-8")) <= 128 * 1024
     assert result.cleanup == "removed"
+
+
+@pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
+def test_ordinary_check_can_use_sanitized_project_venv(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(root, capabilities=("read", "check"))
+    venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    sites = sorted((root / ".venv" / "lib").glob("python*/site-packages"))
+    assert len(sites) == 1
+    (sites[0] / "runtime_marker.py").write_text("VALUE = 'captured-runtime'\n")
+    registry = _registry_with_check(
+        tmp_path,
+        root,
+        check_id="runtime",
+        argv=(
+            "/workspace/.venv/bin/python",
+            "-c",
+            "import runtime_marker; print(runtime_marker.VALUE)",
+        ),
+        runtime="project_venv",
+    )
+
+    result = project_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="runtime",
+    )
+
+    assert result.outcome == "passed", result.stderr
+    assert result.stdout.strip() == "captured-runtime"
+    assert result.runtime is not None
+    assert result.runtime.kind == "project_venv_sanitized"
+    assert len(result.runtime.sha256) == 64
+
+
+@pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
+def test_ordinary_check_preserves_editable_project_install_outside_workspace_cwd(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(
+        root,
+        capabilities=("read", "check"),
+        files={"src/editable_demo/__init__.py": "VALUE = 'editable-runtime'\n"},
+    )
+    venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    sites = sorted((root / ".venv" / "lib").glob("python*/site-packages"))
+    assert len(sites) == 1
+    (sites[0] / "editable-demo.pth").write_text(str(root / "src") + "\n")
+    registry = _registry_with_check(
+        tmp_path,
+        root,
+        check_id="editable-runtime",
+        argv=(
+            "/workspace/.venv/bin/python",
+            "-c",
+            "import os; os.chdir('/tmp'); import editable_demo; print(editable_demo.VALUE)",
+        ),
+        runtime="project_venv",
+    )
+
+    result = project_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="editable-runtime",
+    )
+
+    assert result.outcome == "passed", result.stderr
+    assert result.stdout.strip() == "editable-runtime"
+    assert result.runtime is not None
+
+
+@pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
+def test_ordinary_check_can_use_captured_venv_console_executable(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(root, capabilities=("read", "check"))
+    venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    sites = sorted((root / ".venv" / "lib").glob("python*/site-packages"))
+    assert len(sites) == 1
+    (sites[0] / "runtime_marker.py").write_text("VALUE = 'console-runtime'\n")
+    tool = root / ".venv" / "bin" / "runtime-tool"
+    tool.write_text(
+        f"#!{root / '.venv' / 'bin' / 'python'}\n"
+        "from runtime_marker import VALUE\n"
+        "print(VALUE)\n"
+    )
+    tool.chmod(0o755)
+    registry = _registry_with_check(
+        tmp_path,
+        root,
+        check_id="runtime-tool",
+        argv=("/workspace/.venv/bin/runtime-tool",),
+        runtime="project_venv",
+    )
+
+    result = project_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="runtime-tool",
+    )
+
+    assert result.outcome == "passed", result.stderr
+    assert result.stdout.strip() == "console-runtime"
+    assert result.runtime is not None
+
+
+def test_runtime_builder_ignores_repo_local_venv_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    root.mkdir()
+    venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    marker = tmp_path / "controller-executed.txt"
+    (root / "venv.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed')\n"
+    )
+    destination = tmp_path / "runtime"
+    uv_copy = tmp_path / "uv"
+    monkeypatch.chdir(root)
+
+    identity = capture_project_runtime(root, destination, uv_copy)
+
+    assert identity.kind == "project_venv_sanitized"
+    assert not marker.exists()
+
+
+def test_sandbox_argv_wraps_worker_in_aggregate_systemd_scope(tmp_path: Path):
+    check = RegisteredCheck(
+        id="limits",
+        argv=["/usr/bin/true"],
+        timeout_seconds=5,
+        memory_mb=256,
+    )
+    argv = checks_module._sandbox_argv(
+        bwrap=Path("/usr/bin/bwrap"),
+        prlimit=Path("/usr/bin/prlimit"),
+        systemd_run=Path("/usr/bin/systemd-run"),
+        snapshot_dir=tmp_path,
+        check=check,
+        timeout_seconds=5,
+    )
+
+    assert argv[:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
+    assert "--property=MemoryMax=268435456" in argv
+    assert "--property=MemorySwapMax=0" in argv
+    assert f"--property=TasksMax={checks_module.MAX_WORKER_TASKS}" in argv
+    assert "/usr/bin/bwrap" in argv
+
+
+def test_check_admission_refuses_when_global_capacity_is_exhausted(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(root, capabilities=("read", "check"))
+    registry = _registry_with_check(tmp_path, root)
+    acquired = 0
+    try:
+        for _ in range(checks_module.MAX_CONCURRENT_CHECKS):
+            assert checks_module._CHECK_ADMISSION.acquire(blocking=False)
+            acquired += 1
+        with pytest.raises(PolicyError, match="VEDAOPS_CHECK_CAPACITY_REACHED"):
+            project_check_run(
+                registry,
+                principal_id="test-agent",
+                project_id="example",
+                expected_git_head=head,
+                check_id="isolation",
+            )
+    finally:
+        for _ in range(acquired):
+            checks_module._CHECK_ADMISSION.release()
 
 
 def test_runner_availability_is_host_specific():

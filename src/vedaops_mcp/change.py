@@ -13,7 +13,6 @@ import re
 import stat
 import subprocess
 import tempfile
-import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath
@@ -22,20 +21,26 @@ from pydantic import BaseModel, ConfigDict
 
 from vedaops_mcp.authority import AuthorizedProject, get_authorized_project
 from vedaops_mcp.errors import AuthorityError, PolicyError
+from vedaops_mcp.operations import start_operation
 from vedaops_mcp.policy import (
     MAX_FILE_BYTES,
     MAX_GIT_RESULT_BYTES,
+    atomic_write_project_file,
     ensure_mutation_path,
     ensure_not_ignored,
+    ensure_project_parent_directories,
     git_environment,
     literal_pathspec,
     normalize_relative,
+    project_lstat,
     protected_reason,
     read_bounded_file,
+    remove_project_empty_directories,
     resolve_within_root,
     run_git_bytes,
     run_git_input,
     run_git_text,
+    unlink_project_file,
 )
 
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -181,19 +186,16 @@ def project_file_write(
     )
     with _project_lock(project.root):
         _require_head(project.root, expected_git_head)
-        normalized, target = _mutation_target(project.root, path, must_exist=False)
+        normalized, _target = _mutation_target(project.root, path, must_exist=False)
         before_raw: bytes | None = None
         before_mode = 0o644
-        try:
-            info = target.lstat()
-        except FileNotFoundError:
+        info = project_lstat(project.root, normalized)
+        if info is None:
             if expected_digest is not None:
                 raise PolicyError(
                     "VEDAOPS_CHANGE_PRECONDITION_FAILED",
                     "expected_sha256 was supplied but the target does not exist",
-                ) from None
-        except OSError as exc:
-            raise PolicyError("VEDAOPS_FILE_UNAVAILABLE", normalized) from exc
+                )
         else:
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                 raise PolicyError("VEDAOPS_PATH_FORBIDDEN", f"{normalized} is not a regular file")
@@ -217,20 +219,60 @@ def project_file_write(
             if before_raw == raw:
                 raise PolicyError("VEDAOPS_INVALID_ARGUMENT", "write would not change the file")
 
-        created_dirs = _ensure_parent_directories(project.root, target.parent)
+        created_dirs = ensure_project_parent_directories(project.root, normalized)
+        journal = start_operation(
+            registry_path,
+            kind="file_write",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
+        )
         try:
-            _atomic_write(target, raw, before_mode)
+            atomic_write_project_file(project.root, normalized, raw, before_mode)
             _verify_file(project.root, normalized, raw)
             _require_head(project.root, expected_git_head)
-        except Exception:
-            if before_raw is None:
-                target.unlink(missing_ok=True)
-                _remove_empty_directories(created_dirs)
-            else:
-                _atomic_write(target, before_raw, before_mode)
-            raise
+        except Exception as exc:
+            try:
+                current_info = project_lstat(project.root, normalized)
+                if before_raw is None:
+                    if current_info is not None:
+                        current_raw, _current_info = read_bounded_file(
+                            project.root,
+                            normalized,
+                            limit_bytes=MAX_FILE_BYTES,
+                        )
+                        if current_raw != raw:
+                            raise _change_effect_uncertain("file creation rollback")
+                        unlink_project_file(project.root, normalized)
+                    remove_project_empty_directories(project.root, created_dirs)
+                else:
+                    if current_info is None:
+                        raise _change_effect_uncertain("file replacement rollback")
+                    current_raw, _current_info = read_bounded_file(
+                        project.root,
+                        normalized,
+                        limit_bytes=MAX_FILE_BYTES,
+                    )
+                    if current_raw == raw:
+                        atomic_write_project_file(
+                            project.root,
+                            normalized,
+                            before_raw,
+                            before_mode,
+                        )
+                    elif current_raw != before_raw:
+                        raise _change_effect_uncertain("file replacement rollback")
+            except Exception as rollback_exc:
+                journal.terminal("uncertain", detail=str(rollback_exc))
+                if isinstance(rollback_exc, PolicyError) and rollback_exc.code == (
+                    "VEDAOPS_CHANGE_EFFECT_UNCERTAIN"
+                ):
+                    raise
+                raise _change_effect_uncertain("file mutation rollback") from rollback_exc
+            journal.terminal("failed", detail=str(exc))
+            raise exc
+        journal.terminal("succeeded")
         return FileChangeResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             git_head=expected_git_head,
@@ -273,7 +315,7 @@ def project_text_replace(
     expected_digest = _required_sha256(expected_sha256)
     with _project_lock(project.root):
         _require_head(project.root, expected_git_head)
-        normalized, target = _mutation_target(project.root, path, must_exist=True)
+        normalized, _target = _mutation_target(project.root, path, must_exist=True)
         raw, info = read_bounded_file(project.root, normalized, limit_bytes=MAX_FILE_BYTES)
         if info.st_size > MAX_FILE_BYTES or len(raw) != info.st_size:
             raise PolicyError("VEDAOPS_CHANGE_TOO_LARGE", "file exceeds the hard limit")
@@ -297,15 +339,42 @@ def project_text_replace(
         if len(updated) > MAX_FILE_BYTES:
             raise PolicyError("VEDAOPS_CHANGE_TOO_LARGE", "replacement exceeds the hard limit")
         mode = stat.S_IMODE(info.st_mode)
+        journal = start_operation(
+            registry_path,
+            kind="text_replace",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
+        )
         try:
-            _atomic_write(target, updated, mode)
+            atomic_write_project_file(project.root, normalized, updated, mode)
             _verify_file(project.root, normalized, updated)
             _require_head(project.root, expected_git_head)
-        except Exception:
-            _atomic_write(target, raw, mode)
-            raise
+        except Exception as exc:
+            try:
+                current_info = project_lstat(project.root, normalized)
+                if current_info is None:
+                    raise _change_effect_uncertain("text replacement rollback")
+                current_raw, _current_info = read_bounded_file(
+                    project.root,
+                    normalized,
+                    limit_bytes=MAX_FILE_BYTES,
+                )
+                if current_raw == updated:
+                    atomic_write_project_file(project.root, normalized, raw, mode)
+                elif current_raw != raw:
+                    raise _change_effect_uncertain("text replacement rollback")
+            except Exception as rollback_exc:
+                journal.terminal("uncertain", detail=str(rollback_exc))
+                if isinstance(rollback_exc, PolicyError) and rollback_exc.code == (
+                    "VEDAOPS_CHANGE_EFFECT_UNCERTAIN"
+                ):
+                    raise
+                raise _change_effect_uncertain("text replacement rollback") from rollback_exc
+            journal.terminal("failed", detail=str(exc))
+            raise exc
+        journal.terminal("succeeded")
         return FileChangeResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             git_head=expected_git_head,
@@ -336,7 +405,7 @@ def project_file_delete(
     expected_digest = _required_sha256(expected_sha256)
     with _project_lock(project.root):
         _require_head(project.root, expected_git_head)
-        normalized, target = _mutation_target(project.root, path, must_exist=True)
+        normalized, _target = _mutation_target(project.root, path, must_exist=True)
         raw, info = read_bounded_file(project.root, normalized, limit_bytes=MAX_FILE_BYTES)
         if info.st_size > MAX_FILE_BYTES or len(raw) != info.st_size:
             raise PolicyError("VEDAOPS_CHANGE_TOO_LARGE", "file exceeds the hard limit")
@@ -347,17 +416,42 @@ def project_file_delete(
                 "file SHA-256 does not match expected_sha256",
             )
         mode = stat.S_IMODE(info.st_mode)
+        journal = start_operation(
+            registry_path,
+            kind="file_delete",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
+        )
         try:
-            target.unlink()
-            if target.exists() or target.is_symlink():
+            unlink_project_file(project.root, normalized)
+            if project_lstat(project.root, normalized) is not None:
                 raise PolicyError("VEDAOPS_CHANGE_VERIFY_FAILED", "deleted file still exists")
             _require_head(project.root, expected_git_head)
-        except Exception:
-            if not target.exists():
-                _atomic_write(target, raw, mode)
-            raise
+        except Exception as exc:
+            try:
+                current_info = project_lstat(project.root, normalized)
+                if current_info is None:
+                    atomic_write_project_file(project.root, normalized, raw, mode)
+                else:
+                    current_raw, _current_info = read_bounded_file(
+                        project.root,
+                        normalized,
+                        limit_bytes=MAX_FILE_BYTES,
+                    )
+                    if current_raw != raw:
+                        raise _change_effect_uncertain("file deletion rollback")
+            except Exception as rollback_exc:
+                journal.terminal("uncertain", detail=str(rollback_exc))
+                if isinstance(rollback_exc, PolicyError) and rollback_exc.code == (
+                    "VEDAOPS_CHANGE_EFFECT_UNCERTAIN"
+                ):
+                    raise
+                raise _change_effect_uncertain("file deletion rollback") from rollback_exc
+            journal.terminal("failed", detail=str(exc))
+            raise exc
+        journal.terminal("succeeded")
         return FileChangeResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             git_head=expected_git_head,
@@ -392,13 +486,18 @@ def project_patch_apply(
     with _project_lock(project.root):
         _require_head(project.root, expected_git_head)
         paths = _validated_patch_paths(project.root, patch)
-        snapshots = [_snapshot_path(project.root, item) for item in paths]
         run_git_input(
             project.root,
             "apply",
             "--check",
             "--whitespace=nowarn",
             input_bytes=raw,
+        )
+        journal = start_operation(
+            registry_path,
+            kind="patch_apply",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
         )
         try:
             run_git_input(
@@ -409,11 +508,12 @@ def project_patch_apply(
             )
             _verify_patch_targets(project.root, paths)
             _require_head(project.root, expected_git_head)
-        except Exception:
-            _restore_snapshots(project.root, snapshots)
-            raise
+        except Exception as exc:
+            journal.terminal("uncertain", detail=str(exc))
+            raise _change_effect_uncertain("patch application") from exc
+        journal.terminal("succeeded")
         return PatchApplyResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             git_head=expected_git_head,
@@ -570,17 +670,29 @@ def project_git_commit(
                 f"requested path {missing[0]!r} has no working-tree change",
             )
         pathspecs = [literal_pathspec(item) for item in commit_paths]
-        run_git_text(project.root, "add", "-A", "--", *pathspecs)
-        staged = _nul_paths(
-            run_git_bytes(project.root, "diff", "--cached", "--name-only", "-z", "--no-renames")
+        journal = start_operation(
+            registry_path,
+            kind="git_commit",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
         )
-        if set(staged) != set(commit_paths) or len(staged) != len(commit_paths):
-            _unstage_paths(project.root, commit_paths)
-            raise PolicyError(
-                "VEDAOPS_COMMIT_PATH_MISMATCH",
-                "staged path set does not exactly match requested commit paths",
-            )
         try:
+            run_git_text(project.root, "add", "-A", "--", *pathspecs)
+            staged = _nul_paths(
+                run_git_bytes(
+                    project.root,
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                )
+            )
+            if set(staged) != set(commit_paths) or len(staged) != len(commit_paths):
+                raise PolicyError(
+                    "VEDAOPS_COMMIT_PATH_MISMATCH",
+                    "staged path set does not exactly match requested commit paths",
+                )
             run_git_text(
                 project.root,
                 "commit",
@@ -589,10 +701,6 @@ def project_git_commit(
                 "-m",
                 commit_message,
             )
-        except Exception:
-            _unstage_paths(project.root, commit_paths)
-            raise
-        try:
             new_head = run_git_text(project.root, "rev-parse", "HEAD")
             parent = run_git_text(project.root, "rev-parse", f"{new_head}^")
             committed = _nul_paths(
@@ -619,9 +727,11 @@ def project_git_commit(
                 )
             remaining_status = _status_text(project.root)
         except Exception as exc:
+            journal.terminal("uncertain", detail=str(exc))
             raise _git_effect_uncertain("local commit") from exc
+        journal.terminal("succeeded")
         return GitCommitResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             branch=branch,
@@ -654,23 +764,31 @@ def project_git_branch_create(
         _require_clean(project.root)
         if _branch_head(project.root, branch) is not None:
             raise PolicyError("VEDAOPS_BRANCH_EXISTS", f"local branch {branch!r} already exists")
-        run_git_text(
-            project.root,
-            "switch",
-            "--no-guess",
-            "--no-track",
-            "-c",
-            branch,
-            expected_git_head,
+        journal = start_operation(
+            registry_path,
+            kind="git_branch_create",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
         )
         try:
+            run_git_text(
+                project.root,
+                "switch",
+                "--no-guess",
+                "--no-track",
+                "-c",
+                branch,
+                expected_git_head,
+            )
             if _require_current_branch(project.root) != branch:
                 raise PolicyError("VEDAOPS_GIT_VERIFY_FAILED", "new branch was not selected")
             _require_head(project.root, expected_git_head)
         except Exception as exc:
+            journal.terminal("uncertain", detail=str(exc))
             raise _git_effect_uncertain("local branch creation/switch") from exc
+        journal.terminal("succeeded")
         return BranchChangeResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             action="created_and_switched",
@@ -717,15 +835,23 @@ def project_git_switch(
             )
         _require_clean(project.root)
         _require_safe_tree_transition(project.root, expected_git_head, target_head)
-        run_git_text(project.root, "switch", "--no-guess", branch)
+        journal = start_operation(
+            registry_path,
+            kind="git_switch",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
+        )
         try:
+            run_git_text(project.root, "switch", "--no-guess", branch)
             if _require_current_branch(project.root) != branch:
                 raise PolicyError("VEDAOPS_GIT_VERIFY_FAILED", "target branch was not selected")
             _require_head(project.root, target_head)
         except Exception as exc:
+            journal.terminal("uncertain", detail=str(exc))
             raise _git_effect_uncertain("local branch switch") from exc
+        journal.terminal("succeeded")
         return BranchChangeResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             action="switched",
@@ -780,16 +906,24 @@ def project_git_merge_ff(
                 "source branch cannot fast-forward the current target",
             )
         _require_safe_tree_transition(project.root, expected_git_head, source_head)
-        run_git_text(project.root, "merge", "--ff-only", "--no-edit", source)
+        journal = start_operation(
+            registry_path,
+            kind="git_merge_ff",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
+        )
         try:
+            run_git_text(project.root, "merge", "--ff-only", "--no-edit", source_head)
             _require_head(project.root, source_head)
             if _require_current_branch(project.root) != target:
                 raise PolicyError("VEDAOPS_GIT_VERIFY_FAILED", "target branch changed unexpectedly")
             _require_clean(project.root)
         except Exception as exc:
+            journal.terminal("uncertain", detail=str(exc))
             raise _git_effect_uncertain("local fast-forward integration") from exc
+        journal.terminal("succeeded")
         return GitMergeResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             target_branch=target,
@@ -849,17 +983,25 @@ def project_git_branch_delete(
                 "VEDAOPS_BRANCH_DELETE_REFUSED",
                 "branch is not merged into the current target",
             )
-        run_git_text(project.root, "branch", "-d", "--", branch)
+        journal = start_operation(
+            registry_path,
+            kind="git_branch_delete",
+            project_id=project.id,
+            expected_git_head=expected_git_head,
+        )
         try:
+            run_git_text(project.root, "branch", "-d", "--", branch)
             if _branch_head(project.root, branch) is not None:
                 raise PolicyError(
                     "VEDAOPS_GIT_VERIFY_FAILED",
                     "local branch deletion was not verified",
                 )
         except Exception as exc:
+            journal.terminal("uncertain", detail=str(exc))
             raise _git_effect_uncertain("local branch deletion") from exc
+        journal.terminal("succeeded")
         return BranchDeleteResult(
-            operation_id=uuid.uuid4().hex,
+            operation_id=journal.operation_id,
             project_id=project.id,
             workspace_id=project.workspace_id,
             branch=branch,
@@ -875,6 +1017,13 @@ def _git_effect_uncertain(action: str) -> PolicyError:
         "VEDAOPS_GIT_EFFECT_UNCERTAIN",
         f"{action} may have changed local Git state; inspect branch, HEAD, index, and working "
         "tree before retrying",
+    )
+
+
+def _change_effect_uncertain(action: str) -> PolicyError:
+    return PolicyError(
+        "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+        f"{action} could not prove rollback; inspect the exact path before retrying",
     )
 
 
@@ -997,65 +1146,50 @@ def _verify_file(root: Path, path: str, expected: bytes) -> None:
 
 
 def _validated_patch_paths(root: Path, patch: str) -> list[str]:
+    """Authorize the complete effect set parsed by Git, not a hand-parsed prefix."""
+    raw_patch = patch.encode("utf-8")
+    summary = run_git_input(
+        root,
+        "apply",
+        "--summary",
+        "--whitespace=nowarn",
+        input_bytes=raw_patch,
+    )
+    if summary.strip():
+        raise PolicyError(
+            "VEDAOPS_PATCH_INVALID",
+            "patch structural effects such as create/delete/rename/copy/mode are not allowed",
+        )
+    numstat = run_git_input(
+        root,
+        "apply",
+        "--numstat",
+        "-z",
+        "--whitespace=nowarn",
+        input_bytes=raw_patch,
+    )
     paths: list[str] = []
-    current: str | None = None
-    in_hunk = False
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
-            in_hunk = False
-            parts = line.split(" ")
-            if len(parts) != 4 or not parts[2].startswith("a/") or not parts[3].startswith("b/"):
-                raise PolicyError("VEDAOPS_PATCH_INVALID", "patch must use unquoted Git diff paths")
-            left = parts[2][2:]
-            right = parts[3][2:]
-            if left != right:
-                raise PolicyError(
-                    "VEDAOPS_PATCH_INVALID",
-                    "patch rename/copy semantics are not allowed",
-                )
-            current = normalize_relative(left)
-            _mutation_target(root, current, must_exist=True)
-            paths.append(current)
+    for record in numstat.split(b"\x00"):
+        if not record:
             continue
-        if line.startswith("@@"):
-            if current is None:
-                raise PolicyError(
-                    "VEDAOPS_PATCH_INVALID",
-                    "patch hunk appears before a file header",
-                )
-            in_hunk = True
-            continue
-        if in_hunk:
-            continue
-        if line.startswith("--- "):
-            if current is None or line[4:] != f"a/{current}":
-                raise PolicyError(
-                    "VEDAOPS_PATCH_INVALID",
-                    "patch old-file header must name its existing Git diff path",
-                )
-            continue
-        if line.startswith("+++ "):
-            if current is None or line[4:] != f"b/{current}":
-                raise PolicyError(
-                    "VEDAOPS_PATCH_INVALID",
-                    "patch new-file header must name its existing Git diff path",
-                )
-            continue
-        if line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
-            raise PolicyError("VEDAOPS_PATCH_INVALID", "rename/copy patches are not allowed")
-        if line.startswith(
-            (
-                "old mode ",
-                "new mode ",
-                "new file mode ",
-                "deleted file mode ",
-                "GIT binary patch",
-                "Binary files ",
-            )
-        ):
-            raise PolicyError("VEDAOPS_PATCH_INVALID", "mode/binary patches are not allowed")
-        if line.startswith("index ") and " 160000" in line:
-            raise PolicyError("VEDAOPS_PATCH_INVALID", "submodule patches are not allowed")
+        try:
+            added, deleted, raw_path = record.split(b"\t", 2)
+            path = normalize_relative(raw_path.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, PolicyError) as exc:
+            raise PolicyError(
+                "VEDAOPS_PATCH_INVALID",
+                "Git patch effect output was malformed",
+            ) from exc
+        if not added.isdigit() or not deleted.isdigit():
+            raise PolicyError("VEDAOPS_PATCH_INVALID", "binary patch effects are not allowed")
+        try:
+            _mutation_target(root, path, must_exist=True)
+        except PolicyError as exc:
+            raise PolicyError(
+                "VEDAOPS_PATCH_INVALID",
+                "patch targets a path outside the permitted Change surface",
+            ) from exc
+        paths.append(path)
     if not paths or len(paths) > MAX_PATCH_FILES or len(paths) != len(set(paths)):
         raise PolicyError("VEDAOPS_PATCH_INVALID", "patch must affect unique bounded files")
     return paths
@@ -1266,6 +1400,25 @@ def _require_safe_tree_transition(root: Path, from_head: str, to_head: str) -> N
         )
     for path in paths:
         ensure_mutation_path(path)
+
+    if paths:
+        ignored = _nul_paths(
+            run_git_bytes(
+                root,
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+                *(literal_pathspec(path) for path in paths),
+            )
+        )
+        if ignored:
+            raise PolicyError(
+                "VEDAOPS_WORKTREE_COLLISION",
+                f"branch transition would overwrite ignored work at {ignored[0]!r}",
+            )
 
     from_entries = _tree_entries(root, from_head, paths)
     to_entries = _tree_entries(root, to_head, paths)

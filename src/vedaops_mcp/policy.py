@@ -8,11 +8,14 @@ Git is invoked against a project root.
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
+import secrets
 import stat
 import subprocess
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 
 from vedaops_mcp.errors import PolicyError
@@ -85,8 +88,6 @@ SAFE_LOCAL_GIT_CONFIG_FAMILIES = {
         {
             "fetch",
             "mirror",
-            "partialclonefilter",
-            "promisor",
             "pushurl",
             "tagopt",
             "url",
@@ -217,6 +218,33 @@ def resolve_within_root(root: Path, relative_path: str, *, must_exist: bool) -> 
     return resolved
 
 
+def _open_project_parent(root: Path, relative_path: str) -> tuple[int, str, os.stat_result]:
+    """Pin every parent directory without following a project-controlled symlink."""
+    normalized = normalize_relative(relative_path)
+    parts = PurePosixPath(normalized).parts
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as exc:
+        raise PolicyError("VEDAOPS_PATH_ESCAPE", "project root could not be pinned") from exc
+    try:
+        root_info = os.fstat(descriptor)
+        for part in parts[:-1]:
+            try:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise PolicyError(
+                    "VEDAOPS_PATH_FORBIDDEN",
+                    f"{normalized} contains an unavailable or symlinked parent",
+                ) from exc
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor, parts[-1], root_info
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def read_bounded_file(
     root: Path,
     relative_path: str,
@@ -224,11 +252,24 @@ def read_bounded_file(
     offset_bytes: int = 0,
     limit_bytes: int,
 ) -> tuple[bytes, os.stat_result]:
-    """Open and read one bounded regular file without following a final symlink."""
-    resolved = resolve_within_root(root, relative_path, must_exist=True)
+    """Read one bounded regular file through pinned no-follow path components."""
+    normalized = normalize_relative(relative_path)
+    ensure_not_protected(normalized)
+    parent_descriptor, filename, root_info = _open_project_parent(root, normalized)
     try:
-        descriptor = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        entry = os.stat(filename, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(entry.st_mode):
+            raise PolicyError("VEDAOPS_PATH_FORBIDDEN", f"{normalized} is a symlink")
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_descriptor,
+        )
+    except PolicyError:
+        os.close(parent_descriptor)
+        raise
     except OSError as exc:
+        os.close(parent_descriptor)
         raise PolicyError(
             "VEDAOPS_FILE_UNAVAILABLE",
             _filesystem_error_detail(relative_path, exc),
@@ -237,7 +278,7 @@ def read_bounded_file(
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise PolicyError("VEDAOPS_FILE_UNAVAILABLE", f"{relative_path} is not a regular file")
-        if info.st_dev != root.stat().st_dev:
+        if info.st_dev != root_info.st_dev:
             raise PolicyError("VEDAOPS_PATH_DEVICE_ESCAPE", relative_path)
         if offset_bytes:
             os.lseek(descriptor, offset_bytes, os.SEEK_SET)
@@ -251,7 +292,215 @@ def read_bounded_file(
         ) from exc
     finally:
         os.close(descriptor)
+        os.close(parent_descriptor)
     return raw, info
+
+
+def read_bounded_file_with_digest(
+    root: Path,
+    relative_path: str,
+    *,
+    offset_bytes: int,
+    limit_bytes: int,
+    digest_limit_bytes: int,
+) -> tuple[bytes, os.stat_result, str | None]:
+    """Read one window and optional digest from the same pinned file descriptor."""
+    normalized = normalize_relative(relative_path)
+    ensure_not_protected(normalized)
+    parent_descriptor, filename, root_info = _open_project_parent(root, normalized)
+    try:
+        entry = os.stat(filename, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(entry.st_mode):
+            raise PolicyError("VEDAOPS_PATH_FORBIDDEN", f"{normalized} is a symlink")
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_descriptor,
+        )
+    except PolicyError:
+        os.close(parent_descriptor)
+        raise
+    except OSError as exc:
+        os.close(parent_descriptor)
+        raise PolicyError(
+            "VEDAOPS_FILE_UNAVAILABLE",
+            _filesystem_error_detail(relative_path, exc),
+        ) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise PolicyError("VEDAOPS_FILE_UNAVAILABLE", f"{relative_path} is not a regular file")
+        if info.st_dev != root_info.st_dev:
+            raise PolicyError("VEDAOPS_PATH_DEVICE_ESCAPE", relative_path)
+        digest: str | None = None
+        if info.st_size <= digest_limit_bytes:
+            whole = bytearray()
+            while len(whole) <= digest_limit_bytes:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, digest_limit_bytes + 1 - len(whole)),
+                )
+                if not chunk:
+                    break
+                whole.extend(chunk)
+            if len(whole) != info.st_size:
+                raise PolicyError(
+                    "VEDAOPS_FILE_UNAVAILABLE",
+                    "file changed while it was being captured",
+                )
+            digest = hashlib.sha256(whole).hexdigest()
+            raw = bytes(whole[offset_bytes : offset_bytes + limit_bytes + 1])
+        else:
+            if offset_bytes:
+                os.lseek(descriptor, offset_bytes, os.SEEK_SET)
+            raw = os.read(descriptor, limit_bytes + 1)
+        return raw, info, digest
+    except PolicyError:
+        raise
+    except OSError as exc:
+        raise PolicyError(
+            "VEDAOPS_FILE_UNAVAILABLE",
+            _filesystem_error_detail(relative_path, exc),
+        ) from exc
+    finally:
+        os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def ensure_project_parent_directories(root: Path, relative_path: str) -> list[str]:
+    """Create missing parent directories through pinned no-follow directory descriptors."""
+    normalized = normalize_relative(relative_path)
+    parts = PurePosixPath(normalized).parts[:-1]
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(root, flags)
+    created: list[str] = []
+    traversed: list[str] = []
+    try:
+        for part in parts:
+            traversed.append(part)
+            try:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=descriptor)
+                created.append(PurePosixPath(*traversed).as_posix())
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise PolicyError(
+                    "VEDAOPS_PATH_FORBIDDEN",
+                    f"{normalized} contains an unavailable or symlinked parent",
+                ) from exc
+            os.close(descriptor)
+            descriptor = next_descriptor
+    finally:
+        os.close(descriptor)
+    return created
+
+
+def remove_project_empty_directories(root: Path, directories: list[str]) -> None:
+    """Best-effort removal of directories created by one failed governed write."""
+    for relative in reversed(directories):
+        parent = PurePosixPath(relative).parent
+        name = PurePosixPath(relative).name
+        parent_path = "placeholder" if str(parent) == "." else f"{parent.as_posix()}/placeholder"
+        try:
+            descriptor, _filename, _root_info = _open_project_parent(root, parent_path)
+        except PolicyError:
+            continue
+        try:
+            os.rmdir(name, dir_fd=descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+
+def atomic_write_project_file(root: Path, relative_path: str, data: bytes, mode: int) -> None:
+    """Atomically replace one file through a pinned parent directory descriptor."""
+    parent_descriptor, filename, _root_info = _open_project_parent(root, relative_path)
+    temporary: str | None = None
+    descriptor: int | None = None
+    try:
+        for _attempt in range(8):
+            temporary = f".{filename}.vedaops-{secrets.token_hex(8)}"
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    mode & 0o777,
+                    dir_fd=parent_descriptor,
+                )
+                break
+            except FileExistsError:
+                continue
+        if descriptor is None or temporary is None:
+            raise PolicyError("VEDAOPS_FILE_UNAVAILABLE", "temporary file name collision")
+        os.fchmod(descriptor, mode & 0o777)
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            written += os.write(descriptor, view[written:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary,
+            filename,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        temporary = None
+        os.fsync(parent_descriptor)
+    except PolicyError:
+        raise
+    except OSError as exc:
+        raise PolicyError(
+            "VEDAOPS_FILE_UNAVAILABLE",
+            _filesystem_error_detail(relative_path, exc),
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            with suppress(OSError):
+                os.unlink(temporary, dir_fd=parent_descriptor)
+        os.close(parent_descriptor)
+
+
+def unlink_project_file(root: Path, relative_path: str) -> None:
+    """Unlink one final path component through a pinned parent descriptor."""
+    parent_descriptor, filename, _root_info = _open_project_parent(root, relative_path)
+    try:
+        os.unlink(filename, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except OSError as exc:
+        raise PolicyError(
+            "VEDAOPS_FILE_UNAVAILABLE",
+            _filesystem_error_detail(relative_path, exc),
+        ) from exc
+    finally:
+        os.close(parent_descriptor)
+
+
+def project_lstat(root: Path, relative_path: str) -> os.stat_result | None:
+    """Return a no-follow final-entry stat through pinned parent components."""
+    try:
+        parent_descriptor, filename, _root_info = _open_project_parent(root, relative_path)
+    except PolicyError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return None
+        raise
+    try:
+        try:
+            return os.stat(filename, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+    except OSError as exc:
+        raise PolicyError(
+            "VEDAOPS_FILE_UNAVAILABLE",
+            _filesystem_error_detail(relative_path, exc),
+        ) from exc
+    finally:
+        os.close(parent_descriptor)
 
 
 def literal_pathspec(relative_path: str) -> str:
@@ -260,7 +509,7 @@ def literal_pathspec(relative_path: str) -> str:
 
 
 def ensure_git_repository(root: Path) -> None:
-    """Refuse a registered root that is not a self-contained Git repository."""
+    """Refuse repositories whose administrative storage can escape the project root."""
     git_directory = root / ".git"
     try:
         info = git_directory.lstat()
@@ -273,6 +522,48 @@ def ensure_git_repository(root: Path) -> None:
         raise PolicyError(
             "VEDAOPS_PROJECT_CONFIG_UNSAFE",
             "the repository Git directory must be a real in-root directory",
+        )
+
+    for relative, expected_kind in (
+        ("HEAD", "file"),
+        ("config", "file"),
+        ("objects", "directory"),
+        ("refs", "directory"),
+    ):
+        candidate = git_directory / relative
+        try:
+            child = candidate.lstat()
+        except OSError as exc:
+            raise PolicyError(
+                "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+                f"repository Git administrative path .git/{relative} is unavailable",
+            ) from exc
+        valid = (
+            stat.S_ISREG(child.st_mode)
+            if expected_kind == "file"
+            else stat.S_ISDIR(child.st_mode)
+        )
+        if not valid:
+            raise PolicyError(
+                "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+                "repository Git administrative path "
+                f".git/{relative} must be a real {expected_kind}",
+            )
+
+    for relative in ("commondir", "gitdir", "objects/info/alternates"):
+        candidate = git_directory / relative
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise PolicyError(
+                "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+                f"repository Git administrative path .git/{relative} is unavailable",
+            ) from exc
+        raise PolicyError(
+            "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+            f"repository Git administrative indirection .git/{relative} is unsupported",
         )
 
 
@@ -378,6 +669,8 @@ def git_environment() -> dict[str, str]:
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_PAGER"] = "cat"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_ALLOW_PROTOCOL"] = ""
+    environment["GIT_PROTOCOL_FROM_USER"] = "0"
     return environment
 
 

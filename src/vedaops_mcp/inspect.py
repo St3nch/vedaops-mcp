@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fnmatch
-import hashlib
 import re
 from pathlib import Path, PurePosixPath
 
@@ -32,6 +31,7 @@ from vedaops_mcp.policy import (
     normalize_relative,
     protected_reason,
     read_bounded_file,
+    read_bounded_file_with_digest,
     resolve_within_root,
     run_git_bytes,
     run_git_text,
@@ -257,23 +257,15 @@ def project_file_read(
         )
     normalized = normalize_relative(path)
     ensure_not_ignored(project.root, normalized)
-    raw, info = read_bounded_file(
+    raw, info, sha256 = read_bounded_file_with_digest(
         project.root,
         normalized,
         offset_bytes=offset_bytes,
         limit_bytes=max_bytes,
+        digest_limit_bytes=MAX_FILE_BYTES,
     )
     chunk = raw[:max_bytes]
     content, returned = decode_bounded_utf8(chunk, may_end_mid_codepoint=len(raw) > max_bytes)
-    sha256 = None
-    if info.st_size <= MAX_FILE_BYTES:
-        whole, whole_info = read_bounded_file(
-            project.root,
-            normalized,
-            limit_bytes=MAX_FILE_BYTES,
-        )
-        if whole_info.st_size == info.st_size and len(whole) == whole_info.st_size:
-            sha256 = hashlib.sha256(whole).hexdigest()
     return ProjectFileResult(
         project_id=project.id,
         workspace_id=project.workspace_id,

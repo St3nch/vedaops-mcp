@@ -24,7 +24,14 @@ from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from vedaops_mcp.errors import AuthorityError, IdentityError
 from vedaops_mcp.settings import validate_principal_id
@@ -70,6 +77,30 @@ class RegisteredCheck(BaseModel):
         if not value[0].startswith("/"):
             raise ValueError("check executable must be an absolute sandbox path")
         return value
+
+    @model_validator(mode="after")
+    def profile_is_supported(self) -> RegisteredCheck:
+        if self.substrate == "postgres18" and self.runtime != "project_venv":
+            raise ValueError("postgres18 checks require runtime='project_venv'")
+        if self.runtime == "system" and self.argv[0].startswith(
+            ("/workspace/.venv/", "/runtime/")
+        ):
+            raise ValueError(
+                "system-runtime check executable may not require project runtime paths"
+            )
+        return self
+
+
+class CheckDescriptor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    argv: list[str]
+    timeout_seconds: int
+    memory_mb: int
+    runtime: Literal["system", "project_venv"]
+    substrate: Literal["postgres18"] | None
+    definition_sha256: str
 
 
 class RegisteredProject(BaseModel):
@@ -256,6 +287,7 @@ class ProjectDetail(ProjectSummary):
     principal_id: str
     authority_sources: dict[str, str | list[str]]
     check_ids: list[str]
+    checks: list[CheckDescriptor]
     git: GitOrientation
     limitations: list[Limitation]
 
@@ -332,17 +364,46 @@ def get_authorized_check(
     project_id: str,
     check_id: str,
 ) -> tuple[AuthorizedProject, RegisteredCheck]:
-    """Resolve one operator-defined check after project capability authorization."""
-    project = get_authorized_project(
-        registry_path,
-        principal_id=principal_id,
-        project_id=project_id,
-        capability="check",
-    )
+    """Resolve one approved check from one immutable operator-policy snapshot."""
     registry = _load_registry(registry_path)
-    entry = next((item for item in registry.projects if item.id == project.id), None)
+    principal = require_principal(registry, principal_id)
+    normalized_id = normalize_project_id(project_id)
+    if normalized_id not in principal.projects:
+        raise AuthorityError(
+            "VEDAOPS_PROJECT_NOT_AUTHORIZED",
+            f"project {normalized_id!r} is not authorized for this principal",
+        )
+    entry = next((item for item in registry.projects if item.id == normalized_id), None)
     if entry is None:
-        raise AuthorityError("VEDAOPS_PROJECT_NOT_AUTHORIZED", project.id)
+        raise AuthorityError(
+            "VEDAOPS_PROJECT_NOT_AUTHORIZED",
+            f"project {normalized_id!r} is not authorized for this principal",
+        )
+    if entry.status not in ACTIVE_STATUSES:
+        raise AuthorityError(
+            "VEDAOPS_PROJECT_INACTIVE",
+            f"project {entry.id!r} is not in an active lifecycle status",
+        )
+    manifest = validate_project_manifest(entry)
+    grant = frozenset(principal.projects.get(entry.id, ()))
+    effective = frozenset(entry.capabilities) & frozenset(manifest.capabilities) & grant
+    if "check" not in effective:
+        raise AuthorityError(
+            "VEDAOPS_CAPABILITY_DENIED",
+            f"project {entry.id!r} does not grant 'check' after policy intersection",
+        )
+    project = AuthorizedProject(
+        id=entry.id,
+        name=entry.name,
+        status=entry.status,
+        root=entry.root,
+        workspace_id=entry.workspace_id,
+        workspace_kind=WORKSPACE_KIND,
+        mutable=entry.mutable and manifest.mutable,
+        capabilities=effective,
+        context_files=tuple(entry.context_files),
+        principal_id=principal.id,
+    )
     check = next((item for item in entry.checks if item.id == check_id), None)
     if check is None:
         raise AuthorityError(
@@ -439,8 +500,21 @@ def get_project_detail(
             if "check" in summary.effective_capabilities
             else []
         ),
+        checks=(
+            [_check_descriptor(item) for item in sorted(entry.checks, key=lambda value: value.id)]
+            if "check" in summary.effective_capabilities
+            else []
+        ),
         git=git_orientation,
         limitations=limitations,
+    )
+
+
+def _check_descriptor(check: RegisteredCheck) -> CheckDescriptor:
+    payload = json.dumps(check.model_dump(), separators=(",", ":"), sort_keys=True).encode()
+    return CheckDescriptor(
+        **check.model_dump(),
+        definition_sha256=hashlib.sha256(payload).hexdigest(),
     )
 
 
@@ -533,14 +607,20 @@ def _project_summary(
 
 
 def validate_project_manifest(project: RegisteredProject) -> ProjectManifest:
-    """Validate the manifest at one trusted registered project root."""
+    """Validate a non-aliased manifest at one trusted registered project root."""
     root = project.root.resolve()
+    authority_dir = root / ".vedaops"
     manifest_path = root / MANIFEST_RELATIVE_PATH
     try:
-        resolved_manifest = manifest_path.resolve(strict=True)
-        if root not in resolved_manifest.parents:
-            raise AuthorityError("VEDAOPS_MANIFEST_OUTSIDE_PROJECT_ROOT", str(manifest_path))
-        if resolved_manifest.stat().st_dev != root.stat().st_dev:
+        authority_info = authority_dir.lstat()
+        manifest_info = manifest_path.lstat()
+        if not stat.S_ISDIR(authority_info.st_mode) or not stat.S_ISREG(manifest_info.st_mode):
+            raise AuthorityError(
+                "VEDAOPS_MANIFEST_UNAVAILABLE",
+                "project manifest and .vedaops parent must be real in-root entries",
+            )
+        root_device = root.stat().st_dev
+        if authority_info.st_dev != root_device or manifest_info.st_dev != root_device:
             raise AuthorityError("VEDAOPS_MANIFEST_DEVICE_ESCAPE", str(manifest_path))
     except AuthorityError:
         raise
@@ -550,7 +630,7 @@ def validate_project_manifest(project: RegisteredProject) -> ProjectManifest:
             "project manifest is unavailable",
         ) from exc
 
-    manifest = _load_manifest(resolved_manifest)
+    manifest = _load_manifest(manifest_path)
     if manifest.id != project.id:
         raise AuthorityError(
             "VEDAOPS_PROJECT_ID_COLLISION",

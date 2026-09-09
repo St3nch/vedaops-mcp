@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
 from support import git, init_project, write_registry
 
+import vedaops_mcp.policy as policy_module
 from vedaops_mcp.errors import PolicyError
 from vedaops_mcp.inspect import (
     orient_project,
@@ -39,6 +41,44 @@ def test_file_read_returns_content_sha256_and_completeness(tmp_path: Path):
     assert result.sha256 == expected
     assert result.truncated is False
     assert result.bytes_returned == result.bytes_total
+
+
+def test_file_read_content_and_digest_bind_same_open_inode_during_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    init_project(root)
+    registry = write_registry(tmp_path / "projects.toml", root=root)
+    target = root / "README.md"
+    original_bytes = target.read_bytes()
+    replacement_bytes = original_bytes.replace(b"hello world", b"hello other")
+    assert len(replacement_bytes) == len(original_bytes)
+    original_open = policy_module.os.open
+    swapped = False
+
+    def replace_after_final_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if path == "README.md" and kwargs.get("dir_fd") is not None and not swapped:
+            temporary = root / "README.replacement"
+            temporary.write_bytes(replacement_bytes)
+            os.replace(temporary, target)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(policy_module.os, "open", replace_after_final_open)
+    result = project_file_read(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        path="README.md",
+    )
+
+    assert swapped is True
+    assert result.content.encode() == original_bytes
+    assert result.sha256 == hashlib.sha256(original_bytes).hexdigest()
+    assert target.read_bytes() == replacement_bytes
 
 
 def test_file_read_truncation_is_explicit(tmp_path: Path):

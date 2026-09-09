@@ -1,6 +1,6 @@
 # MCP-04 — Bounded Change Plane
 
-Status: candidate implemented on `ticket/MCP-04-bounded-change-plane`; verification green; independent review pending Product acceptance.
+Status: Astra whole-system audit rejected candidate `634635388837d39e1f1c9f33e2a20d8e2121c81d`; bounded remediation implemented on `ticket/MCP-04-bounded-change-plane`; verification green; independent remediation review pending Product acceptance.
 
 ## Product reason
 
@@ -166,21 +166,38 @@ Prove at minimum:
 17. tool catalog exposes no general shell, arbitrary Git, or push capability;
 18. a complete local ticket cycle can be performed through the MCP without CHAZ typing routine local Git commands.
 
-## Candidate evidence
+## Astra whole-system audit remediation
+
+Astra's whole-system review of candidate `634635388837d39e1f1c9f33e2a20d8e2121c81d` found real cutover blockers rather than missing Product scope. The remediation remains MCP-04 work and does not add a new core capability ticket.
+
+The repaired implementation now includes:
+
+- complete patch-effect authorization using Git's parsed effect set, including mixed/traditional diff cases;
+- fail-closed Git administrative confinement for refs indirection, alternates, promisor/partial-clone configuration, and protocol/network behavior;
+- exact FF integration against the validated source commit object rather than an ambiguous short ref;
+- stronger path/inode handling for manifest aliases, ignored checkout collisions, and same-open file content/hash identity;
+- a shared sanitized `project_venv` runtime for ordinary and PostgreSQL checks, built with trusted system Python in isolated mode, including bounded console executables and editable-install path retargeting into the disposable snapshot;
+- aggregate hostile-check containment through a bounded user systemd scope plus a global concurrent-check admission ceiling;
+- durable operation start/terminal evidence outside managed repos, with explicit uncertain-effect states for interrupted or unverifiable file/Git/check effects;
+- PostgreSQL cleanup failures preserved as structured uncertainty rather than escaping and discarding cleanup evidence;
+- LLM-visible approved check descriptors in project orientation;
+- server diagnostics that distinguish observed source revision from loaded runtime artifact/Python/process identities.
+
+## Remediation evidence
 
 - `ruff check .`: pass.
-- Full repository suite: 79 passed in 17.95s after final uncertainty, protected-transition, and unsupported-entry hardening.
-- The focused Change suite proves `change` capability intersection plus mutable-project gating, exact file hashes, authority-path protection, validated patch paths/headers, bounded native diff, exact commit path sets, unrelated dirty-file preservation, repository-hook suppression, and refusal of pre-existing staged state.
-- A complete local ticket lifecycle is exercised without operator Git commands: create/switch ticket branch, edit, exact commit, switch target, refuse premature deletion, fast-forward-only integration, and safe merged-branch deletion.
-- Dirty branch switching and non-fast-forward integration are refused without changing the intended target state; branch transitions also refuse mutation-protected paths and unsupported Git entry types such as symlinks/gitlinks.
-- Post-effect Git verification failures are represented as `VEDAOPS_GIT_EFFECT_UNCERTAIN`, instructing callers to inspect branch/HEAD/index/worktree before retrying rather than assuming the effect did not occur.
-- The server catalog includes no general shell, caller-selected Git argv, fetch, pull, or push surface. Remote publication remains outside MCP-04.
-- The live `.vedaops/project.toml` remains an intentional legacy-control-plane working-tree change and is excluded from the MCP-04 candidate commit.
+- Permanent repository suite: 96 passed after the final editable-runtime repair.
+- Astra-derived adversarial regressions cover hidden patch targets, manifest aliases, ignored checkout collisions, branch/tag ambiguity, Git refs indirection, promisor/partial-clone refusal, Git alternates refusal, same-inode content/hash binding, controller-side Python shadowing, post-commit wrapper failure, PostgreSQL cleanup uncertainty, aggregate scope limits, and global check admission.
+- The complete local ticket lifecycle remains exercised without operator Git commands: create/switch ticket branch, edit, exact commit, switch target, refuse premature deletion, fast-forward-only integration, and safe merged-branch deletion.
+- Real Discrepancy Desk tracer at exact HEAD `73941507f2511aca3af8abcf47799bd016c687bf`: ordinary lint passed under the sanitized `project_venv` runtime; full PostgreSQL-backed pytest passed with 356 tests; PostgreSQL 18 Unix-socket connectivity and both container/workspace cleanup were verified with `uncertain_effects = false`.
+- Real Discrepancy Desk `format-check` passed through the ordinary runner, and `postgres-foundation-proofs` returned PASS through the disposable PostgreSQL 18 runner with verified cleanup.
+- The server catalog still exposes no general shell, caller-selected Git argv, fetch, pull, or push surface. Remote publication remains outside MCP-04.
+- The live `.vedaops/project.toml` remains an intentional legacy-control-plane working-tree change and is excluded from the remediation candidate commit.
 
 ## Completion / cutover relevance
 
-MCP-04 is intended to close the declared core responsibility gap: Orient, Inspect, Change, Check.
+MCP-04 still closes the declared core responsibility gap: Orient, Inspect, Change, Check. Astra's audit did not justify a fifth core capability.
 
-After MCP-04 reaches an accepted exact revision, stop adding core capability. Run the planned independent whole-MCP review (Astra), reconcile only genuine blockers/material corrections, then assess explicit CHAZ cutover from `linux-vedaops-mcp` to `vedaops-mcp`.
+After an exact remediation revision passes independent review and CHAZ acceptance, perform explicit cutover verification of source -> loaded artifact -> running process -> policy -> server catalog -> client catalog, prove one real Discrepancy Desk development cycle, then retire the legacy controller. Stop adding core MCP capability unless a future real trigger earns it.
 
 No push without separate fresh CHAZ authorization.

@@ -20,13 +20,14 @@ After CHAZ commissions MCP-01:
 1. Create `ticket/MCP-01-core-foundation` from the exact accepted baseline.
 2. Assign one Writer.
 3. Implement only MCP-01 scope.
-4. Run targeted checks.
-5. Inspect the exact diff/candidate.
-6. Obtain independent review bound to the exact commit.
-7. Reconcile findings.
-8. Record native acceptance.
-9. Integrate using native Git/GitHub semantics.
-10. Push only under fresh CHAZ authorization.
+4. Inspect the exact intended diff.
+5. Create the exact local candidate commit.
+6. Run targeted checks against that committed candidate.
+7. Obtain independent review bound to the exact commit.
+8. Reconcile findings with a new exact candidate when required.
+9. Record native acceptance only after the accepted exact candidate is established.
+10. Integrate using native Git/GitHub semantics.
+11. Push only under fresh CHAZ authorization.
 
 ## Early next capabilities
 

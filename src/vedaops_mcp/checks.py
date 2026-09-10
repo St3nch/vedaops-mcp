@@ -36,10 +36,12 @@ from vedaops_mcp.policy import (
 )
 from vedaops_mcp.runtime import RUNTIME_VENV_RELATIVE, RuntimeIdentity, capture_project_runtime
 
-RUNNER_PROFILE = "linux-bwrap-systemd-v2"
+RUNNER_PROFILE = "linux-bwrap-systemd-tmpfs-v3"
 BWRAP_PATH = Path("/usr/bin/bwrap")
 PRLIMIT_PATH = Path("/usr/bin/prlimit")
 SYSTEMD_RUN_PATH = Path("/usr/bin/systemd-run")
+TRUSTED_PYTHON_PATH = Path("/usr/bin/python3")
+WORKSPACE_HELPER_PATH = Path(__file__).with_name("workspace_helper.py")
 MAX_CONCURRENT_CHECKS = 2
 MAX_WORKER_TASKS = 128
 _CHECK_ADMISSION = threading.BoundedSemaphore(MAX_CONCURRENT_CHECKS)
@@ -75,6 +77,8 @@ class CheckRunResult(BaseModel):
     runner_sha256: str
     limiter_sha256: str
     aggregate_limiter_sha256: str
+    aggregate_memory_limit_bytes: int
+    scratch_storage: str
     outcome: str
     exit_code: int | None
     duration_ms: int
@@ -155,6 +159,15 @@ def project_check_run(
         kind="check_run",
         project_id=project.id,
         expected_git_head=expected,
+        principal_id=project.principal_id,
+        workspace_id=project.workspace_id,
+        project_root=project.root,
+        subject={
+            "check_id": check.id,
+            "check_definition_sha256": check_digest,
+            "captured_commit": expected,
+            "captured_tree": tree,
+        },
     )
     operation_id = journal.operation_id
     root: Path | None = None
@@ -165,7 +178,9 @@ def project_check_run(
     runtime_identity: RuntimeIdentity | None = None
     failure: Exception | None = None
     try:
-        root = Path(tempfile.mkdtemp(prefix="vedaops-check-"))
+        root = Path(tempfile.gettempdir()) / f"vedaops-check-{operation_id}"
+        journal.update(disposable_root=str(root))
+        root.mkdir(mode=0o700)
         snapshot_dir = root / "snapshot"
         runtime_dir = root / "runtime-venv"
         uv_copy = root / "uv"
@@ -178,6 +193,7 @@ def project_check_run(
         extra_dirs: list[str] = []
         extra_ro_binds: list[tuple[Path, str]] = []
         extra_env: dict[str, str] = {}
+        runtime_source: Path | None = None
         if check.runtime == "project_venv":
             if (snapshot_dir / RUNTIME_VENV_RELATIVE).exists():
                 raise PolicyError(
@@ -187,10 +203,8 @@ def project_check_run(
             runtime_identity = capture_project_runtime(project.root, runtime_dir, uv_copy)
             (snapshot_dir / RUNTIME_VENV_RELATIVE).mkdir(mode=0o700)
             extra_dirs = ["/runtime", "/runtime/bin"]
-            extra_ro_binds = [
-                (runtime_dir, "/workspace/.venv"),
-                (uv_copy, "/runtime/bin/uv"),
-            ]
+            runtime_source = runtime_dir
+            extra_ro_binds = [(uv_copy, "/runtime/bin/uv")]
             extra_env = {"PATH": "/runtime/bin:/workspace/.venv/bin:/usr/bin:/bin"}
         argv = _sandbox_argv(
             bwrap=bwrap,
@@ -202,6 +216,7 @@ def project_check_run(
             extra_dirs=extra_dirs,
             extra_ro_binds=extra_ro_binds,
             extra_env=extra_env,
+            runtime_source=runtime_source,
         )
         started = time.monotonic()
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
@@ -248,7 +263,7 @@ def project_check_run(
         if process is not None and process.poll() is None and not _terminate_process(process):
             uncertain_effects = True
             _append_termination_limitation(limitations)
-        if root is not None:
+        if root is not None and root.exists():
             try:
                 shutil.rmtree(root)
             except OSError:
@@ -293,6 +308,8 @@ def project_check_run(
         runner_sha256=_sha256_file(bwrap),
         limiter_sha256=_sha256_file(prlimit),
         aggregate_limiter_sha256=_sha256_file(systemd_run),
+        aggregate_memory_limit_bytes=check.memory_mb * 1024 * 1024,
+        scratch_storage="tmpfs_memory_cgroup",
         outcome=outcome,
         exit_code=exit_code,
         duration_ms=duration_ms,
@@ -467,11 +484,18 @@ def _sandbox_argv(
     extra_dirs: list[str] | None = None,
     extra_ro_binds: list[tuple[Path, str]] | None = None,
     extra_env: dict[str, str] | None = None,
+    runtime_source: Path | None = None,
 ) -> list[str]:
     memory_bytes = check.memory_mb * 1024 * 1024
     extra_dirs = [] if extra_dirs is None else extra_dirs
     extra_ro_binds = [] if extra_ro_binds is None else extra_ro_binds
     extra_env = {} if extra_env is None else extra_env
+    helper = WORKSPACE_HELPER_PATH.resolve(strict=True)
+    if helper == snapshot_dir or snapshot_dir in helper.parents:
+        raise PolicyError(
+            "VEDAOPS_CONTROLLER_LAYOUT_UNSAFE",
+            "workspace setup helper must not come from the managed snapshot",
+        )
     command = [
         str(bwrap),
         "--die-with-parent",
@@ -500,26 +524,45 @@ def _sandbox_argv(
             "/tmp",
             "--dir",
             "/home",
-            "--dir",
+            "--tmpfs",
             "/home/worker",
+            "--tmpfs",
+            "/dev/shm",
             "--dir",
+            "/input",
+            "--ro-bind",
+            str(snapshot_dir),
+            "/input",
+            "--tmpfs",
             "/workspace",
             "--symlink",
             "usr/bin",
             "/bin",
-            "--bind",
-            str(snapshot_dir),
-            "/workspace",
+            "--ro-bind",
+            str(helper),
+            "/vedaops-workspace-helper.py",
         ]
     )
+    if runtime_source is not None:
+        command.extend(
+            [
+                "--dir",
+                "/workspace/.venv",
+                "--ro-bind",
+                str(runtime_source),
+                "/workspace/.venv",
+            ]
+        )
     for directory in extra_dirs:
         command.extend(["--dir", directory])
     for source, target in extra_ro_binds:
         command.extend(["--ro-bind", str(source), target])
     command.extend(
         [
+            "--remount-ro",
+            "/",
             "--chdir",
-            "/workspace",
+            "/",
             "--clearenv",
             "--setenv",
             "HOME",
@@ -545,6 +588,10 @@ def _sandbox_argv(
         command.extend(["--setenv", name, value])
     command.extend(
         [
+            "--",
+            str(TRUSTED_PYTHON_PATH),
+            "-I",
+            "/vedaops-workspace-helper.py",
             "--",
             str(prlimit),
             f"--as={memory_bytes}",

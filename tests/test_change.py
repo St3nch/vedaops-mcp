@@ -759,3 +759,157 @@ def test_manifest_alias_cannot_turn_ordinary_file_into_authority_mutation(tmp_pa
         )
 
     assert alias.read_text() == before
+
+
+def test_concurrent_replacement_is_preserved_instead_of_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+    readme = root / "README.md"
+    expected = _sha(readme)
+    original = change_module.conditional_write_project_file
+
+    def replace_then_write(*args, **kwargs):
+        replacement = root / "README.concurrent"
+        replacement.write_text("concurrent owner bytes\n")
+        replacement.replace(readme)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(change_module, "conditional_write_project_file", replace_then_write)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_PRECONDITION_FAILED"):
+        project_text_replace(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="README.md",
+            expected_sha256=expected,
+            find="hello world",
+            replacement="candidate bytes",
+        )
+
+    assert readme.read_text() == "concurrent owner bytes\n"
+
+
+def test_parent_relocation_cannot_redirect_conditional_write_outside_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+    nested = root / "nested"
+    nested.mkdir()
+    target = nested / "file.txt"
+    target.write_text("original\n")
+    git(root, "add", "nested/file.txt")
+    git(root, "commit", "-q", "-m", "nested target")
+    head = git(root, "rev-parse", "HEAD")
+    expected = _sha(target)
+    outside = tmp_path / "outside-nested"
+    original = change_module.conditional_write_project_file
+
+    def relocate_then_write(*args, **kwargs):
+        nested.rename(outside)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(change_module, "conditional_write_project_file", relocate_then_write)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_PRECONDITION_FAILED"):
+        project_text_replace(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="nested/file.txt",
+            expected_sha256=expected,
+            find="original",
+            replacement="candidate",
+        )
+
+    assert (outside / "file.txt").read_text() == "original\n"
+    assert not nested.exists()
+
+
+def test_journal_start_failure_occurs_before_nested_create_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+
+    def fail_start(*args, **kwargs):
+        raise PolicyError("VEDAOPS_OPERATION_RECORD_UNAVAILABLE", "simulated journal failure")
+
+    monkeypatch.setattr(change_module, "start_operation", fail_start)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_OPERATION_RECORD_UNAVAILABLE"):
+        project_file_write(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="new/nested/file.txt",
+            content="candidate\n",
+        )
+
+    assert not (root / "new").exists()
+
+
+def test_operation_journal_location_inside_managed_project_is_refused(tmp_path: Path):
+    root = tmp_path / "operations"
+    head = init_project(
+        root,
+        capabilities=("read", "change"),
+        mutable=True,
+    )
+    registry = write_registry(
+        tmp_path / "projects.toml",
+        root=root,
+        mutable=True,
+        capabilities=("read", "change"),
+        principal_capabilities=("read", "change"),
+    )
+
+    with pytest.raises(AuthorityError, match="VEDAOPS_TRUSTED_PATH_INSIDE_MANAGED_PROJECT"):
+        project_file_write(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="new.txt",
+            content="candidate\n",
+        )
+
+    assert not (root / "new.txt").exists()
+
+
+def test_grafted_false_fast_forward_is_refused_before_merge_effect(tmp_path: Path):
+    root, registry, base = _change_project(tmp_path)
+    target_branch = git(root, "branch", "--show-current")
+    git(root, "switch", "-c", "ticket/source")
+    (root / "README.md").write_text("source\n")
+    git(root, "add", "README.md")
+    git(root, "commit", "-q", "-m", "source")
+    source = git(root, "rev-parse", "HEAD")
+    git(root, "switch", target_branch)
+    (root / "README.md").write_text("target\n")
+    git(root, "add", "README.md")
+    git(root, "commit", "-q", "-m", "target")
+    target = git(root, "rev-parse", "HEAD")
+    assert git(root, "merge-base", source, target) == base
+    grafts = root / ".git" / "info" / "grafts"
+    grafts.parent.mkdir(parents=True, exist_ok=True)
+    grafts.write_text(f"{source} {target}\n")
+
+    with pytest.raises(PolicyError, match="VEDAOPS_PROJECT_CONFIG_UNSAFE"):
+        project_git_merge_ff(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=target,
+            expected_target_branch=target_branch,
+            source_branch="ticket/source",
+            expected_source_head=source,
+        )
+
+    assert git(root, "rev-parse", "HEAD") == target

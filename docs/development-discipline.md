@@ -38,6 +38,16 @@ Prefer messages that identify the coherent change rather than generic text such 
 
 A commit does not mean the work was accepted or pushed.
 
+For MCP-driven development, the exact candidate commit normally precedes execution checks because the restricted Check plane deliberately exercises committed Git objects, not dirty working-tree bytes.
+
+The normal local order is:
+
+`edit -> inspect intended diff -> exact local candidate commit -> run approved checks against that candidate -> independent review -> CHAZ acceptance -> fast-forward integration -> optional local branch cleanup -> operator push when authorized`
+
+Creating the candidate commit establishes the exact check/review subject. It does not imply acceptance, integration, or publication.
+
+If a check is run before the intended changes are committed, record that it exercised the previous committed HEAD rather than the dirty edits.
+
 ## Check discipline
 
 Never write only `tests passed` when more precise information is available.

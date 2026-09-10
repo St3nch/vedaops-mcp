@@ -123,6 +123,15 @@ def project_postgres_check_run(
         kind="postgres_check_run",
         project_id=project.id,
         expected_git_head=expected,
+        principal_id=project.principal_id,
+        workspace_id=project.workspace_id,
+        project_root=project.root,
+        subject={
+            "check_id": check.id,
+            "check_definition_sha256": check_digest,
+            "captured_commit": expected,
+            "captured_tree": tree,
+        },
     )
     operation_id = journal.operation_id
     root: Path | None = None
@@ -145,7 +154,9 @@ def project_postgres_check_run(
     failure: Exception | None = None
 
     try:
-        root = Path(tempfile.mkdtemp(prefix="vedaops-pg-check-"))
+        root = Path(tempfile.gettempdir()) / f"vedaops-pg-check-{operation_id}"
+        journal.update(disposable_root=str(root))
+        root.mkdir(mode=0o700)
         snapshot_dir = root / "snapshot"
         runtime_dir = root / "runtime-venv"
         socket_dir = root / "socket"
@@ -170,6 +181,7 @@ def project_postgres_check_run(
         password = secrets.token_hex(24)
         _write_private_env_file(env_file, password)
         container_name = f"vedaops-pg18-{os.getpid()}-{operation_id[:12]}"
+        journal.update(postgres_container=container_name)
         _start_postgres(
             docker,
             name=container_name,
@@ -194,7 +206,6 @@ def project_postgres_check_run(
             timeout_seconds=effective_timeout,
             extra_dirs=["/runtime", "/runtime/bin", "/run", POSTGRES_SOCKET_SANDBOX],
             extra_ro_binds=[
-                (runtime_dir, "/workspace/.venv"),
                 (uv_copy, "/runtime/bin/uv"),
                 (socket_dir, POSTGRES_SOCKET_SANDBOX),
             ],
@@ -202,6 +213,7 @@ def project_postgres_check_run(
                 "PATH": "/runtime/bin:/workspace/.venv/bin:/usr/bin:/bin",
                 "VEDAOPS_POSTGRES_URL": database_url,
             },
+            runtime_source=runtime_dir,
         )
         started = time.monotonic()
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
@@ -272,7 +284,7 @@ def project_postgres_check_run(
                         detail="disposable PostgreSQL container removal could not be verified",
                     )
                 )
-        if root is not None:
+        if root is not None and root.exists():
             try:
                 shutil.rmtree(root)
             except OSError:
@@ -318,10 +330,12 @@ def project_postgres_check_run(
         exclusions=exclusions,
         check_id=check.id,
         check_definition_sha256=check_digest,
-        runner_profile="linux-bwrap-systemd-postgres18-v2",
+        runner_profile="linux-bwrap-systemd-tmpfs-postgres18-v3",
         runner_sha256=_sha256_file(bwrap),
         limiter_sha256=_sha256_file(prlimit),
         aggregate_limiter_sha256=_sha256_file(systemd_run),
+        aggregate_memory_limit_bytes=check.memory_mb * 1024 * 1024,
+        scratch_storage="tmpfs_memory_cgroup",
         outcome=outcome,
         exit_code=exit_code,
         duration_ms=duration_ms,

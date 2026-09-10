@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import venv
 from pathlib import Path
@@ -10,6 +11,8 @@ import pytest
 from support import git, init_project, write_registry
 
 import vedaops_mcp.checks as checks_module
+import vedaops_mcp.runtime as runtime_module
+import vedaops_mcp.runtime_helper as runtime_helper
 from vedaops_mcp.authority import RegisteredCheck
 from vedaops_mcp.checks import project_check_run
 from vedaops_mcp.errors import AuthorityError, PolicyError
@@ -110,8 +113,10 @@ print("sandbox-ok")
     assert result.captured_commit == head
     assert len(result.captured_input_sha256) == 64
     assert len(result.check_definition_sha256) == 64
-    assert result.runner_profile == "linux-bwrap-systemd-v2"
+    assert result.runner_profile == "linux-bwrap-systemd-tmpfs-v3"
     assert len(result.aggregate_limiter_sha256) == 64
+    assert result.aggregate_memory_limit_bytes == 512 * 1024 * 1024
+    assert result.scratch_storage == "tmpfs_memory_cgroup"
     assert result.cleanup == "removed"
     assert result.uncertain_effects is False
     assert "working_tree_and_untracked_changes" in result.exclusions
@@ -479,6 +484,10 @@ def test_sandbox_argv_wraps_worker_in_aggregate_systemd_scope(tmp_path: Path):
     assert "--property=MemorySwapMax=0" in argv
     assert f"--property=TasksMax={checks_module.MAX_WORKER_TASKS}" in argv
     assert "/usr/bin/bwrap" in argv
+    assert argv.count("--tmpfs") >= 4
+    for scratch in ("/workspace", "/tmp", "/home/worker", "/dev/shm"):
+        assert scratch in argv
+    assert "CAP_SYS_ADMIN" not in argv
 
 
 def test_check_admission_refuses_when_global_capacity_is_exhausted(tmp_path: Path):
@@ -505,3 +514,86 @@ def test_check_admission_refuses_when_global_capacity_is_exhausted(tmp_path: Pat
 
 def test_runner_availability_is_host_specific():
     assert shutil.which("bwrap") is not None or not RUNNER_AVAILABLE
+
+
+@pytest.mark.skipif(not RUNNER_AVAILABLE, reason="Linux MCP-02 runner is unavailable")
+def test_all_worker_writable_scratch_mounts_are_tmpfs(tmp_path: Path):
+    root = tmp_path / "project"
+    script = (
+        "from pathlib import Path\n"
+        "lines = Path('/proc/self/mountinfo').read_text().splitlines()\n"
+        "mounts = {}\n"
+        "for line in lines:\n"
+        "    fields = line.split()\n"
+        "    sep = fields.index('-')\n"
+        "    mounts[fields[4]] = fields[sep + 1]\n"
+        "for path in ['/workspace','/tmp','/home/worker','/dev/shm']:\n"
+        "    assert mounts.get(path) == 'tmpfs', (path, mounts.get(path))\n"
+        "print('tmpfs-ok')\n"
+    )
+    head = init_project(
+        root,
+        capabilities=("read", "check"),
+        files={"check_mounts.py": script},
+    )
+    registry = _registry_with_check(
+        tmp_path,
+        root,
+        check_id="tmpfs",
+        argv=("/usr/bin/python3", "check_mounts.py"),
+    )
+
+    result = project_check_run(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        check_id="tmpfs",
+    )
+
+    assert result.outcome == "passed", result.stderr
+    assert result.stdout.strip() == "tmpfs-ok"
+    assert result.scratch_storage == "tmpfs_memory_cgroup"
+
+
+def test_runtime_capture_refuses_substituted_ancestor_outside_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    root.mkdir()
+    venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    outside = tmp_path / "outside-lib"
+    outside.mkdir()
+    (outside / "outside-sentinel.py").write_text("SECRET = True\n")
+    original = runtime_module._copy_runtime_payload_confined
+
+    def substitute_then_capture(project_root: Path, destination: Path) -> None:
+        lib = root / ".venv" / "lib"
+        lib.rename(root / ".venv" / "lib-original")
+        lib.symlink_to(outside, target_is_directory=True)
+        original(project_root, destination)
+
+    monkeypatch.setattr(runtime_module, "_copy_runtime_payload_confined", substitute_then_capture)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHECK_RUNTIME_UNAVAILABLE"):
+        capture_project_runtime(root, tmp_path / "runtime", tmp_path / "uv")
+
+    assert not any((tmp_path / "runtime").rglob("outside-sentinel.py"))
+
+
+def test_runtime_capture_counts_actual_bytes_after_stale_size_observation(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    target = source / "grow.bin"
+    target.write_bytes(b"x")
+    expected = target.stat()
+    target.write_bytes(b"x" * 1024)
+    directory_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        budget = runtime_helper.Budget(max_files=10, max_bytes=128, timeout_seconds=5)
+        budget.add_file()
+        with pytest.raises(runtime_helper.CaptureError, match="byte bound"):
+            runtime_helper._read_open_file(directory_fd, "grow.bin", expected, budget)
+    finally:
+        os.close(directory_fd)

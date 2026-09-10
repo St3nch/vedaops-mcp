@@ -24,8 +24,8 @@ from vedaops_mcp.authority import (
     ProjectDetail,
     ProjectsListResult,
     list_authorized_projects,
-    load_registry,
-    policy_sha256,
+    load_registry_snapshot,
+    project_summaries_from_registry,
     require_principal,
 )
 from vedaops_mcp.change import (
@@ -175,9 +175,17 @@ def package_version() -> str:
         return __version__
 
 
-def tool_catalog_sha256() -> str:
-    payload = json.dumps(list(TOOL_CATALOG), separators=(",", ":"), sort_keys=False).encode()
-    return hashlib.sha256(payload).hexdigest()
+def tool_catalog_sha256(tools: list[object]) -> tuple[list[str], str]:
+    """Digest the exact MCP tool contracts the FastMCP server advertises."""
+    advertised: list[dict[str, object]] = []
+    names: list[str] = []
+    for tool in tools:
+        mcp_tool = tool.to_mcp_tool()
+        payload = mcp_tool.model_dump(mode="json", by_alias=True, exclude_none=False)
+        advertised.append(payload)
+        names.append(mcp_tool.name)
+    raw = json.dumps(advertised, separators=(",", ":"), sort_keys=True).encode()
+    return names, hashlib.sha256(raw).hexdigest()
 
 
 def controller_artifact_identity() -> ControllerArtifactIdentity:
@@ -285,7 +293,6 @@ def build_server(settings: Settings) -> FastMCP:
     instance_id = uuid.uuid4().hex
     started_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     source_revision, source_revision_state = controller_source_revision()
-    catalog_digest = tool_catalog_sha256()
     artifact_identity = controller_artifact_identity()
     python_identity = python_runtime_identity()
 
@@ -314,6 +321,7 @@ def build_server(settings: Settings) -> FastMCP:
             if requested_version in SUPPORTED_PROTOCOL_VERSIONS
             else LATEST_PROTOCOL_VERSION
         )
+        catalog, catalog_digest = tool_catalog_sha256(await mcp.list_tools())
         return await asyncio.to_thread(
             _server_info,
             settings,
@@ -326,6 +334,7 @@ def build_server(settings: Settings) -> FastMCP:
             python_identity=python_identity,
             protocol_version=protocol_value,
             transport=ctx.transport or "in-memory",
+            catalog=catalog,
             catalog_digest=catalog_digest,
         )
 
@@ -722,6 +731,7 @@ def _server_info(
     python_identity: PythonRuntimeIdentity,
     protocol_version: str,
     transport: str,
+    catalog: list[str],
     catalog_digest: str,
 ) -> ServerInfo:
     limitations: list[Limitation] = []
@@ -729,16 +739,14 @@ def _server_info(
     digest: str | None = None
     policy_state = "unavailable"
     try:
-        registry = load_registry(settings.registry_path)
+        registry, digest = load_registry_snapshot(settings.registry_path)
         require_principal(registry, settings.principal_id)
-        digest = policy_sha256(settings.registry_path)
         policy_state = "observed"
-        listed = list_authorized_projects(
-            settings.registry_path,
+        summaries = project_summaries_from_registry(
+            registry,
             principal_id=settings.principal_id,
-            cursor=None,
-            limit=settings.maximum_page_size,
         )
+        visible = summaries[: settings.maximum_page_size]
         grants = [
             EffectiveGrant(
                 project_id=item.id,
@@ -746,9 +754,9 @@ def _server_info(
                 effective_capabilities=item.effective_capabilities,
                 authorized=item.authorized,
             )
-            for item in listed.projects
+            for item in visible
         ]
-        if listed.truncated:
+        if len(summaries) > len(visible):
             limitations.append(
                 Limitation(
                     code="VEDAOPS_RESULT_TRUNCATED",
@@ -773,7 +781,7 @@ def _server_info(
         policy_path=str(settings.registry_path),
         policy_sha256=digest,
         policy_state=policy_state,
-        tool_catalog=list(TOOL_CATALOG),
+        tool_catalog=catalog,
         tool_catalog_sha256=catalog_digest,
         principal_id=settings.principal_id,
         effective_grants=grants,

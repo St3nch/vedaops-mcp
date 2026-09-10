@@ -34,6 +34,7 @@ from pydantic import (
 )
 
 from vedaops_mcp.errors import AuthorityError, IdentityError
+from vedaops_mcp.policy import read_bounded_file
 from vedaops_mcp.settings import validate_principal_id
 
 MANIFEST_RELATIVE_PATH = Path(".vedaops/project.toml")
@@ -413,6 +414,21 @@ def get_authorized_check(
     return project, check
 
 
+def project_summaries_from_registry(
+    registry: RegistryDocument,
+    *,
+    principal_id: str,
+) -> list[ProjectSummary]:
+    """Return granted project summaries from one already-loaded policy snapshot."""
+    principal = require_principal(registry, principal_id)
+    summaries = [
+        _project_summary(entry, principal)
+        for entry in registry.projects
+        if entry.id in principal.projects
+    ]
+    return sorted(summaries, key=lambda item: (item.id, item.root))
+
+
 def list_authorized_projects(
     registry_path: Path,
     *,
@@ -607,30 +623,25 @@ def _project_summary(
 
 
 def validate_project_manifest(project: RegisteredProject) -> ProjectManifest:
-    """Validate a non-aliased manifest at one trusted registered project root."""
+    """Parse the exact manifest bytes read through pinned no-follow traversal."""
     root = project.root.resolve()
-    authority_dir = root / ".vedaops"
-    manifest_path = root / MANIFEST_RELATIVE_PATH
     try:
-        authority_info = authority_dir.lstat()
-        manifest_info = manifest_path.lstat()
-        if not stat.S_ISDIR(authority_info.st_mode) or not stat.S_ISREG(manifest_info.st_mode):
-            raise AuthorityError(
-                "VEDAOPS_MANIFEST_UNAVAILABLE",
-                "project manifest and .vedaops parent must be real in-root entries",
-            )
-        root_device = root.stat().st_dev
-        if authority_info.st_dev != root_device or manifest_info.st_dev != root_device:
-            raise AuthorityError("VEDAOPS_MANIFEST_DEVICE_ESCAPE", str(manifest_path))
-    except AuthorityError:
-        raise
-    except OSError as exc:
+        raw, info = read_bounded_file(
+            root,
+            MANIFEST_RELATIVE_PATH.as_posix(),
+            limit_bytes=MAX_MANIFEST_BYTES,
+        )
+    except Exception as exc:
         raise AuthorityError(
             "VEDAOPS_MANIFEST_UNAVAILABLE",
             "project manifest is unavailable",
         ) from exc
-
-    manifest = _load_manifest(manifest_path)
+    if info.st_size > MAX_MANIFEST_BYTES or len(raw) != info.st_size:
+        raise AuthorityError(
+            "VEDAOPS_MANIFEST_TOO_LARGE",
+            f"manifest exceeds {MAX_MANIFEST_BYTES} bytes",
+        )
+    manifest = _parse_manifest(raw)
     if manifest.id != project.id:
         raise AuthorityError(
             "VEDAOPS_PROJECT_ID_COLLISION",
@@ -640,6 +651,16 @@ def validate_project_manifest(project: RegisteredProject) -> ProjectManifest:
 
 
 def _load_registry(path: Path) -> RegistryDocument:
+    registry, _digest = _load_registry_snapshot(path)
+    return registry
+
+
+def load_registry_snapshot(path: Path) -> tuple[RegistryDocument, str]:
+    """Load one validated operator-policy byte snapshot and its exact SHA-256."""
+    return _load_registry_snapshot(path)
+
+
+def _load_registry_snapshot(path: Path) -> tuple[RegistryDocument, str]:
     resolved_path = path.expanduser().resolve()
     try:
         info = resolved_path.stat()
@@ -702,26 +723,10 @@ def _load_registry(path: Path) -> RegistryDocument:
         registry.projects,
         label="the trusted project registry",
     )
-    return registry
+    return registry, hashlib.sha256(raw).hexdigest()
 
 
-def _load_manifest(path: Path) -> ProjectManifest:
-    try:
-        info = path.stat()
-        if info.st_size > MAX_MANIFEST_BYTES:
-            raise AuthorityError(
-                "VEDAOPS_MANIFEST_TOO_LARGE",
-                f"manifest exceeds {MAX_MANIFEST_BYTES} bytes",
-            )
-        raw = path.read_bytes()
-    except AuthorityError:
-        raise
-    except OSError as exc:
-        raise AuthorityError(
-            "VEDAOPS_MANIFEST_UNAVAILABLE",
-            "project manifest is unavailable",
-        ) from exc
-
+def _parse_manifest(raw: bytes) -> ProjectManifest:
     try:
         data = tomllib.loads(raw.decode("utf-8"))
         manifest = ProjectManifest.model_validate(data)

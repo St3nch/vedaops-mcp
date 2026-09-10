@@ -88,6 +88,7 @@ The runner must demonstrate:
 - bounded process lifetime;
 - bounded memory;
 - bounded output storage;
+- worker-writable scratch on disposable tmpfs charged to the same no-swap memory cgroup;
 - explicit writable paths;
 - explicit dependency/runtime identity where relevant.
 
@@ -124,7 +125,7 @@ When exact exercised bytes are not established, say so explicitly.
 
 ## 8. Git operations
 
-Target core Git support should eventually cover branch/ref observation, status, working-tree/index diffs, exact commit comparison, merge-base observation, bounded branch creation, bounded safe switch/checkout, and exact local commit.
+Core Git support covers branch/ref observation, status, working-tree/index diffs, exact commit comparison, bounded branch creation, bounded safe switch, exact local commit, fast-forward-only local integration, and safe deletion of an already-merged non-current local branch.
 
 No force reset, implicit stash, history rewriting, generic remote command, or automatic conflict resolution is required in the core.
 

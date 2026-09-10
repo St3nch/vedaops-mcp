@@ -33,9 +33,9 @@ bounded file changes
     ->
 inspect native diff
     ->
-run approved checks
+commit exactly named paths to establish the candidate subject
     ->
-commit exactly named paths
+run approved checks against that exact candidate commit
     ->
 independent review / CHAZ acceptance
     ->
@@ -45,6 +45,8 @@ fast-forward-only local merge
     ->
 optional safe local branch deletion
 ```
+
+The candidate commit is execution/review identity, not Product acceptance or publication. A check run before the intended edits are committed exercises the previous HEAD rather than dirty working-tree bytes.
 
 CHAZ may then perform `git push` separately when publication is explicitly authorized.
 
@@ -168,29 +170,30 @@ Prove at minimum:
 
 ## Astra whole-system audit remediation
 
-Astra's whole-system review of candidate `634635388837d39e1f1c9f33e2a20d8e2121c81d` found real cutover blockers rather than missing Product scope. The remediation remains MCP-04 work and does not add a new core capability ticket.
+Astra's whole-system review of candidate `634635388837d39e1f1c9f33e2a20d8e2121c81d` found real cutover blockers rather than missing Product scope. Its follow-up review of remediation candidate `7dff1bc34929eb31961d222491eb5ba1a9ba8d5e` found a second bounded set of implementation blockers around nested Git metadata, concurrent path substitution, journal placement/order, writable scratch exhaustion, runtime-capture races, and diagnostic/lifecycle identity. Both reviews left the four-responsibility Product boundary intact. This work remains MCP-04 and does not justify MCP-05.
 
 The repaired implementation now includes:
 
 - complete patch-effect authorization using Git's parsed effect set, including mixed/traditional diff cases;
-- fail-closed Git administrative confinement for refs indirection, alternates, promisor/partial-clone configuration, and protocol/network behavior;
+- fail-closed Git execution inside a networkless mount namespace plus recursive administrative-path validation, including nested refs/log aliases, grafts, shallow repositories, alternates, promisor/partial-clone configuration, and unsupported Git indirection;
 - exact FF integration against the validated source commit object rather than an ambiguous short ref;
-- stronger path/inode handling for manifest aliases, ignored checkout collisions, and same-open file content/hash identity;
-- a shared sanitized `project_venv` runtime for ordinary and PostgreSQL checks, built with trusted system Python in isolated mode, including bounded console executables and editable-install path retargeting into the disposable snapshot;
-- aggregate hostile-check containment through a bounded user systemd scope plus a global concurrent-check admission ceiling;
-- durable operation start/terminal evidence outside managed repos, with explicit uncertain-effect states for interrupted or unverifiable file/Git/check effects;
+- pinned manifest reads and confined conditional file create/replace/delete effects that preserve competing bytes instead of blindly overwriting a raced pathname;
+- a shared sanitized `project_venv` runtime for ordinary and PostgreSQL checks, captured inside a read-only project namespace with actual-byte/file/deadline bounds, bounded console executables, and editable-install path retargeting into the disposable snapshot;
+- hostile-check containment through a bounded user systemd scope, global concurrent-check admission ceiling, and tmpfs-only worker-writable scratch (`/workspace`, `/tmp`, worker HOME, and `/dev/shm`) charged to the same no-swap memory cgroup;
+- durable operation start/terminal evidence in operator-owned storage mechanically outside every managed project, with recovery subjects and explicit uncertain-effect states for interrupted or unverifiable file/Git/check/PostgreSQL effects;
 - PostgreSQL cleanup failures preserved as structured uncertainty rather than escaping and discarding cleanup evidence;
 - LLM-visible approved check descriptors in project orientation;
-- server diagnostics that distinguish observed source revision from loaded runtime artifact/Python/process identities.
+- server diagnostics that distinguish observed source revision from loaded runtime artifact/Python/process identities, derive policy digest and grants from one validated byte snapshot, and fingerprint the complete FastMCP-advertised tool contracts rather than tool names alone;
+- lifecycle documentation aligned with exact-subject checking: edit and inspect first, create the exact candidate commit, then check/review that committed subject before Product acceptance or integration.
 
 ## Remediation evidence
 
 - `ruff check .`: pass.
-- Permanent repository suite: 96 passed after the final editable-runtime repair.
-- Astra-derived adversarial regressions cover hidden patch targets, manifest aliases, ignored checkout collisions, branch/tag ambiguity, Git refs indirection, promisor/partial-clone refusal, Git alternates refusal, same-inode content/hash binding, controller-side Python shadowing, post-commit wrapper failure, PostgreSQL cleanup uncertainty, aggregate scope limits, and global check admission.
-- The complete local ticket lifecycle remains exercised without operator Git commands: create/switch ticket branch, edit, exact commit, switch target, refuse premature deletion, fast-forward-only integration, and safe merged-branch deletion.
-- Real Discrepancy Desk tracer at exact HEAD `73941507f2511aca3af8abcf47799bd016c687bf`: ordinary lint passed under the sanitized `project_venv` runtime; full PostgreSQL-backed pytest passed with 356 tests; PostgreSQL 18 Unix-socket connectivity and both container/workspace cleanup were verified with `uncertain_effects = false`.
-- Real Discrepancy Desk `format-check` passed through the ordinary runner, and `postgres-foundation-proofs` returned PASS through the disposable PostgreSQL 18 runner with verified cleanup.
+- Permanent repository suite: 109 passed after the second Astra remediation, including the actual client-contract/policy-snapshot M2 proofs.
+- Astra-derived adversarial regressions cover hidden patch targets, manifest aliases, ignored checkout collisions, branch/tag ambiguity, nested Git refs/log indirection, graft ancestry, promisor/partial-clone refusal, Git alternates refusal, same-inode content/hash binding, concurrent target replacement, parent relocation outside the project, journal placement/start-order failure, controller-side Python shadowing, runtime ancestor substitution and stale-size growth, post-commit wrapper failure, PostgreSQL cleanup uncertainty, tmpfs worker scratch, aggregate scope limits, and global check admission.
+- The complete local ticket lifecycle remains exercised without operator Git commands: create/switch ticket branch, edit, inspect, exact candidate commit, checks bound to that candidate, switch target, refuse premature deletion, fast-forward-only integration, and safe merged-branch deletion. Candidate commit, review, acceptance, integration, and publication remain distinct events.
+- Final real Discrepancy Desk tracer at exact HEAD `73941507f2511aca3af8abcf47799bd016c687bf` passed after the second Astra remediation: ordinary `format-check` and `lint` passed under the sanitized `project_venv`; full PostgreSQL-backed pytest reported 356 passed; `postgres-foundation-proofs` returned PASS; both PostgreSQL runs verified PostgreSQL 18 Unix-socket connectivity, `postgres_cleanup = removed`, workspace cleanup `removed`, `uncertain_effects = false`, and `scratch_storage = tmpfs_memory_cgroup`.
+- The tracer ran only in an automatically removed clone with a temporary new-MCP manifest/operator policy. Live Discrepancy Desk remained exact `73941507f2511aca3af8abcf47799bd016c687bf`, `main`, and clean afterward.
 - The server catalog still exposes no general shell, caller-selected Git argv, fetch, pull, or push surface. Remote publication remains outside MCP-04.
 - The live `.vedaops/project.toml` remains an intentional legacy-control-plane working-tree change and is excluded from the remediation candidate commit.
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from support import init_project, write_registry
 
+import vedaops_mcp.server as server_module
 from vedaops_mcp.server import TOOL_CATALOG, build_server
 from vedaops_mcp.settings import Settings
 
@@ -106,6 +109,49 @@ async def test_server_info_reports_principal_policy_and_catalog(tmp_path: Path):
     assert grants["example"]["workspace_id"] == "primary"
     assert grants["example"]["authorized"] is True
     assert grants["example"]["effective_capabilities"] == ["read"]
+
+
+@pytest.mark.asyncio
+async def test_server_info_catalog_digest_matches_client_advertised_contracts(tmp_path: Path):
+    settings = _settings(tmp_path)
+    async with Client(build_server(settings)) as client:
+        tools = await client.list_tools()
+        info = (await client.call_tool("vedaops_server_info", {})).structured_content
+
+    advertised = [
+        tool.model_dump(mode="json", by_alias=True, exclude_none=False)
+        for tool in tools
+    ]
+    raw = json.dumps(advertised, separators=(",", ":"), sort_keys=True).encode()
+    assert info["tool_catalog"] == [tool.name for tool in tools]
+    assert info["tool_catalog_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_server_info_policy_digest_and_grants_share_one_byte_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    settings = _settings(tmp_path)
+    original = server_module.load_registry_snapshot
+    captured_digest = ""
+
+    def load_then_corrupt(path: Path):
+        nonlocal captured_digest
+        registry, digest = original(path)
+        captured_digest = digest
+        path.write_text("this is no longer valid operator policy\n")
+        return registry, digest
+
+    monkeypatch.setattr(server_module, "load_registry_snapshot", load_then_corrupt)
+    async with Client(build_server(settings)) as client:
+        info = (await client.call_tool("vedaops_server_info", {})).structured_content
+
+    assert info["policy_state"] == "observed"
+    assert info["policy_sha256"] == captured_digest
+    grants = {item["project_id"]: item for item in info["effective_grants"]}
+    assert grants["example"]["effective_capabilities"] == ["read"]
+    assert settings.registry_path.read_text() == "this is no longer valid operator policy\n"
 
 
 @pytest.mark.asyncio

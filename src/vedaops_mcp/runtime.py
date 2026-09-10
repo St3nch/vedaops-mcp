@@ -7,7 +7,6 @@ import os
 import shutil
 import stat
 import subprocess
-import time
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
@@ -19,6 +18,8 @@ MAX_RUNTIME_FILES = 20_000
 MAX_RUNTIME_BYTES = 256 * 1024 * 1024
 RUNTIME_COPY_TIMEOUT_SECONDS = 30
 TRUSTED_SYSTEM_PYTHON = Path("/usr/bin/python3")
+BWRAP_PATH = Path("/usr/bin/bwrap")
+RUNTIME_HELPER_PATH = Path(__file__).with_name("runtime_helper.py")
 
 
 class RuntimeIdentity(BaseModel):
@@ -83,41 +84,6 @@ def project_venv(project_root: Path) -> Path:
     return path
 
 
-def _site_packages_root(venv_root: Path) -> Path:
-    lib = venv_root / "lib"
-    try:
-        lib_info = lib.lstat()
-    except OSError as exc:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "runtime lib directory is unavailable",
-        ) from exc
-    if not stat.S_ISDIR(lib_info.st_mode) or stat.S_ISLNK(lib_info.st_mode):
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "runtime lib directory must be a real directory",
-        )
-    candidates: list[Path] = []
-    for item in lib.iterdir():
-        info = item.lstat()
-        if item.name.startswith("python") and stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(
-            info.st_mode
-        ):
-            site = item / "site-packages"
-            try:
-                site_info = site.lstat()
-            except FileNotFoundError:
-                continue
-            if stat.S_ISDIR(site_info.st_mode) and not stat.S_ISLNK(site_info.st_mode):
-                candidates.append(site)
-    if len(candidates) != 1:
-        raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "runtime site-packages layout is unsupported",
-        )
-    return candidates[0]
-
-
 def copy_runtime_venv(source: Path, destination: Path, *, project_root: Path) -> None:
     system_python = TRUSTED_SYSTEM_PYTHON
     try:
@@ -133,7 +99,6 @@ def copy_runtime_venv(source: Path, destination: Path, *, project_root: Path) ->
             "trusted system Python is unavailable",
         )
 
-    started = time.monotonic()
     try:
         completed = subprocess.run(
             [str(system_python), "-I", "-m", "venv", "--without-pip", str(destination)],
@@ -175,209 +140,97 @@ def copy_runtime_venv(source: Path, destination: Path, *, project_root: Path) ->
         else:
             normalized_lines.append(line)
     config_path.write_text("\n".join(normalized_lines) + "\n", encoding="utf-8")
+    _copy_runtime_payload_confined(project_root, destination)
 
-    source_site = _site_packages_root(source)
-    target_site = _site_packages_root(destination)
-    if source_site.parent.name != target_site.parent.name:
+
+def _copy_runtime_payload_confined(project_root: Path, destination: Path) -> None:
+    """Copy project dependency bytes inside a read-only project mount."""
+    helper = RUNTIME_HELPER_PATH.resolve(strict=True)
+    root = project_root.resolve(strict=True)
+    if helper == root or root in helper.parents:
         raise PolicyError(
-            "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "project runtime Python version does not match trusted system Python",
+            "VEDAOPS_CONTROLLER_LAYOUT_UNSAFE",
+            "controller runtime helper must be installed outside managed projects",
         )
-
-    files = 0
-    total = 0
-    for current, directories, filenames, directory_fd in os.fwalk(
-        source_site,
-        topdown=True,
-        follow_symlinks=False,
-    ):
-        if time.monotonic() - started > RUNTIME_COPY_TIMEOUT_SECONDS:
-            raise PolicyError(
-                "VEDAOPS_CHECK_RUNTIME_TOO_LARGE",
-                "runtime capture exceeded its deadline",
-            )
-        current_path = Path(current)
-        relative_dir = current_path.relative_to(source_site)
-        target_dir = target_site / relative_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        directories.sort()
-        filenames.sort()
-        for directory in directories:
-            info = os.stat(directory, dir_fd=directory_fd, follow_symlinks=False)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                    "runtime packages contain an unsupported directory entry",
-                )
-        for filename in filenames:
-            info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                    "runtime packages contain an unsupported file entry",
-                )
-            files += 1
-            total += info.st_size
-            if files > MAX_RUNTIME_FILES or total > MAX_RUNTIME_BYTES:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_TOO_LARGE",
-                    "runtime packages exceed the capture bound",
-                )
-            descriptor = os.open(
-                filename,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=directory_fd,
-            )
-            try:
-                with os.fdopen(descriptor, "rb", closefd=True) as source_file:
-                    target_file = target_dir / filename
-                    with target_file.open("wb") as destination_file:
-                        shutil.copyfileobj(source_file, destination_file)
-                target_file.chmod(stat.S_IMODE(info.st_mode) & 0o777)
-            except Exception:
-                raise
-
-    _rewrite_project_paths_in_pth(project_root, target_site)
-    files, total = _copy_runtime_executables(
-        source,
-        destination,
-        started=started,
-        files=files,
-        total=total,
+    command = [
+        str(BWRAP_PATH),
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--hostname",
+        "vedaops-runtime-capture",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/lib",
+        "/lib",
+    ]
+    if Path("/lib64").exists():
+        command.extend(["--ro-bind", "/lib64", "/lib64"])
+    command.extend(
+        [
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--ro-bind",
+            str(root),
+            "/project",
+            "--bind",
+            str(destination.resolve(strict=True)),
+            "/runtime",
+            "--ro-bind",
+            str(helper),
+            "/vedaops-runtime-helper.py",
+            "--chdir",
+            "/",
+            "--clearenv",
+            "--setenv",
+            "HOME",
+            "/nonexistent",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "LC_ALL",
+            "C.UTF-8",
+            "--",
+            str(TRUSTED_SYSTEM_PYTHON),
+            "-I",
+            "/vedaops-runtime-helper.py",
+            str(root),
+            str(MAX_RUNTIME_FILES),
+            str(MAX_RUNTIME_BYTES),
+            str(RUNTIME_COPY_TIMEOUT_SECONDS),
+        ]
     )
-
-
-def _rewrite_project_paths_in_pth(project_root: Path, target_site: Path) -> None:
-    """Retarget editable-install path entries from the live repo to the sandbox snapshot."""
-    root = Path(os.path.normpath(str(project_root.resolve(strict=True))))
-    for path in sorted(target_site.glob("*.pth")):
-        try:
-            info = path.lstat()
-        except OSError as exc:
-            raise PolicyError(
-                "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                "runtime path metadata is unavailable",
-            ) from exc
-        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise PolicyError(
-                "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                "runtime path metadata must be a regular file",
-            )
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise PolicyError(
-                "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                "runtime path metadata must be UTF-8 text",
-            ) from exc
-        rewritten: list[str] = []
-        for line in text.splitlines():
-            stripped = line.strip()
-            candidate = Path(os.path.normpath(stripped)) if stripped else None
-            if candidate is not None and candidate.is_absolute() and (
-                candidate == root or root in candidate.parents
-            ):
-                relative = candidate.relative_to(root)
-                rewritten.append((Path("/workspace") / relative).as_posix())
-            else:
-                rewritten.append(line)
-        trailing = "\n" if text.endswith("\n") else ""
-        path.write_text("\n".join(rewritten) + trailing, encoding="utf-8")
-
-
-def _copy_runtime_executables(
-    source: Path,
-    destination: Path,
-    *,
-    started: float,
-    files: int,
-    total: int,
-) -> tuple[int, int]:
-    """Copy bounded regular venv console executables without preserving Python aliases."""
-    source_bin = source / "bin"
-    target_bin = destination / "bin"
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        directory_fd = os.open(source_bin, flags)
-    except OSError as exc:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=RUNTIME_COPY_TIMEOUT_SECONDS + 5,
+            check=False,
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
         raise PolicyError(
             "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-            "runtime bin directory is unavailable",
+            "confined runtime capture failed",
         ) from exc
-    try:
-        for filename in sorted(os.listdir(directory_fd)):
-            if time.monotonic() - started > RUNTIME_COPY_TIMEOUT_SECONDS:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_TOO_LARGE",
-                    "runtime capture exceeded its deadline",
-                )
-            target = target_bin / filename
-            if filename in {"uv", "uvx"} or target.exists() or target.is_symlink():
-                continue
-            try:
-                info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-            except OSError as exc:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                    "runtime executable metadata is unavailable",
-                ) from exc
-            if stat.S_ISLNK(info.st_mode):
-                continue
-            if not stat.S_ISREG(info.st_mode):
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                    "runtime bin contains an unsupported entry",
-                )
-            if not info.st_mode & 0o111:
-                continue
-            files += 1
-            total += info.st_size
-            if files > MAX_RUNTIME_FILES or total > MAX_RUNTIME_BYTES:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_TOO_LARGE",
-                    "runtime packages and executables exceed the capture bound",
-                )
-            try:
-                descriptor = os.open(
-                    filename,
-                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    dir_fd=directory_fd,
-                )
-            except OSError as exc:
-                raise PolicyError(
-                    "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                    "runtime executable is unavailable",
-                ) from exc
-            try:
-                opened = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(opened.st_mode)
-                    or opened.st_dev != info.st_dev
-                    or opened.st_ino != info.st_ino
-                ):
-                    raise PolicyError(
-                        "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                        "runtime executable changed during capture",
-                    )
-                with os.fdopen(descriptor, "rb", closefd=True) as handle:
-                    descriptor = -1
-                    raw = handle.read(info.st_size + 1)
-                if len(raw) != info.st_size:
-                    raise PolicyError(
-                        "VEDAOPS_CHECK_RUNTIME_UNAVAILABLE",
-                        "runtime executable changed during capture",
-                    )
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-            first_line, separator, remainder = raw.partition(b"\n")
-            if separator and first_line.startswith(b"#!") and b"python" in first_line.lower():
-                raw = b"#!/workspace/.venv/bin/python\n" + remainder
-            target.write_bytes(raw)
-            target.chmod(stat.S_IMODE(info.st_mode) & 0o777)
-    finally:
-        os.close(directory_fd)
-    return files, total
+    if completed.returncode != 0:
+        detail = completed.stdout.strip()[:1024] or "confined runtime capture failed"
+        raise PolicyError("VEDAOPS_CHECK_RUNTIME_UNAVAILABLE", detail)
 
 
 def runtime_identity(runtime_dir: Path, uv_path: Path) -> RuntimeIdentity:

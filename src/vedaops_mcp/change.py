@@ -25,22 +25,20 @@ from vedaops_mcp.operations import start_operation
 from vedaops_mcp.policy import (
     MAX_FILE_BYTES,
     MAX_GIT_RESULT_BYTES,
-    atomic_write_project_file,
+    conditional_delete_project_file,
+    conditional_write_project_file,
     ensure_mutation_path,
     ensure_not_ignored,
-    ensure_project_parent_directories,
     git_environment,
     literal_pathspec,
     normalize_relative,
     project_lstat,
     protected_reason,
     read_bounded_file,
-    remove_project_empty_directories,
     resolve_within_root,
     run_git_bytes,
     run_git_input,
     run_git_text,
-    unlink_project_file,
 )
 
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -219,57 +217,41 @@ def project_file_write(
             if before_raw == raw:
                 raise PolicyError("VEDAOPS_INVALID_ARGUMENT", "write would not change the file")
 
-        created_dirs = ensure_project_parent_directories(project.root, normalized)
         journal = start_operation(
             registry_path,
             kind="file_write",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={
+                "path": normalized,
+                "action": "create" if before_raw is None else "replace",
+                "expected_sha256": expected_digest,
+            },
         )
         try:
-            atomic_write_project_file(project.root, normalized, raw, before_mode)
+            conditional_write_project_file(
+                project.root,
+                normalized,
+                raw,
+                before_mode,
+                expected_sha256=expected_digest,
+            )
             _verify_file(project.root, normalized, raw)
             _require_head(project.root, expected_git_head)
+        except PolicyError as exc:
+            if exc.code == "VEDAOPS_CHANGE_PRECONDITION_FAILED":
+                journal.terminal("failed", detail=str(exc))
+                raise
+            journal.terminal("uncertain", detail=str(exc))
+            if exc.code == "VEDAOPS_CHANGE_EFFECT_UNCERTAIN":
+                raise
+            raise _change_effect_uncertain("file write") from exc
         except Exception as exc:
-            try:
-                current_info = project_lstat(project.root, normalized)
-                if before_raw is None:
-                    if current_info is not None:
-                        current_raw, _current_info = read_bounded_file(
-                            project.root,
-                            normalized,
-                            limit_bytes=MAX_FILE_BYTES,
-                        )
-                        if current_raw != raw:
-                            raise _change_effect_uncertain("file creation rollback")
-                        unlink_project_file(project.root, normalized)
-                    remove_project_empty_directories(project.root, created_dirs)
-                else:
-                    if current_info is None:
-                        raise _change_effect_uncertain("file replacement rollback")
-                    current_raw, _current_info = read_bounded_file(
-                        project.root,
-                        normalized,
-                        limit_bytes=MAX_FILE_BYTES,
-                    )
-                    if current_raw == raw:
-                        atomic_write_project_file(
-                            project.root,
-                            normalized,
-                            before_raw,
-                            before_mode,
-                        )
-                    elif current_raw != before_raw:
-                        raise _change_effect_uncertain("file replacement rollback")
-            except Exception as rollback_exc:
-                journal.terminal("uncertain", detail=str(rollback_exc))
-                if isinstance(rollback_exc, PolicyError) and rollback_exc.code == (
-                    "VEDAOPS_CHANGE_EFFECT_UNCERTAIN"
-                ):
-                    raise
-                raise _change_effect_uncertain("file mutation rollback") from rollback_exc
-            journal.terminal("failed", detail=str(exc))
-            raise exc
+            journal.terminal("uncertain", detail=str(exc))
+            raise _change_effect_uncertain("file write") from exc
         journal.terminal("succeeded")
         return FileChangeResult(
             operation_id=journal.operation_id,
@@ -344,34 +326,32 @@ def project_text_replace(
             kind="text_replace",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={"path": normalized, "expected_sha256": expected_digest},
         )
         try:
-            atomic_write_project_file(project.root, normalized, updated, mode)
+            conditional_write_project_file(
+                project.root,
+                normalized,
+                updated,
+                mode,
+                expected_sha256=expected_digest,
+            )
             _verify_file(project.root, normalized, updated)
             _require_head(project.root, expected_git_head)
+        except PolicyError as exc:
+            if exc.code == "VEDAOPS_CHANGE_PRECONDITION_FAILED":
+                journal.terminal("failed", detail=str(exc))
+                raise
+            journal.terminal("uncertain", detail=str(exc))
+            if exc.code == "VEDAOPS_CHANGE_EFFECT_UNCERTAIN":
+                raise
+            raise _change_effect_uncertain("text replacement") from exc
         except Exception as exc:
-            try:
-                current_info = project_lstat(project.root, normalized)
-                if current_info is None:
-                    raise _change_effect_uncertain("text replacement rollback")
-                current_raw, _current_info = read_bounded_file(
-                    project.root,
-                    normalized,
-                    limit_bytes=MAX_FILE_BYTES,
-                )
-                if current_raw == updated:
-                    atomic_write_project_file(project.root, normalized, raw, mode)
-                elif current_raw != raw:
-                    raise _change_effect_uncertain("text replacement rollback")
-            except Exception as rollback_exc:
-                journal.terminal("uncertain", detail=str(rollback_exc))
-                if isinstance(rollback_exc, PolicyError) and rollback_exc.code == (
-                    "VEDAOPS_CHANGE_EFFECT_UNCERTAIN"
-                ):
-                    raise
-                raise _change_effect_uncertain("text replacement rollback") from rollback_exc
-            journal.terminal("failed", detail=str(exc))
-            raise exc
+            journal.terminal("uncertain", detail=str(exc))
+            raise _change_effect_uncertain("text replacement") from exc
         journal.terminal("succeeded")
         return FileChangeResult(
             operation_id=journal.operation_id,
@@ -415,40 +395,36 @@ def project_file_delete(
                 "VEDAOPS_CHANGE_PRECONDITION_FAILED",
                 "file SHA-256 does not match expected_sha256",
             )
-        mode = stat.S_IMODE(info.st_mode)
         journal = start_operation(
             registry_path,
             kind="file_delete",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={"path": normalized, "expected_sha256": expected_digest},
         )
         try:
-            unlink_project_file(project.root, normalized)
+            conditional_delete_project_file(
+                project.root,
+                normalized,
+                expected_sha256=expected_digest,
+            )
             if project_lstat(project.root, normalized) is not None:
                 raise PolicyError("VEDAOPS_CHANGE_VERIFY_FAILED", "deleted file still exists")
             _require_head(project.root, expected_git_head)
+        except PolicyError as exc:
+            if exc.code == "VEDAOPS_CHANGE_PRECONDITION_FAILED":
+                journal.terminal("failed", detail=str(exc))
+                raise
+            journal.terminal("uncertain", detail=str(exc))
+            if exc.code == "VEDAOPS_CHANGE_EFFECT_UNCERTAIN":
+                raise
+            raise _change_effect_uncertain("file deletion") from exc
         except Exception as exc:
-            try:
-                current_info = project_lstat(project.root, normalized)
-                if current_info is None:
-                    atomic_write_project_file(project.root, normalized, raw, mode)
-                else:
-                    current_raw, _current_info = read_bounded_file(
-                        project.root,
-                        normalized,
-                        limit_bytes=MAX_FILE_BYTES,
-                    )
-                    if current_raw != raw:
-                        raise _change_effect_uncertain("file deletion rollback")
-            except Exception as rollback_exc:
-                journal.terminal("uncertain", detail=str(rollback_exc))
-                if isinstance(rollback_exc, PolicyError) and rollback_exc.code == (
-                    "VEDAOPS_CHANGE_EFFECT_UNCERTAIN"
-                ):
-                    raise
-                raise _change_effect_uncertain("file deletion rollback") from rollback_exc
-            journal.terminal("failed", detail=str(exc))
-            raise exc
+            journal.terminal("uncertain", detail=str(exc))
+            raise _change_effect_uncertain("file deletion") from exc
         journal.terminal("succeeded")
         return FileChangeResult(
             operation_id=journal.operation_id,
@@ -498,6 +474,10 @@ def project_patch_apply(
             kind="patch_apply",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={"paths": paths},
         )
         try:
             run_git_input(
@@ -675,6 +655,10 @@ def project_git_commit(
             kind="git_commit",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={"branch": branch, "paths": commit_paths},
         )
         try:
             run_git_text(project.root, "add", "-A", "--", *pathspecs)
@@ -769,6 +753,10 @@ def project_git_branch_create(
             kind="git_branch_create",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={"branch": branch, "previous_branch": previous},
         )
         try:
             run_git_text(
@@ -840,6 +828,10 @@ def project_git_switch(
             kind="git_switch",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={"from_branch": current, "to_branch": branch, "to_head": target_head},
         )
         try:
             run_git_text(project.root, "switch", "--no-guess", branch)
@@ -911,6 +903,14 @@ def project_git_merge_ff(
             kind="git_merge_ff",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={
+                "target_branch": target,
+                "source_branch": source,
+                "source_head": source_head,
+            },
         )
         try:
             run_git_text(project.root, "merge", "--ff-only", "--no-edit", source_head)
@@ -988,6 +988,10 @@ def project_git_branch_delete(
             kind="git_branch_delete",
             project_id=project.id,
             expected_git_head=expected_git_head,
+            principal_id=project.principal_id,
+            workspace_id=project.workspace_id,
+            project_root=project.root,
+            subject={"branch": branch, "branch_head": branch_head_expected},
         )
         try:
             run_git_text(project.root, "branch", "-d", "--", branch)

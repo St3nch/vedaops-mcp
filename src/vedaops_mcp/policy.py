@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import secrets
 import stat
@@ -28,6 +29,11 @@ MAX_GIT_RESULT_BYTES = 256 * 1024
 GIT_TIMEOUT_SECONDS = 15
 IGNORE_CHECK_TIMEOUT_SECONDS = 5
 FALLBACK_PATH = "/usr/local/bin:/usr/bin:/bin"
+GIT_PATH = Path("/usr/bin/git")
+GIT_BWRAP_PATH = Path("/usr/bin/bwrap")
+TRUSTED_PYTHON_PATH = Path("/usr/bin/python3")
+FS_HELPER_PATH = Path(__file__).with_name("fs_helper.py")
+MAX_GIT_ADMIN_ENTRIES = 200_000
 GIT_ENVIRONMENT_ALLOWLIST = (
     "HOME",
     "LANG",
@@ -503,13 +509,158 @@ def project_lstat(root: Path, relative_path: str) -> os.stat_result | None:
         os.close(parent_descriptor)
 
 
+def conditional_write_project_file(
+    root: Path,
+    relative_path: str,
+    data: bytes,
+    mode: int,
+    *,
+    expected_sha256: str | None,
+) -> None:
+    """Apply one conditional write inside a filesystem-confined helper."""
+    expected = "-" if expected_sha256 is None else expected_sha256
+    _run_file_helper(root, "write", relative_path, expected, f"{mode & 0o777:o}", input_bytes=data)
+
+
+def conditional_delete_project_file(
+    root: Path,
+    relative_path: str,
+    *,
+    expected_sha256: str,
+) -> None:
+    """Delete only the exact expected file object inside a filesystem-confined helper."""
+    _run_file_helper(root, "delete", relative_path, expected_sha256, input_bytes=b"")
+
+
+def _run_file_helper(
+    root: Path,
+    operation: str,
+    relative_path: str,
+    expected: str,
+    *extra: str,
+    input_bytes: bytes,
+) -> None:
+    helper = FS_HELPER_PATH.resolve(strict=True)
+    resolved_root = root.resolve(strict=True)
+    if helper == resolved_root or resolved_root in helper.parents:
+        raise PolicyError(
+            "VEDAOPS_CONTROLLER_LAYOUT_UNSAFE",
+            "controller file-effect helper must be installed outside managed projects",
+        )
+    command = [
+        str(GIT_BWRAP_PATH),
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--hostname",
+        "vedaops-file",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/lib",
+        "/lib",
+    ]
+    if Path("/lib64").exists():
+        command.extend(["--ro-bind", "/lib64", "/lib64"])
+    command.extend(
+        [
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--bind",
+            str(resolved_root),
+            "/workspace",
+            "--ro-bind",
+            str(helper),
+            "/vedaops-fs-helper.py",
+            "--chdir",
+            "/workspace",
+            "--clearenv",
+            "--setenv",
+            "HOME",
+            "/nonexistent",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "LC_ALL",
+            "C.UTF-8",
+            "--",
+            str(TRUSTED_PYTHON_PATH),
+            "-I",
+            "/vedaops-fs-helper.py",
+            operation,
+            relative_path,
+            expected,
+            *extra,
+        ]
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            input=input_bytes,
+            capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+            shell=False,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PolicyError(
+            "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+            "confined file operation may have started; inspect the exact target before retrying",
+        ) from exc
+    if len(completed.stdout) > 4096 or len(completed.stderr) > 4096:
+        raise PolicyError(
+            "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+            "confined file operation returned malformed evidence; inspect before retrying",
+        )
+    try:
+        payload = json.loads(completed.stdout.decode("utf-8"))
+        state = payload["state"]
+        detail = str(payload.get("detail", ""))
+        backup = payload.get("backup")
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise PolicyError(
+            "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+            "confined file operation returned malformed evidence; inspect before retrying",
+        ) from exc
+    if completed.returncode == 0 and state == "succeeded":
+        return
+    if completed.returncode == 2 and state == "precondition_failed":
+        raise PolicyError(
+            "VEDAOPS_CHANGE_PRECONDITION_FAILED",
+            detail or "file precondition changed before the effect",
+        )
+    if completed.returncode == 3 and state == "uncertain":
+        suffix = f"; preserved backup {backup!r}" if backup else ""
+        raise PolicyError(
+            "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+            (detail or "file effect could not be verified") + suffix,
+        )
+    raise PolicyError(
+        "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+        "confined file operation failed without trustworthy terminal evidence; "
+        "inspect before retrying",
+    )
+
+
 def literal_pathspec(relative_path: str) -> str:
     """Return a Git pathspec that matches exactly one repository path."""
     return f":(literal){relative_path}"
 
 
 def ensure_git_repository(root: Path) -> None:
-    """Refuse repositories whose administrative storage can escape the project root."""
+    """Refuse unsupported Git metadata before a confined Git subprocess starts."""
     git_directory = root / ".git"
     try:
         info = git_directory.lstat()
@@ -518,7 +669,7 @@ def ensure_git_repository(root: Path) -> None:
             "VEDAOPS_PROJECT_NOT_A_GIT_REPOSITORY",
             "registered project root is not a Git repository",
         ) from exc
-    if not stat.S_ISDIR(info.st_mode):
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
         raise PolicyError(
             "VEDAOPS_PROJECT_CONFIG_UNSAFE",
             "the repository Git directory must be a real in-root directory",
@@ -543,14 +694,21 @@ def ensure_git_repository(root: Path) -> None:
             if expected_kind == "file"
             else stat.S_ISDIR(child.st_mode)
         )
-        if not valid:
+        if not valid or stat.S_ISLNK(child.st_mode):
             raise PolicyError(
                 "VEDAOPS_PROJECT_CONFIG_UNSAFE",
                 "repository Git administrative path "
                 f".git/{relative} must be a real {expected_kind}",
             )
 
-    for relative in ("commondir", "gitdir", "objects/info/alternates"):
+    for relative in (
+        "commondir",
+        "gitdir",
+        "objects/info/alternates",
+        "info/grafts",
+        "shallow",
+        "modules",
+    ):
         candidate = git_directory / relative
         try:
             candidate.lstat()
@@ -565,6 +723,65 @@ def ensure_git_repository(root: Path) -> None:
             "VEDAOPS_PROJECT_CONFIG_UNSAFE",
             f"repository Git administrative indirection .git/{relative} is unsupported",
         )
+
+    for relative in ("refs", "objects", "logs", "info"):
+        _validate_git_admin_subtree(git_directory, relative)
+
+    for relative in ("packed-refs", "index"):
+        candidate = git_directory / relative
+        try:
+            entry = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise PolicyError(
+                "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+                f"repository Git administrative path .git/{relative} is unavailable",
+            ) from exc
+        if not stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+            raise PolicyError(
+                "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+                f"repository Git administrative path .git/{relative} must be a regular file",
+            )
+
+
+def _validate_git_admin_subtree(git_directory: Path, relative: str) -> None:
+    """Reject aliases/non-files in metadata trees that Git may read or mutate."""
+    start = git_directory / relative
+    try:
+        info = start.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise PolicyError(
+            "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+            f"repository Git administrative path .git/{relative} is unavailable",
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise PolicyError(
+            "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+            f"repository Git administrative path .git/{relative} must be a real directory",
+        )
+    count = 0
+    for current, directories, filenames in os.walk(start, topdown=True, followlinks=False):
+        directories.sort()
+        filenames.sort()
+        current_path = Path(current)
+        for name in [*directories, *filenames]:
+            count += 1
+            if count > MAX_GIT_ADMIN_ENTRIES:
+                raise PolicyError(
+                    "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+                    "Git administrative tree exceeds the validation bound",
+                )
+            entry = (current_path / name).lstat()
+            if stat.S_ISLNK(entry.st_mode) or not (
+                stat.S_ISDIR(entry.st_mode) or stat.S_ISREG(entry.st_mode)
+            ):
+                raise PolicyError(
+                    "VEDAOPS_PROJECT_CONFIG_UNSAFE",
+                    "Git administrative trees may contain only real files/directories",
+                )
 
 
 def ensure_safe_local_git_config(root: Path) -> None:
@@ -877,7 +1094,86 @@ def bounded_text(raw: bytes, limit: int) -> tuple[str, int, bool]:
 
 
 def _git_command(root: Path, *args: str) -> list[str]:
-    command = ["git", "--no-replace-objects", "-C", str(root)]
+    """Run Git in a mount/network namespace that exposes only the managed root."""
+    command = [
+        str(GIT_BWRAP_PATH),
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--hostname",
+        "vedaops-git",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/lib",
+        "/lib",
+    ]
+    if Path("/lib64").exists():
+        command.extend(["--ro-bind", "/lib64", "/lib64"])
+    command.extend(
+        [
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--dir",
+            "/home",
+            "--dir",
+            "/home/worker",
+            "--bind",
+            str(root.resolve()),
+            "/workspace",
+            "--chdir",
+            "/workspace",
+            "--clearenv",
+            "--setenv",
+            "HOME",
+            "/home/worker",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "LC_ALL",
+            "C.UTF-8",
+            "--setenv",
+            "GIT_TERMINAL_PROMPT",
+            "0",
+            "--setenv",
+            "GIT_CONFIG_GLOBAL",
+            "/dev/null",
+            "--setenv",
+            "GIT_CONFIG_NOSYSTEM",
+            "1",
+            "--setenv",
+            "GIT_OPTIONAL_LOCKS",
+            "0",
+            "--setenv",
+            "GIT_PAGER",
+            "cat",
+            "--setenv",
+            "GIT_NO_REPLACE_OBJECTS",
+            "1",
+            "--setenv",
+            "GIT_ALLOW_PROTOCOL",
+            "",
+            "--setenv",
+            "GIT_PROTOCOL_FROM_USER",
+            "0",
+            "--",
+            str(GIT_PATH),
+            "--no-replace-objects",
+            "-C",
+            "/workspace",
+        ]
+    )
     for key, value in GIT_CONFIG_OVERRIDES:
         command.extend(["-c", f"{key}={value}"])
     command.extend(args)

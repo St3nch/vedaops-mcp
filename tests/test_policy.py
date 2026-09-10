@@ -247,3 +247,50 @@ def test_git_object_alternates_are_refused(tmp_path: Path):
 
     with pytest.raises(PolicyError, match="VEDAOPS_PROJECT_CONFIG_UNSAFE"):
         ensure_git_repository(root)
+
+
+@pytest.mark.parametrize("relative", ["refs/heads", "logs"])
+def test_nested_git_admin_symlink_outside_project_is_refused(
+    tmp_path: Path,
+    relative: str,
+):
+    root = tmp_path / "project"
+    init_project(root)
+    target = root / ".git" / relative
+    outside = tmp_path / f"outside-{relative.replace('/', '-')}"
+    if target.exists():
+        target.rename(outside)
+    else:
+        outside.mkdir(parents=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_PROJECT_CONFIG_UNSAFE"):
+        ensure_git_repository(root)
+
+    assert outside.is_dir()
+
+
+def test_git_grafts_are_refused_before_ancestry_can_be_used(tmp_path: Path):
+    root = tmp_path / "project"
+    head = init_project(root)
+    target_branch = git(root, "branch", "--show-current")
+    git(root, "switch", "-c", "source")
+    (root / "README.md").write_text("source\n")
+    git(root, "add", "README.md")
+    git(root, "commit", "-q", "-m", "source")
+    source = git(root, "rev-parse", "HEAD")
+    git(root, "switch", target_branch)
+    (root / "README.md").write_text("target\n")
+    git(root, "add", "README.md")
+    git(root, "commit", "-q", "-m", "target")
+    target = git(root, "rev-parse", "HEAD")
+    assert git(root, "merge-base", source, target) != target
+    grafts = root / ".git" / "info" / "grafts"
+    grafts.parent.mkdir(parents=True, exist_ok=True)
+    grafts.write_text(f"{source} {target}\n")
+
+    with pytest.raises(PolicyError, match="VEDAOPS_PROJECT_CONFIG_UNSAFE"):
+        ensure_git_repository(root)
+
+    assert head != source

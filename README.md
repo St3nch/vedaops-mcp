@@ -33,7 +33,7 @@ The trusted launcher sets `VEDAOPS_AGENT_ID`. That binds this MCP process to a c
 
 MCP-02 adds one execution surface: `project_check_run`. Callers select only an operator-approved check ID, an exact current Git HEAD, and optionally a shorter timeout. They cannot supply argv.
 
-The runner materializes a bounded snapshot directly from Git tree/blob objects and executes it under the `linux-bwrap-systemd-v2` profile with network denied, a synthetic home, no controller or SSH environment, no other project mounts, no Docker socket, per-process limits, aggregate systemd-scope memory/task limits, bounded output, and explicit cleanup evidence. The snapshot is writable only as disposable check workspace state; it has no path back to the live project. The receipt reports `exact_commit_snapshot` only when every supported commit entry was materialized; otherwise it reports explicit exclusions. Dirty and untracked working-tree content is never part of the exercised commit subject.
+The runner materializes a bounded snapshot directly from Git tree/blob objects and executes it under the `linux-bwrap-systemd-tmpfs-v3` profile with network denied, a synthetic home, no controller or SSH environment, no other project mounts, no Docker socket, per-process limits, aggregate systemd-scope memory/task limits, bounded output, and explicit cleanup evidence. All worker-writable scratch (`/workspace`, `/tmp`, `/home/worker`, and `/dev/shm`) is disposable tmpfs memory charged to the same no-swap systemd memory cgroup rather than host-backed disk. Project code receives no mount capability. The receipt reports `exact_commit_snapshot` only when every supported commit entry was materialized; otherwise it reports explicit exclusions. Dirty and untracked working-tree content is never part of the exercised commit subject.
 
 ## MCP-03 disposable PostgreSQL checks
 
@@ -51,7 +51,13 @@ The MCP does not expose shell access, caller-selected Git argv, fetch, pull, pus
 
 Effecting file, Git, and check operations record a minimal durable operation journal outside managed project roots. A started operation is recorded before its first externally visible effect and reaches `succeeded`, `failed`, or `uncertain` only after terminal evidence. This is recovery evidence, not workflow state.
 
-`vedaops_server_info` distinguishes observed source-checkout revision from the runtime artifact actually loaded. It reports a deterministic loaded-package digest, Python executable path/digest, process ID, instance/start identity, policy fingerprint, tool-catalog fingerprint, and effective grants; client-advertised catalog state must still be verified separately during cutover.
+`vedaops_server_info` distinguishes observed source-checkout revision from the runtime artifact actually loaded. It reports a deterministic loaded-package digest, Python executable path/digest, process ID, instance/start identity, one exact validated operator-policy byte snapshot and its effective grants, plus a fingerprint of the complete FastMCP-advertised tool contracts rather than names alone. Client-advertised catalog state must still be independently observed during cutover.
+
+Because Check intentionally exercises an exact committed subject, the normal local development order is:
+
+`edit -> inspect intended diff -> exact local candidate commit -> run approved checks against that candidate -> independent review -> CHAZ acceptance -> fast-forward integration -> optional local branch cleanup -> operator push when authorized`
+
+The candidate commit is neither Product acceptance nor publication. Running a check before the candidate commit would exercise the previous HEAD, not dirty working-tree bytes.
 
 Effective permission is the intersection of the principal grant, operator project ceiling, project-manifest narrowing, and operation-specific restrictions.
 

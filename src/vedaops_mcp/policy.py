@@ -224,6 +224,44 @@ def resolve_within_root(root: Path, relative_path: str, *, must_exist: bool) -> 
     return resolved
 
 
+def read_project_directory_identity(
+    root: Path,
+    relative_path: str,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Pin one in-root directory and return its filesystem identity.
+
+    This deliberately permits protected directory names because authorization
+    uses it to remember mechanical-authority directories before Change
+    preflight. Callers cannot select this path.
+    """
+    normalized = normalize_relative(relative_path)
+    descriptor, _placeholder, root_info = _open_project_parent(
+        root,
+        f"{normalized}/.vedaops-identity-probe",
+    )
+    try:
+        root_identity = (root_info.st_dev, root_info.st_ino)
+        if (
+            expected_root_identity is not None
+            and root_identity != expected_root_identity
+        ):
+            raise PolicyError(
+                "VEDAOPS_CHANGE_PRECONDITION_FAILED",
+                "authorized project root identity changed while authority was captured",
+            )
+        info = os.fstat(descriptor)
+        if info.st_dev != root_info.st_dev:
+            raise PolicyError(
+                "VEDAOPS_PATH_DEVICE_ESCAPE",
+                f"{normalized} is on a different filesystem",
+            )
+        return info.st_dev, info.st_ino
+    finally:
+        os.close(descriptor)
+
+
 def _capture_parent_guard(
     root: Path,
     relative_path: str,

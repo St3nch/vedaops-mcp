@@ -1,6 +1,6 @@
 # MCP-04 — Bounded Change Plane
 
-Status: Astra independent acceptance review rejected candidate `8e28d9ac208b35697b8ace103e36a944a8b3a938`; a fourth bounded remediation is implemented on `ticket/MCP-04-bounded-change-plane`; local verification is green; exact-candidate independent review and Product acceptance remain pending.
+Status: Grok independent review rejected candidate `9c2da4ca1ce0bfb73205f1a98fd309c394cb86a2`; a fifth bounded remediation is implemented on `ticket/MCP-04-bounded-change-plane`; local verification is green; exact-candidate independent review and Product acceptance remain pending.
 
 ## Product reason
 
@@ -180,6 +180,10 @@ Astra's independent acceptance review of candidate `8e28d9ac208b35697b8ace103e36
 
 The fourth remediation carries the authorized root, protected authority-directory identity, and requested parent-directory identity from public preflight into the confined helper; moves only helper-reported cleanup entries through identity-checked quarantine before deletion; treats malformed or inconsistent helper evidence as uncertain; and starts PostgreSQL with `--log-driver none` while verifying the effective log configuration and empty `LogPath`. No new capability or architecture was added.
 
+Grok's independent review of candidate `9c2da4ca1ce0bfb73205f1a98fd309c394cb86a2` reproduced the commissioned F1-F3 repairs as fixed, then found one remaining form of the same F1 authority-identity bug: `.git` was lexically protected but its directory identity was not captured beside `.vedaops`, so moving the real Git administrative directory onto an ordinary parent during parent-guard capture could still produce an in-`.git` file effect.
+
+The fifth remediation pins the real in-root `.git` directory identity during Change authorization, verifies it against the same authorized project-root identity, adds it to the protected-parent identity set, and permanently reproduces the capture-time swap through helper invocation. This remains an MCP-04 correction, not new architecture or MCP-05.
+
 The repaired implementation now includes:
 
 - complete patch-effect authorization using Git's parsed effect set, including mixed/traditional diff cases;
@@ -198,8 +202,9 @@ The repaired implementation now includes:
 
 ## Remediation evidence
 
-- Disposable review-copy `ruff check .`: pass on the fourth-remediation tree.
-- Permanent repository suite: 127 tests plus one disposable harness smoke test, 128 passed in 41.09 seconds on the fourth-remediation tree.
+- Disposable review-copy `ruff check .`: pass on the fifth-remediation tree.
+- Permanent repository suite: 128 tests plus one disposable harness smoke test, 129 passed in 44.54 seconds on the fifth-remediation tree.
+- The new regression holds a real `.git`-onto-ordinary-directory substitution across target-parent capture and helper invocation; Change now refuses it before an effect and leaves both `.git/new.txt` and `ordinary/new.txt` absent.
 - Astra-derived adversarial regressions cover hidden patch targets, manifest aliases, ignored checkout collisions, branch/tag ambiguity, nested Git refs/log indirection, graft ancestry, promisor/partial-clone refusal, Git alternates refusal, same-inode content/hash binding, concurrent target replacement, parent relocation outside the project, symlink and real-directory substitution across public preflight and the helper effect boundary, create/replace/delete attempts against moved protected authority, helper-owned cleanup identity, O_EXCL collisions, competing cleanup substitution, strict effect-evidence decoding, post-create/post-exchange/post-delete uncertainty, preservation of original and competing recovery bytes without reverse exchange, journal placement/start-order failure, controller-side Python shadowing, runtime ancestor substitution and stale-size growth, post-commit wrapper failure, PostgreSQL cleanup uncertainty, disabled Docker host logging, bounded read-only PostgreSQL server storage, tmpfs worker scratch, aggregate scope limits, and global check admission.
 - The live PostgreSQL 18 regression emitted a bounded 32 KiB server log message and verified effective `LogConfig.Type=none`, empty `LogPath`, and refusal of `docker logs`; the full suite reported no skipped probe.
 - The complete local ticket lifecycle remains exercised without operator Git commands: create/switch ticket branch, edit, inspect, exact candidate commit, checks bound to that candidate, switch target, refuse premature deletion, fast-forward-only integration, and safe merged-branch deletion. Candidate commit, review, acceptance, integration, and publication remain distinct events.

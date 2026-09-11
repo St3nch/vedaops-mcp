@@ -34,7 +34,10 @@ from pydantic import (
 )
 
 from vedaops_mcp.errors import AuthorityError, IdentityError
-from vedaops_mcp.policy import read_bounded_file_with_parent_identity
+from vedaops_mcp.policy import (
+    read_bounded_file_with_parent_identity,
+    read_project_directory_identity,
+)
 from vedaops_mcp.settings import validate_principal_id
 
 MANIFEST_RELATIVE_PATH = Path(".vedaops/project.toml")
@@ -356,6 +359,14 @@ def get_authorized_project(
     assert manifest is not None
     assert root_identity is not None
     assert protected_parent_identity is not None
+    protected_parent_identities = (protected_parent_identity,)
+    if capability == "change":
+        git_identity = read_project_directory_identity(
+            entry.root,
+            ".git",
+            expected_root_identity=root_identity,
+        )
+        protected_parent_identities += (git_identity,)
     return AuthorizedProject(
         id=entry.id,
         name=entry.name,
@@ -368,7 +379,7 @@ def get_authorized_project(
         context_files=tuple(entry.context_files),
         principal_id=principal.id,
         authorized_root_identity=root_identity,
-        protected_parent_identities=(protected_parent_identity,),
+        protected_parent_identities=protected_parent_identities,
     )
 
 

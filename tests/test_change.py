@@ -1451,3 +1451,69 @@ def test_ordinary_real_directory_substitution_is_rejected_before_effect(
 
     assert ordinary_target.read_bytes() == b"same bytes\n"
     assert substitute_target.read_bytes() == b"same bytes\n"
+
+
+def test_git_directory_substitution_during_parent_capture_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+    ordinary = root / "ordinary"
+    ordinary.mkdir()
+    git_directory = root / ".git"
+    parked = root / "parked"
+    real_capture = change_module._capture_parent_guard
+    real_helper = change_module.conditional_write_project_file
+    swapped = False
+
+    def restore() -> None:
+        nonlocal swapped
+        if not swapped:
+            return
+        ordinary.rename(git_directory)
+        parked.rename(ordinary)
+        swapped = False
+
+    def substitute_during_capture(*args, **kwargs):
+        nonlocal swapped
+        ordinary.rename(parked)
+        git_directory.rename(ordinary)
+        swapped = True
+        try:
+            return real_capture(*args, **kwargs)
+        except Exception:
+            restore()
+            raise
+
+    def hold_substitution_through_helper(*args, **kwargs):
+        try:
+            return real_helper(*args, **kwargs)
+        finally:
+            restore()
+
+    monkeypatch.setattr(
+        change_module,
+        "_capture_parent_guard",
+        substitute_during_capture,
+    )
+    monkeypatch.setattr(
+        change_module,
+        "conditional_write_project_file",
+        hold_substitution_through_helper,
+    )
+
+    try:
+        with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_PRECONDITION_FAILED"):
+            project_file_write(
+                registry,
+                principal_id="test-agent",
+                project_id="example",
+                expected_git_head=head,
+                path="ordinary/new.txt",
+                content="into-git\n",
+            )
+    finally:
+        restore()
+
+    assert not (git_directory / "new.txt").exists()
+    assert not (ordinary / "new.txt").exists()

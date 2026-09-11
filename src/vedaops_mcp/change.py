@@ -25,6 +25,7 @@ from vedaops_mcp.operations import start_operation
 from vedaops_mcp.policy import (
     MAX_FILE_BYTES,
     MAX_GIT_RESULT_BYTES,
+    _capture_parent_guard,
     conditional_delete_project_file,
     conditional_write_project_file,
     ensure_mutation_path,
@@ -217,6 +218,12 @@ def project_file_write(
             if before_raw == raw:
                 raise PolicyError("VEDAOPS_INVALID_ARGUMENT", "write would not change the file")
 
+        parent_guard = _capture_parent_guard(
+            project.root,
+            normalized,
+            authorized_root_identity=project.authorized_root_identity,
+            protected_parent_identities=project.protected_parent_identities,
+        )
         journal = start_operation(
             registry_path,
             kind="file_write",
@@ -244,6 +251,9 @@ def project_file_write(
                 before_mode,
                 expected_sha256=expected_digest,
                 operation_id=journal.operation_id,
+                authorized_root_identity=project.authorized_root_identity,
+                protected_parent_identities=project.protected_parent_identities,
+                parent_guard=parent_guard,
             )
             _verify_file(project.root, normalized, raw)
             _require_head(project.root, expected_git_head)
@@ -327,6 +337,12 @@ def project_text_replace(
         if len(updated) > MAX_FILE_BYTES:
             raise PolicyError("VEDAOPS_CHANGE_TOO_LARGE", "replacement exceeds the hard limit")
         mode = stat.S_IMODE(info.st_mode)
+        parent_guard = _capture_parent_guard(
+            project.root,
+            normalized,
+            authorized_root_identity=project.authorized_root_identity,
+            protected_parent_identities=project.protected_parent_identities,
+        )
         journal = start_operation(
             registry_path,
             kind="text_replace",
@@ -350,6 +366,9 @@ def project_text_replace(
                 mode,
                 expected_sha256=expected_digest,
                 operation_id=journal.operation_id,
+                authorized_root_identity=project.authorized_root_identity,
+                protected_parent_identities=project.protected_parent_identities,
+                parent_guard=parent_guard,
             )
             _verify_file(project.root, normalized, updated)
             _require_head(project.root, expected_git_head)
@@ -407,6 +426,12 @@ def project_file_delete(
                 "VEDAOPS_CHANGE_PRECONDITION_FAILED",
                 "file SHA-256 does not match expected_sha256",
             )
+        parent_guard = _capture_parent_guard(
+            project.root,
+            normalized,
+            authorized_root_identity=project.authorized_root_identity,
+            protected_parent_identities=project.protected_parent_identities,
+        )
         journal = start_operation(
             registry_path,
             kind="file_delete",
@@ -428,6 +453,9 @@ def project_file_delete(
                 normalized,
                 expected_sha256=expected_digest,
                 operation_id=journal.operation_id,
+                authorized_root_identity=project.authorized_root_identity,
+                protected_parent_identities=project.protected_parent_identities,
+                parent_guard=parent_guard,
             )
             if project_lstat(project.root, normalized) is not None:
                 raise PolicyError("VEDAOPS_CHANGE_VERIFY_FAILED", "deleted file still exists")

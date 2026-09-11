@@ -34,7 +34,7 @@ from pydantic import (
 )
 
 from vedaops_mcp.errors import AuthorityError, IdentityError
-from vedaops_mcp.policy import read_bounded_file
+from vedaops_mcp.policy import read_bounded_file_with_parent_identity
 from vedaops_mcp.settings import validate_principal_id
 
 MANIFEST_RELATIVE_PATH = Path(".vedaops/project.toml")
@@ -232,6 +232,8 @@ class AuthorizedProject(BaseModel):
     capabilities: frozenset[str]
     context_files: tuple[str, ...]
     principal_id: str
+    authorized_root_identity: tuple[int, int] | None = None
+    protected_parent_identities: tuple[tuple[int, int], ...] = ()
 
 
 class ProjectSummary(BaseModel):
@@ -326,7 +328,15 @@ def get_authorized_project(
     """Resolve one project's effective authority and require one capability."""
     if capability not in KNOWN_CAPABILITIES:
         raise AuthorityError("VEDAOPS_INVALID_ARGUMENT", f"unknown capability {capability!r}")
-    entry, principal, manifest, effective, manifest_valid = _evaluate_project(
+    (
+        entry,
+        principal,
+        manifest,
+        effective,
+        manifest_valid,
+        root_identity,
+        protected_parent_identity,
+    ) = _evaluate_project(
         registry_path,
         principal_id=principal_id,
         project_id=project_id,
@@ -344,6 +354,8 @@ def get_authorized_project(
             f"project {entry.id!r} does not grant {capability!r} after policy intersection",
         )
     assert manifest is not None
+    assert root_identity is not None
+    assert protected_parent_identity is not None
     return AuthorizedProject(
         id=entry.id,
         name=entry.name,
@@ -355,6 +367,8 @@ def get_authorized_project(
         capabilities=effective,
         context_files=tuple(entry.context_files),
         principal_id=principal.id,
+        authorized_root_identity=root_identity,
+        protected_parent_identities=(protected_parent_identity,),
     )
 
 
@@ -564,6 +578,8 @@ def _evaluate_project(
     ProjectManifest | None,
     frozenset[str],
     bool,
+    tuple[int, int] | None,
+    tuple[int, int] | None,
 ]:
     registry = _load_registry(registry_path)
     principal = require_principal(registry, principal_id)
@@ -581,11 +597,21 @@ def _evaluate_project(
         )
     grant = frozenset(principal.projects.get(entry.id, ()))
     try:
-        manifest = validate_project_manifest(entry)
+        manifest, root_identity, protected_parent_identity = _validate_project_manifest_snapshot(
+            entry
+        )
     except AuthorityError:
-        return entry, principal, None, frozenset(), False
+        return entry, principal, None, frozenset(), False, None, None
     effective = frozenset(entry.capabilities) & frozenset(manifest.capabilities) & grant
-    return entry, principal, manifest, effective, True
+    return (
+        entry,
+        principal,
+        manifest,
+        effective,
+        True,
+        root_identity,
+        protected_parent_identity,
+    )
 
 
 def _project_summary(
@@ -624,9 +650,16 @@ def _project_summary(
 
 def validate_project_manifest(project: RegisteredProject) -> ProjectManifest:
     """Parse the exact manifest bytes read through pinned no-follow traversal."""
+    manifest, _root_identity, _parent_identity = _validate_project_manifest_snapshot(project)
+    return manifest
+
+
+def _validate_project_manifest_snapshot(
+    project: RegisteredProject,
+) -> tuple[ProjectManifest, tuple[int, int], tuple[int, int]]:
     root = project.root.resolve()
     try:
-        raw, info = read_bounded_file(
+        raw, info, root_identity, parent_identity = read_bounded_file_with_parent_identity(
             root,
             MANIFEST_RELATIVE_PATH.as_posix(),
             limit_bytes=MAX_MANIFEST_BYTES,
@@ -647,7 +680,7 @@ def validate_project_manifest(project: RegisteredProject) -> ProjectManifest:
             "VEDAOPS_PROJECT_ID_COLLISION",
             "manifest ID does not match the registered project ID",
         )
-    return manifest
+    return manifest, root_identity, parent_identity
 
 
 def _load_registry(path: Path) -> RegistryDocument:

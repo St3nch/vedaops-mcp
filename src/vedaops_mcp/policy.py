@@ -224,7 +224,70 @@ def resolve_within_root(root: Path, relative_path: str, *, must_exist: bool) -> 
     return resolved
 
 
-def _open_project_parent(root: Path, relative_path: str) -> tuple[int, str, os.stat_result]:
+def _capture_parent_guard(
+    root: Path,
+    relative_path: str,
+    *,
+    authorized_root_identity: tuple[int, int] | None = None,
+    protected_parent_identities: tuple[tuple[int, int], ...] = (),
+) -> list[list[int] | None]:
+    """Capture parent identities while excluding authority directories by identity."""
+    normalized = normalize_relative(relative_path)
+    parts = PurePosixPath(normalized).parts
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    guard: list[list[int] | None] = []
+    descriptor: int | None = None
+    missing = False
+    try:
+        descriptor = os.open(root, flags)
+        root_info = os.fstat(descriptor)
+        root_identity = (root_info.st_dev, root_info.st_ino)
+        if authorized_root_identity is not None and root_identity != authorized_root_identity:
+            raise PolicyError(
+                "VEDAOPS_CHANGE_PRECONDITION_FAILED",
+                "authorized project root identity changed before file effect",
+            )
+        guard.append([*root_identity])
+        for part in parts[:-1]:
+            if missing:
+                guard.append(None)
+                continue
+            try:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                missing = True
+                guard.append(None)
+                continue
+            except OSError as exc:
+                raise PolicyError(
+                    "VEDAOPS_PATH_FORBIDDEN",
+                    f"{normalized} contains an unavailable or symlinked parent",
+                ) from exc
+            info = os.fstat(next_descriptor)
+            identity = (info.st_dev, info.st_ino)
+            if identity in protected_parent_identities:
+                os.close(next_descriptor)
+                raise PolicyError(
+                    "VEDAOPS_CHANGE_PRECONDITION_FAILED",
+                    "mutation parent resolves to protected project authority",
+                )
+            guard.append([*identity])
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except OSError as exc:
+        raise PolicyError("VEDAOPS_PATH_ESCAPE", "project root could not be pinned") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return guard
+
+
+def _open_project_parent(
+    root: Path,
+    relative_path: str,
+    *,
+    expected_guard: list[list[int] | None] | None = None,
+) -> tuple[int, str, os.stat_result]:
     """Pin every parent directory without following a project-controlled symlink."""
     normalized = normalize_relative(relative_path)
     parts = PurePosixPath(normalized).parts
@@ -235,7 +298,15 @@ def _open_project_parent(root: Path, relative_path: str) -> tuple[int, str, os.s
         raise PolicyError("VEDAOPS_PATH_ESCAPE", "project root could not be pinned") from exc
     try:
         root_info = os.fstat(descriptor)
-        for part in parts[:-1]:
+        if expected_guard is not None and (
+            len(expected_guard) != len(parts)
+            or expected_guard[0] != [root_info.st_dev, root_info.st_ino]
+        ):
+            raise PolicyError(
+                "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+                "authorized project root identity changed before cleanup",
+            )
+        for index, part in enumerate(parts[:-1], start=1):
             try:
                 next_descriptor = os.open(part, flags, dir_fd=descriptor)
             except OSError as exc:
@@ -243,6 +314,14 @@ def _open_project_parent(root: Path, relative_path: str) -> tuple[int, str, os.s
                     "VEDAOPS_PATH_FORBIDDEN",
                     f"{normalized} contains an unavailable or symlinked parent",
                 ) from exc
+            if expected_guard is not None:
+                info = os.fstat(next_descriptor)
+                if expected_guard[index] != [info.st_dev, info.st_ino]:
+                    os.close(next_descriptor)
+                    raise PolicyError(
+                        "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+                        "authorized parent identity changed before cleanup",
+                    )
             os.close(descriptor)
             descriptor = next_descriptor
         return descriptor, parts[-1], root_info
@@ -300,6 +379,59 @@ def read_bounded_file(
         os.close(descriptor)
         os.close(parent_descriptor)
     return raw, info
+
+
+def read_bounded_file_with_parent_identity(
+    root: Path,
+    relative_path: str,
+    *,
+    limit_bytes: int,
+) -> tuple[bytes, os.stat_result, tuple[int, int], tuple[int, int]]:
+    """Read one file and return the pinned root/parent identities used for it."""
+    normalized = normalize_relative(relative_path)
+    ensure_not_protected(normalized)
+    parent_descriptor, filename, root_info = _open_project_parent(root, normalized)
+    try:
+        parent_info = os.fstat(parent_descriptor)
+        entry = os.stat(filename, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(entry.st_mode):
+            raise PolicyError("VEDAOPS_PATH_FORBIDDEN", f"{normalized} is a symlink")
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_descriptor,
+        )
+    except PolicyError:
+        os.close(parent_descriptor)
+        raise
+    except OSError as exc:
+        os.close(parent_descriptor)
+        raise PolicyError(
+            "VEDAOPS_FILE_UNAVAILABLE",
+            _filesystem_error_detail(relative_path, exc),
+        ) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise PolicyError("VEDAOPS_FILE_UNAVAILABLE", f"{relative_path} is not a regular file")
+        if info.st_dev != root_info.st_dev:
+            raise PolicyError("VEDAOPS_PATH_DEVICE_ESCAPE", relative_path)
+        raw = os.read(descriptor, limit_bytes + 1)
+        final = os.fstat(descriptor)
+        if final.st_dev != info.st_dev or final.st_ino != info.st_ino or len(raw) != final.st_size:
+            raise PolicyError(
+                "VEDAOPS_FILE_UNAVAILABLE",
+                "file changed while it was being captured",
+            )
+        return (
+            raw,
+            final,
+            (root_info.st_dev, root_info.st_ino),
+            (parent_info.st_dev, parent_info.st_ino),
+        )
+    finally:
+        os.close(descriptor)
+        os.close(parent_descriptor)
 
 
 def read_bounded_file_with_digest(
@@ -517,6 +649,9 @@ def conditional_write_project_file(
     *,
     expected_sha256: str | None,
     operation_id: str,
+    authorized_root_identity: tuple[int, int] | None = None,
+    protected_parent_identities: tuple[tuple[int, int], ...] = (),
+    parent_guard: list[list[int] | None] | None = None,
 ) -> None:
     """Apply one conditional write inside a filesystem-confined helper."""
     expected = "-" if expected_sha256 is None else expected_sha256
@@ -528,6 +663,9 @@ def conditional_write_project_file(
         operation_id,
         f"{mode & 0o777:o}",
         input_bytes=data,
+        authorized_root_identity=authorized_root_identity,
+        protected_parent_identities=protected_parent_identities,
+        parent_guard=parent_guard,
     )
 
 
@@ -537,6 +675,9 @@ def conditional_delete_project_file(
     *,
     expected_sha256: str,
     operation_id: str,
+    authorized_root_identity: tuple[int, int] | None = None,
+    protected_parent_identities: tuple[tuple[int, int], ...] = (),
+    parent_guard: list[list[int] | None] | None = None,
 ) -> None:
     """Delete only the exact expected file object inside a filesystem-confined helper."""
     _run_file_helper(
@@ -546,7 +687,114 @@ def conditional_delete_project_file(
         expected_sha256,
         operation_id,
         input_bytes=b"",
+        authorized_root_identity=authorized_root_identity,
+        protected_parent_identities=protected_parent_identities,
+        parent_guard=parent_guard,
     )
+
+
+def _validate_cleanup_entries(value: object) -> list[dict[str, int | str]]:
+    if not isinstance(value, list):
+        raise ValueError("cleanup evidence must be a list")
+    entries: list[dict[str, int | str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"name", "dev", "ino"}:
+            raise ValueError("cleanup evidence entry is malformed")
+        name = item["name"]
+        dev = item["dev"]
+        ino = item["ino"]
+        if (
+            not isinstance(name, str)
+            or not name
+            or "/" in name
+            or "\\" in name
+            or not isinstance(dev, int)
+            or isinstance(dev, bool)
+            or dev < 0
+            or not isinstance(ino, int)
+            or isinstance(ino, bool)
+            or ino <= 0
+        ):
+            raise ValueError("cleanup evidence entry is malformed")
+        entries.append({"name": name, "dev": dev, "ino": ino})
+    return entries
+
+
+def _cleanup_helper_entries(
+    root: Path,
+    relative_path: str,
+    parent_guard: list[list[int] | None],
+    entries: list[dict[str, int | str]],
+    *,
+    operation_id: str,
+) -> None:
+    """Move helper-owned entries out of the project before deleting them.
+
+    A project-side replacement at the cleanup name is preserved in the
+    outside-project quarantine and turns the operation uncertain instead of
+    being unlinked.
+    """
+    if not entries:
+        return
+    parent_parts = PurePosixPath(relative_path).parts[:-1]
+    if any(parent_guard[index] is None for index in range(1, len(parent_parts) + 1)):
+        raise PolicyError(
+            "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+            "helper cleanup cannot safely reacquire a parent created during the operation",
+        )
+    parent_fd, _filename, _root_info = _open_project_parent(
+        root,
+        relative_path,
+        expected_guard=parent_guard,
+    )
+    quarantine_path: Path | None = None
+    quarantine_fd: int | None = None
+    preserved: list[str] = []
+    try:
+        quarantine_path = Path(
+            tempfile.mkdtemp(
+                prefix=f".vedaops-mcp-recovery-{operation_id[:12]}-",
+                dir=root.parent,
+            )
+        )
+        quarantine_fd = os.open(
+            quarantine_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        if os.fstat(quarantine_fd).st_dev != os.fstat(parent_fd).st_dev:
+            raise OSError(errno.EXDEV, "recovery quarantine is on a different filesystem")
+        for index, item in enumerate(entries):
+            quarantine_name = f"entry-{index}-{secrets.token_hex(8)}"
+            try:
+                os.rename(
+                    str(item["name"]),
+                    quarantine_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=quarantine_fd,
+                )
+            except OSError as exc:
+                raise PolicyError(
+                    "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+                    "helper cleanup entry could not be moved into trusted recovery storage",
+                ) from exc
+            moved = os.stat(quarantine_name, dir_fd=quarantine_fd, follow_symlinks=False)
+            if moved.st_dev != item["dev"] or moved.st_ino != item["ino"]:
+                preserved.append(str(quarantine_path / quarantine_name))
+                continue
+            os.unlink(quarantine_name, dir_fd=quarantine_fd)
+        if preserved:
+            raise PolicyError(
+                "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+                "cleanup name was replaced concurrently; preserved competing entry at "
+                + ", ".join(repr(item) for item in preserved),
+            )
+    finally:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+        os.close(parent_fd)
+        if quarantine_path is not None:
+            with suppress(OSError):
+                quarantine_path.rmdir()
 
 
 def _run_file_helper(
@@ -556,9 +804,19 @@ def _run_file_helper(
     expected: str,
     *extra: str,
     input_bytes: bytes,
+    authorized_root_identity: tuple[int, int] | None = None,
+    protected_parent_identities: tuple[tuple[int, int], ...] = (),
+    parent_guard: list[list[int] | None] | None = None,
 ) -> None:
     helper = FS_HELPER_PATH.resolve(strict=True)
     resolved_root = root.resolve(strict=True)
+    if parent_guard is None:
+        parent_guard = _capture_parent_guard(
+            resolved_root,
+            relative_path,
+            authorized_root_identity=authorized_root_identity,
+            protected_parent_identities=protected_parent_identities,
+        )
     if helper == resolved_root or resolved_root in helper.parents:
         raise PolicyError(
             "VEDAOPS_CONTROLLER_LAYOUT_UNSAFE",
@@ -618,6 +876,7 @@ def _run_file_helper(
             operation,
             relative_path,
             expected,
+            json.dumps(parent_guard, separators=(",", ":")),
             *extra,
         ]
     )
@@ -643,28 +902,60 @@ def _run_file_helper(
         )
     try:
         payload = json.loads(completed.stdout.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("helper payload is not an object")
+        allowed_keys = {"state", "detail", "effect_occurred", "recoveries", "cleanup"}
+        required_keys = {"state", "detail", "effect_occurred"}
+        if set(payload) - allowed_keys or not required_keys <= set(payload):
+            raise TypeError("helper payload schema is invalid")
         state = payload["state"]
-        detail = str(payload.get("detail", ""))
-        effect_occurred = bool(payload.get("effect_occurred", False))
+        detail = payload["detail"]
+        effect_occurred = payload["effect_occurred"]
         recoveries = payload.get("recoveries", [])
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        cleanup_entries = _validate_cleanup_entries(payload.get("cleanup", []))
+        if (
+            not isinstance(state, str)
+            or state not in {"succeeded", "precondition_failed", "uncertain"}
+            or not isinstance(detail, str)
+            or not isinstance(effect_occurred, bool)
+            or not isinstance(recoveries, list)
+            or not all(isinstance(item, str) for item in recoveries)
+        ):
+            raise TypeError("helper payload fields are invalid")
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise PolicyError(
             "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
             "confined file operation returned malformed evidence; inspect before retrying",
         ) from exc
-    if not isinstance(recoveries, list) or not all(isinstance(item, str) for item in recoveries):
+
+    valid_terminal = (
+        (completed.returncode == 0 and state == "succeeded" and effect_occurred)
+        or (completed.returncode == 2 and state == "precondition_failed" and not effect_occurred)
+        or (completed.returncode == 3 and state == "uncertain")
+    )
+    if not valid_terminal or (state == "uncertain" and cleanup_entries):
         raise PolicyError(
             "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
-            "confined file operation returned malformed recovery evidence; inspect before retrying",
+            "confined file operation returned inconsistent terminal evidence; "
+            "inspect before retrying",
         )
-    if completed.returncode == 0 and state == "succeeded" and effect_occurred:
+
+    _cleanup_helper_entries(
+        resolved_root,
+        relative_path,
+        parent_guard,
+        cleanup_entries,
+        operation_id=extra[0] if extra else "unknown",
+    )
+
+    if state == "succeeded":
         return
-    if completed.returncode == 2 and state == "precondition_failed" and not effect_occurred:
+    if state == "precondition_failed":
         raise PolicyError(
             "VEDAOPS_CHANGE_PRECONDITION_FAILED",
             detail or "file precondition changed before the effect",
         )
-    if completed.returncode == 3 and state == "uncertain":
+    if state == "uncertain":
         suffix = (
             "; preserved recovery entries " + ", ".join(repr(item) for item in recoveries)
             if recoveries
@@ -673,12 +964,6 @@ def _run_file_helper(
         raise PolicyError(
             "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
             (detail or "file effect could not be verified") + suffix,
-        )
-    if effect_occurred:
-        raise PolicyError(
-            "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
-            "confined file operation reports a possible effect without trustworthy "
-            "terminal evidence; inspect before retrying",
         )
     raise PolicyError(
         "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",

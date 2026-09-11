@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import secrets
+import shutil
 import subprocess
 import venv
 from pathlib import Path
@@ -235,7 +237,7 @@ def test_postgres_start_contract_bounds_server_writable_storage(
                 f"{postgres_module.POSTGRES_CONTAINER_USER}|true|"
                 f"{postgres_module.POSTGRES_CONTAINER_MEMORY_BYTES}|"
                 f"{postgres_module.POSTGRES_CONTAINER_MEMORY_BYTES}|"
-                f"{postgres_module.POSTGRES_CONTAINER_PIDS}\n"
+                f"{postgres_module.POSTGRES_CONTAINER_PIDS}|none|\n"
             )
             return subprocess.CompletedProcess(args, 0, expected, "")
         raise AssertionError(args)
@@ -257,6 +259,7 @@ def test_postgres_start_contract_bounds_server_writable_storage(
     assert run[run.index("--memory") + 1] == postgres_module.POSTGRES_CONTAINER_MEMORY
     assert run[run.index("--memory-swap") + 1] == postgres_module.POSTGRES_CONTAINER_SWAP
     assert run[run.index("--pids-limit") + 1] == postgres_module.POSTGRES_CONTAINER_PIDS
+    assert run[run.index("--log-driver") + 1] == "none"
     tmpfs_specs = [run[index + 1] for index, item in enumerate(run) if item == "--tmpfs"]
     assert any(
         spec.startswith("/var/lib/postgresql:") and "size=512m" in spec
@@ -268,6 +271,62 @@ def test_postgres_start_contract_bounds_server_writable_storage(
         item == f"type=bind,src={socket_dir},dst={postgres_module.POSTGRES_SOCKET_CONTAINER}"
         for item in run
     )
+
+
+@pytest.mark.skipif(not POSTGRES_AVAILABLE, reason="local PostgreSQL 18 image unavailable")
+def test_postgres_server_output_has_no_host_log_sink(tmp_path: Path):
+    docker = DOCKER
+    image_id = postgres_module._local_image_id(docker)
+    operation_id = secrets.token_hex(16)
+    name = f"vedaops-log-probe-{operation_id[:12]}"
+    socket_dir = postgres_module._create_host_tmpfs_socket_directory(operation_id)
+    env_file = tmp_path / "postgres.env"
+    postgres_module._write_private_env_file(env_file, secrets.token_hex(24))
+
+    try:
+        postgres_module._start_postgres(
+            docker,
+            name=name,
+            socket_dir=socket_dir,
+            env_file=env_file,
+            image_id=image_id,
+            operation_id=operation_id,
+        )
+        postgres_module._wait_for_postgres(docker, name)
+        config = postgres_module._docker(
+            docker,
+            "inspect",
+            "--format",
+            "{{.HostConfig.LogConfig.Type}}|{{.LogPath}}",
+            name,
+        )
+        assert config.returncode == 0
+        assert config.stdout.strip() == "none|"
+
+        marker = "vedaops-server-log-probe"
+        emitted = postgres_module._docker(
+            docker,
+            "exec",
+            name,
+            "psql",
+            "-h",
+            postgres_module.POSTGRES_SOCKET_CONTAINER,
+            "-U",
+            postgres_module.POSTGRES_USER,
+            "-d",
+            postgres_module.POSTGRES_DB,
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-Atqc",
+            f"DO $$ BEGIN RAISE LOG '{marker} %', repeat('x', 32768); END $$",
+        )
+        assert emitted.returncode == 0
+        logs = postgres_module._docker(docker, "logs", name)
+        assert logs.returncode != 0
+        assert marker not in (logs.stdout + logs.stderr)
+    finally:
+        assert postgres_module._remove_container(docker, name)
+        shutil.rmtree(socket_dir, ignore_errors=False)
 
 
 def test_ordinary_check_runner_refuses_postgres_bound_check(tmp_path: Path):

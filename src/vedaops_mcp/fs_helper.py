@@ -24,6 +24,7 @@ def _emit(
     detail: str = "",
     *,
     recoveries: list[str] | None = None,
+    cleanup: list[dict[str, object]] | None = None,
     effect_occurred: bool = False,
 ) -> int:
     payload: dict[str, object] = {
@@ -33,6 +34,8 @@ def _emit(
     }
     if recoveries:
         payload["recoveries"] = recoveries
+    if cleanup:
+        payload["cleanup"] = cleanup
     print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
     return {"succeeded": 0, "precondition_failed": 2, "uncertain": 3}.get(state, 4)
 
@@ -57,25 +60,82 @@ def _operation_id(value: str) -> str:
     return value
 
 
+def _parent_guard(value: str, relative: str) -> list[tuple[int, int] | None]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid parent guard") from exc
+    expected_length = len(PurePosixPath(relative).parts)
+    if not isinstance(payload, list) or len(payload) != expected_length:
+        raise ValueError("invalid parent guard")
+    guard: list[tuple[int, int] | None] = []
+    missing_seen = False
+    for item in payload:
+        if item is None:
+            missing_seen = True
+            guard.append(None)
+            continue
+        if missing_seen or not isinstance(item, list) or len(item) != 2:
+            raise ValueError("invalid parent guard")
+        dev, ino = item
+        if (
+            not isinstance(dev, int)
+            or isinstance(dev, bool)
+            or dev < 0
+            or not isinstance(ino, int)
+            or isinstance(ino, bool)
+            or ino <= 0
+        ):
+            raise ValueError("invalid parent guard")
+        guard.append((dev, ino))
+    if guard[0] is None:
+        raise ValueError("invalid parent guard")
+    return guard
+
+
+def _matches_identity(descriptor: int, expected: tuple[int, int]) -> bool:
+    info = os.fstat(descriptor)
+    return info.st_dev == expected[0] and info.st_ino == expected[1]
+
+
 def _open_parent(
     relative: str,
     *,
     create: bool,
+    guard: list[tuple[int, int] | None] | None = None,
 ) -> tuple[list[int], int, str, list[tuple[int, str]]]:
     parts = PurePosixPath(relative).parts
     descriptors = [os.open(ROOT_PATH, DIR_FLAGS)]
     created: list[tuple[int, str]] = []
     try:
-        for part in parts[:-1]:
+        if guard is not None and not _matches_identity(descriptors[0], guard[0]):
+            raise OSError(errno.ESTALE, "project root changed before effect")
+        for index, part in enumerate(parts[:-1], start=1):
             parent_fd = descriptors[-1]
+            expected = guard[index] if guard is not None else None
             try:
                 child_fd = os.open(part, DIR_FLAGS, dir_fd=parent_fd)
             except FileNotFoundError:
                 if not create:
                     raise
+                if guard is not None and expected is not None:
+                    raise OSError(
+                        errno.ESTALE, "authorized parent disappeared before effect"
+                    ) from None
                 os.mkdir(part, mode=0o755, dir_fd=parent_fd)
                 created.append((parent_fd, part))
                 child_fd = os.open(part, DIR_FLAGS, dir_fd=parent_fd)
+            else:
+                if guard is not None and expected is None:
+                    os.close(child_fd)
+                    raise OSError(errno.ESTALE, "unauthorized parent appeared before effect")
+            if (
+                guard is not None
+                and expected is not None
+                and not _matches_identity(child_fd, expected)
+            ):
+                os.close(child_fd)
+                raise OSError(errno.ESTALE, "authorized parent identity changed before effect")
             descriptors.append(child_fd)
         return descriptors, descriptors[-1], parts[-1], created
     except Exception:
@@ -88,13 +148,6 @@ def _close_descriptors(descriptors: list[int]) -> None:
         with suppress(OSError):
             os.close(descriptor)
 
-
-def _cleanup_created(created: list[tuple[int, str]]) -> None:
-    for parent_fd, name in reversed(created):
-        try:
-            os.rmdir(name, dir_fd=parent_fd)
-        except OSError:
-            return
 
 
 def _read_regular_at(parent_fd: int, name: str) -> tuple[bytes, int]:
@@ -121,7 +174,13 @@ def _read_regular_at(parent_fd: int, name: str) -> tuple[bytes, int]:
         os.close(descriptor)
 
 
-def _write_temp_at(parent_fd: int, name: str, raw: bytes, mode: int) -> None:
+def _write_temp_at(
+    parent_fd: int,
+    name: str,
+    raw: bytes,
+    mode: int,
+    owned_entries: list[dict[str, object]],
+) -> dict[str, object]:
     descriptor = os.open(
         name,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -129,18 +188,26 @@ def _write_temp_at(parent_fd: int, name: str, raw: bytes, mode: int) -> None:
         dir_fd=parent_fd,
     )
     try:
+        info = os.fstat(descriptor)
+        entry: dict[str, object] = {"name": name, "dev": info.st_dev, "ino": info.st_ino}
+        owned_entries.append(entry)
         os.fchmod(descriptor, mode & 0o777)
         view = memoryview(raw)
         offset = 0
         while offset < len(view):
             offset += os.write(descriptor, view[offset:])
         os.fsync(descriptor)
+        return entry
     finally:
         os.close(descriptor)
 
 
-def _unlink_at(parent_fd: int, name: str) -> None:
-    os.unlink(name, dir_fd=parent_fd)
+def _entry_identity_at(parent_fd: int, name: str) -> tuple[int, int]:
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(errno.EINVAL, "entry is not a regular file")
+    return info.st_dev, info.st_ino
+
 
 
 def _exists_at(parent_fd: int, name: str) -> bool:
@@ -195,16 +262,6 @@ def _temp_names(target: str, operation_id: str) -> tuple[str, str]:
     return f"{prefix}-candidate", f"{prefix}-recovery"
 
 
-def _cleanup_before_effect(
-    parent_fd: int,
-    names: list[str],
-    created: list[tuple[int, str]],
-) -> None:
-    for name in names:
-        with suppress(FileNotFoundError):
-            _unlink_at(parent_fd, name)
-    _cleanup_created(created)
-
 
 def _write(
     relative: str,
@@ -212,11 +269,13 @@ def _write(
     mode: int,
     raw: bytes,
     operation_id: str,
+    parent_guard: list[tuple[int, int] | None] | None = None,
 ) -> int:
     if len(raw) > MAX_BYTES:
         return _emit("precondition_failed", "replacement exceeds the hard limit")
     descriptors: list[int] = []
     created: list[tuple[int, str]] = []
+    cleanup_entries: list[dict[str, object]] = []
     candidate = ""
     recovery = ""
     effect_occurred = False
@@ -224,20 +283,34 @@ def _write(
         descriptors, parent_fd, target, created = _open_parent(
             relative,
             create=expected == "-",
+            guard=parent_guard,
         )
         candidate, recovery = _temp_names(target, operation_id)
-        _write_temp_at(parent_fd, candidate, raw, mode)
+        _write_temp_at(parent_fd, candidate, raw, mode, cleanup_entries)
 
         if expected == "-":
             if not _parent_identity_matches(relative, parent_fd):
-                _cleanup_before_effect(parent_fd, [candidate], created)
-                return _emit("precondition_failed", "target parent changed before create")
+                return _emit(
+                    "uncertain",
+                    "target parent changed before create; candidate preserved",
+                    recoveries=[candidate],
+                )
             try:
                 _renameat2(parent_fd, candidate, parent_fd, target, RENAME_NOREPLACE)
             except FileExistsError:
-                _cleanup_before_effect(parent_fd, [candidate], created)
-                return _emit("precondition_failed", "target appeared concurrently")
+                if created:
+                    return _emit(
+                        "uncertain",
+                        "target appeared after parent creation; candidate preserved",
+                        recoveries=[candidate],
+                    )
+                return _emit(
+                    "precondition_failed",
+                    "target appeared concurrently",
+                    cleanup=cleanup_entries,
+                )
             effect_occurred = True
+            cleanup_entries.clear()
             try:
                 current, _current_mode = _read_regular_at(parent_fd, target)
                 if hashlib.sha256(current).hexdigest() != hashlib.sha256(raw).hexdigest():
@@ -255,29 +328,45 @@ def _write(
 
         before, before_mode = _read_regular_at(parent_fd, target)
         if hashlib.sha256(before).hexdigest() != expected:
-            _cleanup_before_effect(parent_fd, [candidate], created)
-            return _emit("precondition_failed", "target bytes do not match expected SHA-256")
-        _write_temp_at(parent_fd, recovery, before, before_mode)
+            return _emit(
+                "precondition_failed",
+                "target bytes do not match expected SHA-256",
+                cleanup=cleanup_entries,
+            )
+        recovery_entry = _write_temp_at(parent_fd, recovery, before, before_mode, cleanup_entries)
         recoveries = [recovery]
         if not _parent_identity_matches(relative, parent_fd):
-            _cleanup_before_effect(parent_fd, [candidate, recovery], created)
-            return _emit("precondition_failed", "target parent changed before replace")
+            return _emit(
+                "precondition_failed",
+                "target parent changed before replace",
+                cleanup=cleanup_entries,
+            )
         latest, _latest_mode = _read_regular_at(parent_fd, target)
         if hashlib.sha256(latest).hexdigest() != expected:
-            _cleanup_before_effect(parent_fd, [candidate, recovery], created)
-            return _emit("precondition_failed", "target changed before replace effect")
+            return _emit(
+                "precondition_failed",
+                "target changed before replace effect",
+                cleanup=cleanup_entries,
+            )
+        target_identity = _entry_identity_at(parent_fd, target)
         try:
             _renameat2(parent_fd, candidate, parent_fd, target, RENAME_EXCHANGE)
         except FileNotFoundError:
-            _cleanup_before_effect(parent_fd, [candidate, recovery], created)
-            return _emit("precondition_failed", "target disappeared before replace effect")
+            return _emit(
+                "precondition_failed",
+                "target disappeared before replace effect",
+                cleanup=cleanup_entries,
+            )
         effect_occurred = True
         recoveries.append(candidate)
+        cleanup_entries.clear()
         try:
             displaced, _displaced_mode = _read_regular_at(parent_fd, candidate)
             current, _current_mode = _read_regular_at(parent_fd, target)
             if hashlib.sha256(displaced).hexdigest() != expected:
                 raise OSError(errno.ESTALE, "a concurrent target was displaced")
+            if _entry_identity_at(parent_fd, candidate) != target_identity:
+                raise OSError(errno.ESTALE, "a different target inode was displaced")
             if hashlib.sha256(current).hexdigest() != hashlib.sha256(raw).hexdigest():
                 raise OSError(errno.ESTALE, "replacement target changed after exchange")
             if not _parent_identity_matches(relative, parent_fd):
@@ -290,10 +379,15 @@ def _write(
                 recoveries=recoveries,
                 effect_occurred=True,
             )
-        _unlink_at(parent_fd, candidate)
-        _unlink_at(parent_fd, recovery)
         os.fsync(parent_fd)
-        return _emit("succeeded", effect_occurred=True)
+        return _emit(
+            "succeeded",
+            cleanup=[
+                {"name": candidate, "dev": target_identity[0], "ino": target_identity[1]},
+                recovery_entry,
+            ],
+            effect_occurred=True,
+        )
     except OSError as exc:
         if effect_occurred:
             return _emit(
@@ -302,54 +396,74 @@ def _write(
                 recoveries=[name for name in (recovery, candidate) if name],
                 effect_occurred=True,
             )
-        if descriptors:
-            try:
-                _cleanup_before_effect(
-                    descriptors[-1],
-                    [name for name in (candidate, recovery) if name],
-                    created,
-                )
-            except OSError as cleanup_exc:
-                return _emit(
-                    "uncertain",
-                    f"pre-effect cleanup could not be verified: {cleanup_exc}",
-                    recoveries=[name for name in (candidate, recovery) if name],
-                )
-        return _emit("precondition_failed", f"conditional write refused: {exc.strerror or exc}")
+        if created:
+            return _emit(
+                "uncertain",
+                f"conditional write stopped after creating parent state: {exc.strerror or exc}",
+                recoveries=[item["name"] for item in cleanup_entries],
+            )
+        return _emit(
+            "precondition_failed",
+            f"conditional write refused: {exc.strerror or exc}",
+            cleanup=cleanup_entries,
+        )
     finally:
         _close_descriptors(descriptors)
 
 
-def _delete(relative: str, expected: str, operation_id: str) -> int:
+def _delete(
+    relative: str,
+    expected: str,
+    operation_id: str,
+    parent_guard: list[tuple[int, int] | None] | None = None,
+) -> int:
     descriptors: list[int] = []
     recovery = ""
     removed = ""
+    cleanup_entries: list[dict[str, object]] = []
     effect_occurred = False
     try:
-        descriptors, parent_fd, target, _created = _open_parent(relative, create=False)
+        descriptors, parent_fd, target, _created = _open_parent(
+            relative,
+            create=False,
+            guard=parent_guard,
+        )
         removed, recovery = _temp_names(target, operation_id)
         before, before_mode = _read_regular_at(parent_fd, target)
         if hashlib.sha256(before).hexdigest() != expected:
             return _emit("precondition_failed", "target bytes do not match expected SHA-256")
-        _write_temp_at(parent_fd, recovery, before, before_mode)
+        recovery_entry = _write_temp_at(parent_fd, recovery, before, before_mode, cleanup_entries)
         if not _parent_identity_matches(relative, parent_fd):
-            _cleanup_before_effect(parent_fd, [recovery], [])
-            return _emit("precondition_failed", "target parent changed before delete")
+            return _emit(
+                "precondition_failed",
+                "target parent changed before delete",
+                cleanup=cleanup_entries,
+            )
         latest, _latest_mode = _read_regular_at(parent_fd, target)
         if hashlib.sha256(latest).hexdigest() != expected:
-            _cleanup_before_effect(parent_fd, [recovery], [])
-            return _emit("precondition_failed", "target changed before delete effect")
+            return _emit(
+                "precondition_failed",
+                "target changed before delete effect",
+                cleanup=cleanup_entries,
+            )
+        target_identity = _entry_identity_at(parent_fd, target)
         try:
             _renameat2(parent_fd, target, parent_fd, removed, RENAME_NOREPLACE)
         except FileNotFoundError:
-            _cleanup_before_effect(parent_fd, [recovery], [])
-            return _emit("precondition_failed", "target disappeared before delete effect")
+            return _emit(
+                "precondition_failed",
+                "target disappeared before delete effect",
+                cleanup=cleanup_entries,
+            )
         effect_occurred = True
         recoveries = [recovery, removed]
+        cleanup_entries.clear()
         try:
             displaced, _mode = _read_regular_at(parent_fd, removed)
             if hashlib.sha256(displaced).hexdigest() != expected:
                 raise OSError(errno.ESTALE, "a concurrent target was removed")
+            if _entry_identity_at(parent_fd, removed) != target_identity:
+                raise OSError(errno.ESTALE, "a different target inode was removed")
             if _exists_at(parent_fd, target):
                 raise OSError(errno.ESTALE, "target was recreated after delete")
             if not _parent_identity_matches(relative, parent_fd):
@@ -362,10 +476,15 @@ def _delete(relative: str, expected: str, operation_id: str) -> int:
                 recoveries=recoveries,
                 effect_occurred=True,
             )
-        _unlink_at(parent_fd, removed)
-        _unlink_at(parent_fd, recovery)
         os.fsync(parent_fd)
-        return _emit("succeeded", effect_occurred=True)
+        return _emit(
+            "succeeded",
+            cleanup=[
+                {"name": removed, "dev": target_identity[0], "ino": target_identity[1]},
+                recovery_entry,
+            ],
+            effect_occurred=True,
+        )
     except OSError as exc:
         if effect_occurred:
             return _emit(
@@ -374,16 +493,11 @@ def _delete(relative: str, expected: str, operation_id: str) -> int:
                 recoveries=[name for name in (recovery, removed) if name],
                 effect_occurred=True,
             )
-        if descriptors and recovery:
-            try:
-                _cleanup_before_effect(descriptors[-1], [recovery], [])
-            except OSError as cleanup_exc:
-                return _emit(
-                    "uncertain",
-                    f"pre-effect cleanup could not be verified: {cleanup_exc}",
-                    recoveries=[recovery],
-                )
-        return _emit("precondition_failed", f"conditional delete refused: {exc.strerror or exc}")
+        return _emit(
+            "precondition_failed",
+            f"conditional delete refused: {exc.strerror or exc}",
+            cleanup=cleanup_entries,
+        )
     finally:
         _close_descriptors(descriptors)
 
@@ -393,13 +507,14 @@ def main() -> int:
         operation = sys.argv[1]
         relative = _relative(sys.argv[2])
         expected = sys.argv[3]
-        operation_id = _operation_id(sys.argv[4])
+        guard = _parent_guard(sys.argv[4], relative)
+        operation_id = _operation_id(sys.argv[5])
         if operation == "write":
-            mode = int(sys.argv[5], 8)
+            mode = int(sys.argv[6], 8)
             raw = sys.stdin.buffer.read(MAX_BYTES + 1)
-            return _write(relative, expected, mode, raw, operation_id)
+            return _write(relative, expected, mode, raw, operation_id, guard)
         if operation == "delete":
-            return _delete(relative, expected, operation_id)
+            return _delete(relative, expected, operation_id, guard)
         return _emit("precondition_failed", "unsupported helper operation")
     except (IndexError, ValueError, OSError) as exc:
         return _emit("precondition_failed", f"invalid helper request: {exc}")

@@ -486,6 +486,8 @@ def _start_postgres(
         "--read-only",
         "--security-opt",
         "no-new-privileges:true",
+        "--log-driver",
+        "none",
         "--tmpfs",
         (
             "/var/lib/postgresql:rw,nosuid,nodev,size=512m,"
@@ -538,14 +540,15 @@ def _start_postgres(
         (
             "{{.HostConfig.NetworkMode}}|{{.Config.Image}}|{{.Image}}|{{.Config.User}}|"
             "{{.HostConfig.ReadonlyRootfs}}|{{.HostConfig.Memory}}|"
-            "{{.HostConfig.MemorySwap}}|{{.HostConfig.PidsLimit}}"
+            "{{.HostConfig.MemorySwap}}|{{.HostConfig.PidsLimit}}|"
+            "{{.HostConfig.LogConfig.Type}}|{{.LogPath}}"
         ),
         name,
     )
     expected = (
         f"none|{POSTGRES_IMAGE}|{image_id}|{POSTGRES_CONTAINER_USER}|true|"
         f"{POSTGRES_CONTAINER_MEMORY_BYTES}|{POSTGRES_CONTAINER_MEMORY_BYTES}|"
-        f"{POSTGRES_CONTAINER_PIDS}"
+        f"{POSTGRES_CONTAINER_PIDS}|none|"
     )
     if inspect.returncode != 0 or inspect.stdout.strip() != expected:
         raise PolicyError(

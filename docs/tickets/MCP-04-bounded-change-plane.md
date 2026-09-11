@@ -1,6 +1,6 @@
 # MCP-04 — Bounded Change Plane
 
-Status: Astra whole-system audit rejected candidate `634635388837d39e1f1c9f33e2a20d8e2121c81d`; bounded remediation implemented on `ticket/MCP-04-bounded-change-plane`; verification green; independent remediation review pending Product acceptance.
+Status: Astra independent acceptance review rejected candidate `8e28d9ac208b35697b8ace103e36a944a8b3a938`; a fourth bounded remediation is implemented on `ticket/MCP-04-bounded-change-plane`; local verification is green; exact-candidate independent review and Product acceptance remain pending.
 
 ## Product reason
 
@@ -176,6 +176,10 @@ Astra's next independent review of candidate `37bd705ae3f7b383f2b46eb1f75cb4456b
 
 The third remediation therefore remains bounded to the existing Change/Check implementation. All Astra reviews leave the four-responsibility Product boundary intact. This work remains MCP-04 and does not justify MCP-05.
 
+Astra's independent acceptance review of candidate `8e28d9ac208b35697b8ace103e36a944a8b3a938` returned `RECONCILE BEFORE ACCEPTANCE` with three bounded blocker families: real-directory substitution could still reach protected authority between public preflight and helper acquisition; recovery cleanup could unlink entries it did not own and malformed helper evidence was coerced into false certainty; and PostgreSQL server output still reached Docker's unbounded default host log sink.
+
+The fourth remediation carries the authorized root, protected authority-directory identity, and requested parent-directory identity from public preflight into the confined helper; moves only helper-reported cleanup entries through identity-checked quarantine before deletion; treats malformed or inconsistent helper evidence as uncertain; and starts PostgreSQL with `--log-driver none` while verifying the effective log configuration and empty `LogPath`. No new capability or architecture was added.
+
 The repaired implementation now includes:
 
 - complete patch-effect authorization using Git's parsed effect set, including mixed/traditional diff cases;
@@ -194,9 +198,10 @@ The repaired implementation now includes:
 
 ## Remediation evidence
 
-- `ruff check .`: pass.
-- Permanent repository suite: 116 passed on the uncommitted third-remediation tree.
-- Astra-derived adversarial regressions cover hidden patch targets, manifest aliases, ignored checkout collisions, branch/tag ambiguity, nested Git refs/log indirection, graft ancestry, promisor/partial-clone refusal, Git alternates refusal, same-inode content/hash binding, concurrent target replacement, parent relocation outside the project, parent substitution at the exact effect boundary, post-create/post-exchange/post-delete uncertainty, preservation of original and competing recovery bytes without reverse exchange, journal placement/start-order failure, controller-side Python shadowing, runtime ancestor substitution and stale-size growth, post-commit wrapper failure, PostgreSQL cleanup uncertainty, bounded read-only PostgreSQL server storage, tmpfs worker scratch, aggregate scope limits, and global check admission.
+- Disposable review-copy `ruff check .`: pass on the fourth-remediation tree.
+- Permanent repository suite: 127 tests plus one disposable harness smoke test, 128 passed in 41.09 seconds on the fourth-remediation tree.
+- Astra-derived adversarial regressions cover hidden patch targets, manifest aliases, ignored checkout collisions, branch/tag ambiguity, nested Git refs/log indirection, graft ancestry, promisor/partial-clone refusal, Git alternates refusal, same-inode content/hash binding, concurrent target replacement, parent relocation outside the project, symlink and real-directory substitution across public preflight and the helper effect boundary, create/replace/delete attempts against moved protected authority, helper-owned cleanup identity, O_EXCL collisions, competing cleanup substitution, strict effect-evidence decoding, post-create/post-exchange/post-delete uncertainty, preservation of original and competing recovery bytes without reverse exchange, journal placement/start-order failure, controller-side Python shadowing, runtime ancestor substitution and stale-size growth, post-commit wrapper failure, PostgreSQL cleanup uncertainty, disabled Docker host logging, bounded read-only PostgreSQL server storage, tmpfs worker scratch, aggregate scope limits, and global check admission.
+- The live PostgreSQL 18 regression emitted a bounded 32 KiB server log message and verified effective `LogConfig.Type=none`, empty `LogPath`, and refusal of `docker logs`; the full suite reported no skipped probe.
 - The complete local ticket lifecycle remains exercised without operator Git commands: create/switch ticket branch, edit, inspect, exact candidate commit, checks bound to that candidate, switch target, refuse premature deletion, fast-forward-only integration, and safe merged-branch deletion. Candidate commit, review, acceptance, integration, and publication remain distinct events.
 - Real Discrepancy Desk tracer at exact HEAD `73941507f2511aca3af8abcf47799bd016c687bf` passed on the repaired third-remediation tree: ordinary `format-check` and `lint` passed under the sanitized `project_venv`; full PostgreSQL-backed pytest reported 356 passed; and `postgres-foundation-proofs` returned PASS.
 - Both PostgreSQL tracer runs verified PostgreSQL 18 Unix-socket connectivity, read-only-root + bounded tmpfs + memory-cgroup server storage, host-tmpfs + memory-cgroup socket storage, `postgres_cleanup = removed`, workspace cleanup `removed`, and `uncertain_effects = false`.

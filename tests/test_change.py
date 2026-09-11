@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ from support import git, init_project, write_registry
 
 import vedaops_mcp.change as change_module
 import vedaops_mcp.fs_helper as fs_helper
+import vedaops_mcp.policy as policy_module
 from vedaops_mcp.change import (
     project_file_delete,
     project_file_write,
@@ -1159,3 +1162,292 @@ def test_public_file_uncertainty_never_journals_failed_after_effect(
     record = [item for item in records if item["kind"] == "text_replace"][-1]
     assert record["state"] == "uncertain"
     assert "recovery_prefix" in record
+
+
+def test_real_directory_substitution_before_helper_cannot_modify_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    init_project(root, capabilities=("read", "change"), mutable=True)
+    registry = write_registry(
+        tmp_path / "projects.toml",
+        root=root,
+        mutable=True,
+        capabilities=("read", "change"),
+        principal_capabilities=("read", "change"),
+    )
+    ordinary = root / "ordinary"
+    ordinary.mkdir()
+    authority = root / ".vedaops"
+    manifest = authority / "project.toml"
+    before = manifest.read_bytes()
+    (ordinary / "project.toml").write_bytes(before)
+    git(root, "add", "ordinary/project.toml")
+    git(root, "commit", "-q", "-m", "prepare ordinary subject")
+    head = git(root, "rev-parse", "HEAD")
+    parked = root / "parked"
+    real_helper = change_module.conditional_write_project_file
+
+    def substitute(*args, **kwargs):
+        ordinary.rename(parked)
+        authority.rename(ordinary)
+        try:
+            return real_helper(*args, **kwargs)
+        finally:
+            ordinary.rename(authority)
+            parked.rename(ordinary)
+
+    monkeypatch.setattr(change_module, "conditional_write_project_file", substitute)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_PRECONDITION_FAILED"):
+        project_file_write(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="ordinary/project.toml",
+            content="candidate authority bytes\n",
+            expected_sha256=hashlib.sha256(before).hexdigest(),
+        )
+
+    assert manifest.read_bytes() == before
+
+
+@pytest.mark.parametrize("action", ["write", "delete"])
+def test_preexisting_recovery_entry_is_never_unlinked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+):
+    target = tmp_path / "file.txt"
+    target.write_bytes(b"original\n")
+    suffix = "candidate" if action == "write" else "recovery"
+    collision = tmp_path / f".file.txt.vedaops-collision-{suffix}"
+    collision.write_bytes(b"competing bytes\n")
+    monkeypatch.setattr(fs_helper, "ROOT_PATH", str(tmp_path))
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    if action == "write":
+        code = fs_helper._write("file.txt", digest, 0o644, b"candidate\n", "collision")
+    else:
+        code = fs_helper._delete("file.txt", digest, "collision")
+
+    assert code == 2
+    assert collision.read_bytes() == b"competing bytes\n"
+
+
+@pytest.mark.parametrize(
+    ("payload", "returncode"),
+    [
+        ({"state": "precondition_failed", "detail": ""}, 2),
+        ({"state": "precondition_failed", "detail": "", "effect_occurred": None}, 2),
+        ({"state": "succeeded", "detail": "", "effect_occurred": "false"}, 0),
+    ],
+)
+def test_malformed_effect_evidence_is_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+    returncode: int,
+):
+    result = subprocess.CompletedProcess([], returncode, json.dumps(payload).encode(), b"")
+    monkeypatch.setattr(policy_module.subprocess, "run", lambda *args, **kwargs: result)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_EFFECT_UNCERTAIN"):
+        policy_module._run_file_helper(
+            tmp_path,
+            "write",
+            "file.txt",
+            "-",
+            "op",
+            "644",
+            input_bytes=b"x",
+        )
+
+
+def test_cleanup_quarantines_competing_replacement_instead_of_deleting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    root.mkdir()
+    candidate = root / ".file.txt.vedaops-cleanup-candidate"
+    candidate.write_bytes(b"owned recovery bytes\n")
+    info = candidate.stat()
+    entry = {"name": candidate.name, "dev": info.st_dev, "ino": info.st_ino}
+    guard = policy_module._capture_parent_guard(root, "file.txt")
+    real_rename = policy_module.os.rename
+    injected = False
+
+    def substitute_then_move(src, dst, *args, **kwargs):
+        nonlocal injected
+        if src == candidate.name and not injected:
+            injected = True
+            competitor = root / "competitor"
+            competitor.write_bytes(b"competing unique bytes\n")
+            competitor.replace(candidate)
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(policy_module.os, "rename", substitute_then_move)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_EFFECT_UNCERTAIN"):
+        policy_module._cleanup_helper_entries(
+            root,
+            "file.txt",
+            guard,
+            [entry],
+            operation_id="cleanup-race",
+        )
+
+    preserved = list(tmp_path.glob(".vedaops-mcp-recovery-*/*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == b"competing unique bytes\n"
+    shutil.rmtree(preserved[0].parent)
+
+
+def test_real_directory_substitution_before_create_cannot_modify_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+    ordinary = root / "ordinary"
+    ordinary.mkdir()
+    authority = root / ".vedaops"
+    manifest = authority / "project.toml"
+    before = manifest.read_bytes()
+    parked = root / "parked"
+    real_helper = change_module.conditional_write_project_file
+
+    def substitute(*args, **kwargs):
+        ordinary.rename(parked)
+        authority.rename(ordinary)
+        try:
+            return real_helper(*args, **kwargs)
+        finally:
+            ordinary.rename(authority)
+            parked.rename(ordinary)
+
+    monkeypatch.setattr(change_module, "conditional_write_project_file", substitute)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_PRECONDITION_FAILED"):
+        project_file_write(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="ordinary/new.txt",
+            content="candidate\n",
+        )
+
+    assert manifest.read_bytes() == before
+    assert not (authority / "new.txt").exists()
+    assert not (ordinary / "new.txt").exists()
+
+
+def test_real_directory_substitution_before_delete_cannot_modify_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    init_project(root, capabilities=("read", "change"), mutable=True)
+    registry = write_registry(
+        tmp_path / "projects.toml",
+        root=root,
+        mutable=True,
+        capabilities=("read", "change"),
+        principal_capabilities=("read", "change"),
+    )
+    ordinary = root / "ordinary"
+    ordinary.mkdir()
+    authority = root / ".vedaops"
+    manifest = authority / "project.toml"
+    before = manifest.read_bytes()
+    ordinary_target = ordinary / "project.toml"
+    ordinary_target.write_bytes(before)
+    git(root, "add", "ordinary/project.toml")
+    git(root, "commit", "-q", "-m", "prepare ordinary delete subject")
+    head = git(root, "rev-parse", "HEAD")
+    parked = root / "parked"
+    real_helper = change_module.conditional_delete_project_file
+
+    def substitute(*args, **kwargs):
+        ordinary.rename(parked)
+        authority.rename(ordinary)
+        try:
+            return real_helper(*args, **kwargs)
+        finally:
+            ordinary.rename(authority)
+            parked.rename(ordinary)
+
+    monkeypatch.setattr(change_module, "conditional_delete_project_file", substitute)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_PRECONDITION_FAILED"):
+        project_file_delete(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="ordinary/project.toml",
+            expected_sha256=hashlib.sha256(before).hexdigest(),
+        )
+
+    assert manifest.read_bytes() == before
+    assert ordinary_target.read_bytes() == before
+
+
+def test_ordinary_real_directory_substitution_is_rejected_before_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    init_project(root, capabilities=("read", "change"), mutable=True)
+    registry = write_registry(
+        tmp_path / "projects.toml",
+        root=root,
+        mutable=True,
+        capabilities=("read", "change"),
+        principal_capabilities=("read", "change"),
+    )
+    ordinary = root / "ordinary"
+    substitute = root / "substitute"
+    ordinary.mkdir()
+    substitute.mkdir()
+    ordinary_target = ordinary / "file.txt"
+    substitute_target = substitute / "file.txt"
+    ordinary_target.write_bytes(b"same bytes\n")
+    substitute_target.write_bytes(b"same bytes\n")
+    git(root, "add", "ordinary/file.txt", "substitute/file.txt")
+    git(root, "commit", "-q", "-m", "prepare directory substitution subjects")
+    head = git(root, "rev-parse", "HEAD")
+    parked = root / "parked"
+    real_helper = change_module.conditional_write_project_file
+
+    def substitute_before_helper(*args, **kwargs):
+        ordinary.rename(parked)
+        substitute.rename(ordinary)
+        try:
+            return real_helper(*args, **kwargs)
+        finally:
+            ordinary.rename(substitute)
+            parked.rename(ordinary)
+
+    monkeypatch.setattr(
+        change_module,
+        "conditional_write_project_file",
+        substitute_before_helper,
+    )
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_PRECONDITION_FAILED"):
+        project_file_write(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="ordinary/file.txt",
+            content="candidate\n",
+            expected_sha256=hashlib.sha256(b"same bytes\n").hexdigest(),
+        )
+
+    assert ordinary_target.read_bytes() == b"same bytes\n"
+    assert substitute_target.read_bytes() == b"same bytes\n"

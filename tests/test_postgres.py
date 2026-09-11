@@ -116,9 +116,14 @@ print(json.dumps({'socket': True, 'network_denied': True, 'dsn': url, 'password'
     assert result.postgres_server_version_num // 10000 == 18
     assert result.postgres_readiness == "accepting"
     assert result.postgres_connectivity == "unix_socket"
+    assert result.postgres_storage == "read_only_root_tmpfs_memory_cgroup"
+    assert result.postgres_socket_storage == "host_tmpfs_container_memory_cgroup"
     assert result.postgres_cleanup == "removed"
     assert result.cleanup == "removed"
     assert result.uncertain_effects is False
+    assert not list(
+        Path("/dev/shm").glob(f"vedaops-pg-socket-{result.operation_id[:12]}-*")
+    )
     assert result.postgres_image == POSTGRES_IMAGE
     assert result.postgres_image_id.startswith("sha256:")
     assert len(result.runtime.sha256) == 64
@@ -201,6 +206,67 @@ def test_postgres_cleanup_failure_returns_structured_uncertainty(
     assert result.uncertain_effects is True
     assert any(
         item.code == "VEDAOPS_POSTGRES_CLEANUP_UNCERTAIN" for item in result.limitations
+    )
+
+
+def test_postgres_start_contract_bounds_server_writable_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[str, ...]] = []
+    image_id = "sha256:" + "a" * 64
+    socket_dir = tmp_path / "socket"
+    socket_dir.mkdir()
+    env_file = tmp_path / "postgres.env"
+    env_file.write_text("POSTGRES_USER=vedaops\n")
+
+    def fake_docker(
+        docker: Path,
+        *args: str,
+        timeout_seconds: int = 10,
+    ) -> subprocess.CompletedProcess[str]:
+        del docker, timeout_seconds
+        calls.append(args)
+        if args[0] == "run":
+            return subprocess.CompletedProcess(args, 0, "container\n", "")
+        if args[0] == "inspect":
+            expected = (
+                f"none|{postgres_module.POSTGRES_IMAGE}|{image_id}|"
+                f"{postgres_module.POSTGRES_CONTAINER_USER}|true|"
+                f"{postgres_module.POSTGRES_CONTAINER_MEMORY_BYTES}|"
+                f"{postgres_module.POSTGRES_CONTAINER_MEMORY_BYTES}|"
+                f"{postgres_module.POSTGRES_CONTAINER_PIDS}\n"
+            )
+            return subprocess.CompletedProcess(args, 0, expected, "")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(postgres_module, "_docker", fake_docker)
+    postgres_module._start_postgres(
+        DOCKER,
+        name="bounded-postgres",
+        socket_dir=socket_dir,
+        env_file=env_file,
+        image_id=image_id,
+        operation_id="0123456789abcdef0123456789abcdef",
+    )
+
+    run = calls[0]
+    assert "--read-only" in run
+    assert "no-new-privileges:true" in run
+    assert run[run.index("--user") + 1] == postgres_module.POSTGRES_CONTAINER_USER
+    assert run[run.index("--memory") + 1] == postgres_module.POSTGRES_CONTAINER_MEMORY
+    assert run[run.index("--memory-swap") + 1] == postgres_module.POSTGRES_CONTAINER_SWAP
+    assert run[run.index("--pids-limit") + 1] == postgres_module.POSTGRES_CONTAINER_PIDS
+    tmpfs_specs = [run[index + 1] for index, item in enumerate(run) if item == "--tmpfs"]
+    assert any(
+        spec.startswith("/var/lib/postgresql:") and "size=512m" in spec
+        for spec in tmpfs_specs
+    )
+    assert any(spec.startswith("/tmp:") and "size=64m" in spec for spec in tmpfs_specs)
+    assert any(spec.startswith("/var/tmp:") and "size=64m" in spec for spec in tmpfs_specs)
+    assert any(
+        item == f"type=bind,src={socket_dir},dst={postgres_module.POSTGRES_SOCKET_CONTAINER}"
+        for item in run
     )
 
 

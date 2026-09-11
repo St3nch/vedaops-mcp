@@ -51,7 +51,16 @@ POSTGRES_SOCKET_URI_HOST = "%2Frun%2Fvedaops-pg"
 POSTGRES_PORT = 5432
 POSTGRES_START_TIMEOUT_SECONDS = 60
 POSTGRES_CONTAINER_MEMORY = "512m"
+POSTGRES_CONTAINER_MEMORY_BYTES = 512 * 1024 * 1024
+POSTGRES_CONTAINER_SWAP = "512m"
 POSTGRES_CONTAINER_PIDS = "128"
+POSTGRES_CONTAINER_UID = 70
+POSTGRES_CONTAINER_GID = 70
+POSTGRES_CONTAINER_USER = f"{POSTGRES_CONTAINER_UID}:{POSTGRES_CONTAINER_GID}"
+POSTGRES_HOST_SOCKET_ROOT = Path("/dev/shm")
+POSTGRES_SERVER_SCRATCH = "64m"
+
+
 class PostgresCheckRunResult(CheckRunResult):
     model_config = ConfigDict(extra="forbid")
 
@@ -61,6 +70,8 @@ class PostgresCheckRunResult(CheckRunResult):
     postgres_server_version_num: int
     postgres_readiness: str
     postgres_connectivity: str
+    postgres_storage: str
+    postgres_socket_storage: str
     postgres_cleanup: str
     runtime: RuntimeIdentity
 
@@ -135,6 +146,7 @@ def project_postgres_check_run(
     )
     operation_id = journal.operation_id
     root: Path | None = None
+    socket_dir: Path | None = None
     process: subprocess.Popen[bytes] | None = None
     container_name: str | None = None
     cleanup = "removed"
@@ -159,12 +171,11 @@ def project_postgres_check_run(
         root.mkdir(mode=0o700)
         snapshot_dir = root / "snapshot"
         runtime_dir = root / "runtime-venv"
-        socket_dir = root / "socket"
+        socket_dir = _create_host_tmpfs_socket_directory(operation_id)
+        journal.update(postgres_socket_directory=str(socket_dir))
         uv_copy = root / "uv"
         env_file = root / "postgres.env"
         snapshot_dir.mkdir(mode=0o700)
-        socket_dir.mkdir(mode=0o777)
-        socket_dir.chmod(0o777)
         captured_digest, excluded_count, exclusions = _materialize_snapshot(
             project.root,
             tree_listing,
@@ -192,6 +203,12 @@ def project_postgres_check_run(
         )
         postgres_cleanup = "pending"
         readiness, server_version_num = _wait_for_postgres(docker, container_name)
+        _verify_postgres_server_storage(
+            docker,
+            name=container_name,
+            socket_dir=socket_dir,
+            operation_id=operation_id,
+        )
 
         database_url = (
             f"postgresql://{POSTGRES_USER}:{password}@{POSTGRES_SOCKET_URI_HOST}:"
@@ -284,6 +301,20 @@ def project_postgres_check_run(
                         detail="disposable PostgreSQL container removal could not be verified",
                     )
                 )
+        if socket_dir is not None and socket_dir.exists():
+            try:
+                shutil.rmtree(socket_dir)
+            except OSError:
+                cleanup = "uncertain"
+                uncertain_effects = True
+                limitations.append(
+                    Limitation(
+                        code="VEDAOPS_POSTGRES_SOCKET_CLEANUP_UNCERTAIN",
+                        detail=(
+                            "disposable PostgreSQL host-tmpfs socket directory could not be removed"
+                        ),
+                    )
+                )
         if root is not None and root.exists():
             try:
                 shutil.rmtree(root)
@@ -352,6 +383,8 @@ def project_postgres_check_run(
         postgres_server_version_num=server_version_num,
         postgres_readiness=readiness,
         postgres_connectivity="unix_socket",
+        postgres_storage="read_only_root_tmpfs_memory_cgroup",
+        postgres_socket_storage="host_tmpfs_container_memory_cgroup",
         postgres_cleanup=postgres_cleanup,
         runtime=runtime_identity,
     )
@@ -373,6 +406,53 @@ def _scrub_postgres_output(text: str, *, database_url: str, password: str) -> st
         password,
         "[REDACTED_SECRET]",
     )
+
+
+def _create_host_tmpfs_socket_directory(operation_id: str) -> Path:
+    """Create the exported server socket on host tmpfs, never disk-backed temp storage."""
+    root = POSTGRES_HOST_SOCKET_ROOT
+    try:
+        info = root.lstat()
+        if not info or root.is_symlink() or not root.is_dir():
+            raise OSError("socket root is not a real directory")
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PolicyError(
+            "VEDAOPS_POSTGRES_SUBSTRATE_UNAVAILABLE",
+            "trusted PostgreSQL socket tmpfs is unavailable",
+        ) from exc
+    is_tmpfs = False
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            continue
+        if fields[4] == root.as_posix() and fields[separator + 1] == "tmpfs":
+            is_tmpfs = True
+            break
+    if not is_tmpfs:
+        raise PolicyError(
+            "VEDAOPS_POSTGRES_SUBSTRATE_UNAVAILABLE",
+            "PostgreSQL socket export must live on host tmpfs",
+        )
+    try:
+        path = Path(
+            tempfile.mkdtemp(
+                prefix=f"vedaops-pg-socket-{operation_id[:12]}-",
+                dir=root,
+            )
+        )
+        path.chmod(0o777)
+        created = path.lstat()
+        if path.is_symlink() or not path.is_dir() or created.st_uid != os.getuid():
+            raise OSError("socket directory identity is unsafe")
+        return path
+    except OSError as exc:
+        raise PolicyError(
+            "VEDAOPS_POSTGRES_SUBSTRATE_UNAVAILABLE",
+            "PostgreSQL socket tmpfs directory could not be created",
+        ) from exc
 
 
 def _write_private_env_file(path: Path, password: str) -> None:
@@ -401,10 +481,32 @@ def _start_postgres(
         "never",
         "--network",
         "none",
+        "--user",
+        POSTGRES_CONTAINER_USER,
+        "--read-only",
+        "--security-opt",
+        "no-new-privileges:true",
         "--tmpfs",
-        "/var/lib/postgresql:rw,nosuid,nodev,size=512m",
+        (
+            "/var/lib/postgresql:rw,nosuid,nodev,size=512m,"
+            f"uid={POSTGRES_CONTAINER_UID},gid={POSTGRES_CONTAINER_GID},mode=0700"
+        ),
+        "--tmpfs",
+        (
+            f"/tmp:rw,nosuid,nodev,noexec,size={POSTGRES_SERVER_SCRATCH},"
+            f"uid={POSTGRES_CONTAINER_UID},gid={POSTGRES_CONTAINER_GID},mode=1777"
+        ),
+        "--tmpfs",
+        (
+            f"/var/tmp:rw,nosuid,nodev,noexec,size={POSTGRES_SERVER_SCRATCH},"
+            f"uid={POSTGRES_CONTAINER_UID},gid={POSTGRES_CONTAINER_GID},mode=1777"
+        ),
+        "--shm-size",
+        POSTGRES_SERVER_SCRATCH,
         "--memory",
         POSTGRES_CONTAINER_MEMORY,
+        "--memory-swap",
+        POSTGRES_CONTAINER_SWAP,
         "--pids-limit",
         POSTGRES_CONTAINER_PIDS,
         "--stop-timeout",
@@ -433,14 +535,22 @@ def _start_postgres(
         docker,
         "inspect",
         "--format",
-        "{{.HostConfig.NetworkMode}}|{{.Config.Image}}|{{.Image}}",
+        (
+            "{{.HostConfig.NetworkMode}}|{{.Config.Image}}|{{.Image}}|{{.Config.User}}|"
+            "{{.HostConfig.ReadonlyRootfs}}|{{.HostConfig.Memory}}|"
+            "{{.HostConfig.MemorySwap}}|{{.HostConfig.PidsLimit}}"
+        ),
         name,
     )
-    expected = f"none|{POSTGRES_IMAGE}|{image_id}"
+    expected = (
+        f"none|{POSTGRES_IMAGE}|{image_id}|{POSTGRES_CONTAINER_USER}|true|"
+        f"{POSTGRES_CONTAINER_MEMORY_BYTES}|{POSTGRES_CONTAINER_MEMORY_BYTES}|"
+        f"{POSTGRES_CONTAINER_PIDS}"
+    )
     if inspect.returncode != 0 or inspect.stdout.strip() != expected:
         raise PolicyError(
             "VEDAOPS_POSTGRES_SUBSTRATE_INVALID",
-            "started PostgreSQL container does not match the fixed substrate contract",
+            "started PostgreSQL container does not match the fixed bounded substrate contract",
         )
 
 
@@ -500,6 +610,70 @@ def _wait_for_postgres(docker: Path, name: str) -> tuple[str, int]:
             "connected PostgreSQL server is not major version 18",
         )
     return "accepting", version_num
+
+
+def _verify_postgres_server_storage(
+    docker: Path,
+    *,
+    name: str,
+    socket_dir: Path,
+    operation_id: str,
+) -> None:
+    """Prove server-side writes land only on the bounded disposable storage contract."""
+    root_write = _docker(
+        docker,
+        "exec",
+        name,
+        "sh",
+        "-c",
+        "touch /etc/.vedaops-root-write-probe",
+    )
+    if root_write.returncode == 0:
+        _docker(docker, "exec", name, "rm", "-f", "/etc/.vedaops-root-write-probe")
+        raise PolicyError(
+            "VEDAOPS_POSTGRES_SUBSTRATE_INVALID",
+            "PostgreSQL container root filesystem is unexpectedly writable",
+        )
+
+    probe_name = f".vedaops-storage-probe-{operation_id[:12]}"
+    probe_container = f"{POSTGRES_SOCKET_CONTAINER}/{probe_name}"
+    copy = _docker(
+        docker,
+        "exec",
+        name,
+        "psql",
+        "-h",
+        POSTGRES_SOCKET_CONTAINER,
+        "-U",
+        POSTGRES_USER,
+        "-d",
+        POSTGRES_DB,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-Atqc",
+        f"COPY (SELECT 'vedaops-storage-probe') TO '{probe_container}'",
+    )
+    if copy.returncode != 0:
+        raise PolicyError(
+            "VEDAOPS_POSTGRES_SUBSTRATE_INVALID",
+            "PostgreSQL server-side bounded-storage probe failed",
+        )
+
+    host_probe = socket_dir / probe_name
+    try:
+        info = host_probe.lstat()
+        if host_probe.is_symlink() or not host_probe.is_file() or info.st_size > 128:
+            raise OSError("server-side probe has invalid identity")
+        if host_probe.read_bytes() != b"vedaops-storage-probe\n":
+            raise OSError("server-side probe bytes are unexpected")
+        removed = _docker(docker, "exec", name, "rm", "-f", probe_container)
+        if removed.returncode != 0 or host_probe.exists():
+            raise OSError("server-side probe could not be removed from host tmpfs")
+    except OSError as exc:
+        raise PolicyError(
+            "VEDAOPS_POSTGRES_SUBSTRATE_INVALID",
+            "PostgreSQL server-side writes are not bound to the exported host tmpfs",
+        ) from exc
 
 
 def _remove_container(docker: Path, name: str) -> bool:

@@ -10,6 +10,7 @@ import pytest
 from support import git, init_project, write_registry
 
 import vedaops_mcp.change as change_module
+import vedaops_mcp.fs_helper as fs_helper
 from vedaops_mcp.change import (
     project_file_delete,
     project_file_write,
@@ -913,3 +914,248 @@ def test_grafted_false_fast_forward_is_refused_before_merge_effect(tmp_path: Pat
         )
 
     assert git(root, "rev-parse", "HEAD") == target
+
+
+def test_helper_parent_substitution_at_effect_boundary_cannot_reach_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    root = tmp_path / "workspace"
+    ordinary = root / "ordinary"
+    authority = root / ".vedaops"
+    ordinary.mkdir(parents=True)
+    authority.mkdir()
+    target = ordinary / "project.toml"
+    manifest = authority / "project.toml"
+    target.write_text("ordinary\n")
+    manifest.write_text("authority\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    manifest_before = manifest.read_bytes()
+    relocated = root / "ordinary-original"
+    original_rename = fs_helper._renameat2
+    swapped = False
+
+    def swap_before_effect(old_fd: int, old: str, new_fd: int, new: str, flags: int) -> None:
+        nonlocal swapped
+        if not swapped:
+            ordinary.rename(relocated)
+            ordinary.symlink_to(".vedaops", target_is_directory=True)
+            swapped = True
+        original_rename(old_fd, old, new_fd, new, flags)
+
+    monkeypatch.setattr(fs_helper, "ROOT_PATH", str(root))
+    monkeypatch.setattr(fs_helper, "_renameat2", swap_before_effect)
+
+    code = fs_helper._write(
+        "ordinary/project.toml",
+        expected,
+        0o644,
+        b"candidate\n",
+        "parent-swap",
+    )
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert code == 3
+    assert payload["state"] == "uncertain"
+    assert payload["effect_occurred"] is True
+    assert manifest.read_bytes() == manifest_before
+    assert (relocated / "project.toml").read_bytes() == b"candidate\n"
+
+
+def test_helper_post_create_error_is_uncertain_after_real_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    original_rename = fs_helper._renameat2
+    original_read = fs_helper._read_regular_at
+    effected = False
+
+    def rename_then_mark(old_fd: int, old: str, new_fd: int, new: str, flags: int) -> None:
+        nonlocal effected
+        original_rename(old_fd, old, new_fd, new, flags)
+        effected = True
+
+    def fail_post_effect(parent_fd: int, name: str) -> tuple[bytes, int]:
+        if effected:
+            raise OSError(5, "simulated post-create EIO")
+        return original_read(parent_fd, name)
+
+    monkeypatch.setattr(fs_helper, "ROOT_PATH", str(root))
+    monkeypatch.setattr(fs_helper, "_renameat2", rename_then_mark)
+    monkeypatch.setattr(fs_helper, "_read_regular_at", fail_post_effect)
+
+    code = fs_helper._write("new.txt", "-", 0o644, b"candidate\n", "post-create")
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert code == 3
+    assert payload["state"] == "uncertain"
+    assert payload["effect_occurred"] is True
+    assert (root / "new.txt").read_bytes() == b"candidate\n"
+
+
+def test_helper_post_exchange_error_preserves_recovery_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "file.txt"
+    target.write_bytes(b"original\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    original_rename = fs_helper._renameat2
+    original_read = fs_helper._read_regular_at
+    effected = False
+
+    def rename_then_mark(old_fd: int, old: str, new_fd: int, new: str, flags: int) -> None:
+        nonlocal effected
+        original_rename(old_fd, old, new_fd, new, flags)
+        effected = True
+
+    def fail_post_effect(parent_fd: int, name: str) -> tuple[bytes, int]:
+        if effected:
+            raise OSError(5, "simulated post-exchange EIO")
+        return original_read(parent_fd, name)
+
+    monkeypatch.setattr(fs_helper, "ROOT_PATH", str(root))
+    monkeypatch.setattr(fs_helper, "_renameat2", rename_then_mark)
+    monkeypatch.setattr(fs_helper, "_read_regular_at", fail_post_effect)
+
+    code = fs_helper._write("file.txt", expected, 0o644, b"candidate\n", "post-exchange")
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert code == 3
+    assert payload["state"] == "uncertain"
+    assert payload["effect_occurred"] is True
+    assert target.read_bytes() == b"candidate\n"
+    recoveries = [root / name for name in payload["recoveries"]]
+    assert len(recoveries) == 2
+    assert all(path.exists() for path in recoveries)
+    assert all(path.read_bytes() == b"original\n" for path in recoveries)
+
+
+def test_helper_competing_replacement_is_preserved_without_reverse_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "file.txt"
+    target.write_bytes(b"original\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    original_rename = fs_helper._renameat2
+    calls = 0
+
+    def substitute_then_exchange(
+        old_fd: int,
+        old: str,
+        new_fd: int,
+        new: str,
+        flags: int,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        competitor = root / "competitor.tmp"
+        competitor.write_bytes(b"competitor\n")
+        competitor.replace(target)
+        original_rename(old_fd, old, new_fd, new, flags)
+
+    monkeypatch.setattr(fs_helper, "ROOT_PATH", str(root))
+    monkeypatch.setattr(fs_helper, "_renameat2", substitute_then_exchange)
+
+    code = fs_helper._write("file.txt", expected, 0o644, b"candidate\n", "competitor")
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert code == 3
+    assert payload["state"] == "uncertain"
+    assert calls == 1
+    assert target.read_bytes() == b"candidate\n"
+    recovery_bytes = {(root / name).read_bytes() for name in payload["recoveries"]}
+    assert recovery_bytes == {b"original\n", b"competitor\n"}
+
+
+def test_helper_post_delete_error_preserves_removed_and_recovery_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "file.txt"
+    target.write_bytes(b"original\n")
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+    original_rename = fs_helper._renameat2
+    original_read = fs_helper._read_regular_at
+    effected = False
+
+    def rename_then_mark(old_fd: int, old: str, new_fd: int, new: str, flags: int) -> None:
+        nonlocal effected
+        original_rename(old_fd, old, new_fd, new, flags)
+        effected = True
+
+    def fail_post_effect(parent_fd: int, name: str) -> tuple[bytes, int]:
+        if effected:
+            raise OSError(5, "simulated post-delete EIO")
+        return original_read(parent_fd, name)
+
+    monkeypatch.setattr(fs_helper, "ROOT_PATH", str(root))
+    monkeypatch.setattr(fs_helper, "_renameat2", rename_then_mark)
+    monkeypatch.setattr(fs_helper, "_read_regular_at", fail_post_effect)
+
+    code = fs_helper._delete("file.txt", expected, "post-delete")
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert code == 3
+    assert payload["state"] == "uncertain"
+    assert payload["effect_occurred"] is True
+    assert not target.exists()
+    recoveries = [root / name for name in payload["recoveries"]]
+    assert len(recoveries) == 2
+    assert all(path.exists() for path in recoveries)
+    assert all(path.read_bytes() == b"original\n" for path in recoveries)
+
+
+def test_public_file_uncertainty_never_journals_failed_after_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+    readme = root / "README.md"
+
+    def effect_then_uncertain(
+        project_root: Path,
+        relative_path: str,
+        data: bytes,
+        mode: int,
+        **kwargs,
+    ) -> None:
+        del mode, kwargs
+        (project_root / relative_path).write_bytes(data)
+        raise PolicyError("VEDAOPS_CHANGE_EFFECT_UNCERTAIN", "simulated post-effect uncertainty")
+
+    monkeypatch.setattr(change_module, "conditional_write_project_file", effect_then_uncertain)
+
+    with pytest.raises(PolicyError, match="VEDAOPS_CHANGE_EFFECT_UNCERTAIN"):
+        project_text_replace(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            path="README.md",
+            expected_sha256=_sha(readme),
+            find="hello world",
+            replacement="candidate bytes",
+        )
+
+    records = [
+        json.loads(path.read_text())
+        for path in (registry.parent / "operations").glob("*.json")
+    ]
+    record = [item for item in records if item["kind"] == "text_replace"][-1]
+    assert record["state"] == "uncertain"
+    assert "recovery_prefix" in record

@@ -231,6 +231,11 @@ def project_file_write(
                 "expected_sha256": expected_digest,
             },
         )
+        recovery_prefix = f".{Path(normalized).name}.vedaops-{journal.operation_id}"
+        journal.update(
+            recovery_directory=Path(normalized).parent.as_posix(),
+            recovery_prefix=recovery_prefix,
+        )
         try:
             conditional_write_project_file(
                 project.root,
@@ -238,6 +243,7 @@ def project_file_write(
                 raw,
                 before_mode,
                 expected_sha256=expected_digest,
+                operation_id=journal.operation_id,
             )
             _verify_file(project.root, normalized, raw)
             _require_head(project.root, expected_git_head)
@@ -331,6 +337,11 @@ def project_text_replace(
             project_root=project.root,
             subject={"path": normalized, "expected_sha256": expected_digest},
         )
+        recovery_prefix = f".{Path(normalized).name}.vedaops-{journal.operation_id}"
+        journal.update(
+            recovery_directory=Path(normalized).parent.as_posix(),
+            recovery_prefix=recovery_prefix,
+        )
         try:
             conditional_write_project_file(
                 project.root,
@@ -338,6 +349,7 @@ def project_text_replace(
                 updated,
                 mode,
                 expected_sha256=expected_digest,
+                operation_id=journal.operation_id,
             )
             _verify_file(project.root, normalized, updated)
             _require_head(project.root, expected_git_head)
@@ -405,11 +417,17 @@ def project_file_delete(
             project_root=project.root,
             subject={"path": normalized, "expected_sha256": expected_digest},
         )
+        recovery_prefix = f".{Path(normalized).name}.vedaops-{journal.operation_id}"
+        journal.update(
+            recovery_directory=Path(normalized).parent.as_posix(),
+            recovery_prefix=recovery_prefix,
+        )
         try:
             conditional_delete_project_file(
                 project.root,
                 normalized,
                 expected_sha256=expected_digest,
+                operation_id=journal.operation_id,
             )
             if project_lstat(project.root, normalized) is not None:
                 raise PolicyError("VEDAOPS_CHANGE_VERIFY_FAILED", "deleted file still exists")

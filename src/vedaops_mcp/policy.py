@@ -516,10 +516,19 @@ def conditional_write_project_file(
     mode: int,
     *,
     expected_sha256: str | None,
+    operation_id: str,
 ) -> None:
     """Apply one conditional write inside a filesystem-confined helper."""
     expected = "-" if expected_sha256 is None else expected_sha256
-    _run_file_helper(root, "write", relative_path, expected, f"{mode & 0o777:o}", input_bytes=data)
+    _run_file_helper(
+        root,
+        "write",
+        relative_path,
+        expected,
+        operation_id,
+        f"{mode & 0o777:o}",
+        input_bytes=data,
+    )
 
 
 def conditional_delete_project_file(
@@ -527,9 +536,17 @@ def conditional_delete_project_file(
     relative_path: str,
     *,
     expected_sha256: str,
+    operation_id: str,
 ) -> None:
     """Delete only the exact expected file object inside a filesystem-confined helper."""
-    _run_file_helper(root, "delete", relative_path, expected_sha256, input_bytes=b"")
+    _run_file_helper(
+        root,
+        "delete",
+        relative_path,
+        expected_sha256,
+        operation_id,
+        input_bytes=b"",
+    )
 
 
 def _run_file_helper(
@@ -628,24 +645,40 @@ def _run_file_helper(
         payload = json.loads(completed.stdout.decode("utf-8"))
         state = payload["state"]
         detail = str(payload.get("detail", ""))
-        backup = payload.get("backup")
+        effect_occurred = bool(payload.get("effect_occurred", False))
+        recoveries = payload.get("recoveries", [])
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise PolicyError(
             "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
             "confined file operation returned malformed evidence; inspect before retrying",
         ) from exc
-    if completed.returncode == 0 and state == "succeeded":
+    if not isinstance(recoveries, list) or not all(isinstance(item, str) for item in recoveries):
+        raise PolicyError(
+            "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+            "confined file operation returned malformed recovery evidence; inspect before retrying",
+        )
+    if completed.returncode == 0 and state == "succeeded" and effect_occurred:
         return
-    if completed.returncode == 2 and state == "precondition_failed":
+    if completed.returncode == 2 and state == "precondition_failed" and not effect_occurred:
         raise PolicyError(
             "VEDAOPS_CHANGE_PRECONDITION_FAILED",
             detail or "file precondition changed before the effect",
         )
     if completed.returncode == 3 and state == "uncertain":
-        suffix = f"; preserved backup {backup!r}" if backup else ""
+        suffix = (
+            "; preserved recovery entries " + ", ".join(repr(item) for item in recoveries)
+            if recoveries
+            else ""
+        )
         raise PolicyError(
             "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
             (detail or "file effect could not be verified") + suffix,
+        )
+    if effect_occurred:
+        raise PolicyError(
+            "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",
+            "confined file operation reports a possible effect without trustworthy "
+            "terminal evidence; inspect before retrying",
         )
     raise PolicyError(
         "VEDAOPS_CHANGE_EFFECT_UNCERTAIN",

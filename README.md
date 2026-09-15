@@ -6,6 +6,8 @@ Status: bootstrap project for the next-generation VedaOps development control pl
 
 VedaOps MCP is a small, capability-limited interface for capable LLMs and development agents to orient to registered projects, inspect repository truth, make explicitly delegated local changes, and run accurately scoped development checks.
 
+Operator procedure: [Project onboarding](docs/project-onboarding.md).
+
 The core Product has four responsibilities:
 
 1. **Orient** — identify the project/workspace, authority pointers, principal permissions, and observable state.

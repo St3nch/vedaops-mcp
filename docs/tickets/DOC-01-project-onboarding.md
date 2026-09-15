@@ -65,3 +65,14 @@ existing registry. The second remediation makes the example a private
 candidate only, requires complete replacement and validation of sample values,
 requires an absent first-time destination, and gives existing registries a
 separate preserve-and-atomically-replace path.
+
+## Live coexistence finding
+
+After Astra returned `READY` for exact documentation candidate
+`5c70dc4a128c0bbaf96dc3cabb70043793f74acc`, live read-only inspection found
+the legacy controller degraded with `VEDAOPS_MANIFEST_INVALID` when it
+encountered Shadow capabilities `change` and `check`. The next documentation
+candidate adds the missing coexistence rule: a Shadow-only project root must
+remain outside legacy discovery roots unless a separate legacy
+discovery/cutover change is authorized and verified. The prior `READY` verdict
+does not apply to this later candidate.

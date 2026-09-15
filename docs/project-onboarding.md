@@ -51,6 +51,21 @@ Before editing either authority source, confirm:
 Operator policy, settings, credentials, controller installation data, and the
 operation journal must remain outside every managed project root.
 
+## Legacy-controller coexistence
+
+Before placing a Shadow manifest, inspect the live legacy controller's
+discovery roots. Both generations use `.vedaops/project.toml`, but the legacy
+parser recognizes `read/write/patch/execute` while Shadow recognizes only
+`read/change/check`. A Shadow manifest discovered by the legacy controller can
+therefore make legacy project enumeration fail closed; using legacy
+capabilities instead makes Shadow reject the manifest.
+
+During coexistence, place Shadow-only project roots outside every legacy
+discovery root, or first make a separately authorized legacy discovery/cutover
+change. Do not invent a dual-capability manifest, weaken either parser, or
+assume the failure affects only the newly discovered project. Verify both
+controllers after any coexistence change.
+
 ## Step 1: Record the onboarding decision
 
 Write down the exact project ID, name, canonical root, workspace ID, intended

@@ -745,6 +745,7 @@ def project_git_commit(
                 branch=branch,
                 expected_git_head=expected_git_head,
                 commit_paths=commit_paths,
+                commit_message=commit_message,
                 exc=exc,
             )
         journal.terminal("succeeded")
@@ -1059,6 +1060,7 @@ def _finish_git_commit_attempt(
     branch: str,
     expected_git_head: str,
     commit_paths: Sequence[str],
+    commit_message: str,
     exc: BaseException,
 ) -> GitCommitResult:
     """Classify a failed commit attempt: proven success, restored index, or uncertain."""
@@ -1067,9 +1069,16 @@ def _finish_git_commit_attempt(
         expected_git_head=expected_git_head,
         branch=branch,
         commit_paths=commit_paths,
+        commit_message=commit_message,
     )
     if proven is not None:
-        journal.terminal("succeeded")
+        remaining_status = proven[2]
+        detail = (
+            "recovered after exception; observed matching parent, paths, and commit message"
+        )
+        if remaining_status == "unavailable":
+            detail += "; remaining_status unavailable"
+        journal.terminal("succeeded", detail=detail)
         return GitCommitResult(
             operation_id=journal.operation_id,
             project_id=project_id,
@@ -1078,11 +1087,9 @@ def _finish_git_commit_attempt(
             git_head_before=expected_git_head,
             git_head=proven[0],
             committed_paths=sorted(proven[1]),
-            remaining_status=proven[2],
+            remaining_status=remaining_status,
         )
 
-    actual_head: str | None = None
-    staged_paths: list[str] | None = None
     restored = False
     try:
         actual_head = run_git_text(root, "rev-parse", "HEAD")
@@ -1093,7 +1100,7 @@ def _finish_git_commit_attempt(
             and current_branch == branch
             and set(staged_paths) <= set(commit_paths)
         ):
-            restored = not staged_paths or _restore_own_commit_staging(
+            restored = _restore_own_commit_staging(
                 root,
                 expected_git_head=expected_git_head,
                 branch=branch,
@@ -1111,10 +1118,12 @@ def _finish_git_commit_attempt(
             "local commit failed; index was restored to the pre-operation state",
         ) from exc
 
+    actual_head, branch_note, staged_paths = _observe_commit_effect_evidence(root)
     journal.terminal("uncertain", detail=str(exc))
     raise _git_commit_effect_uncertain(
         expected_git_head=expected_git_head,
         actual_head=actual_head,
+        branch=branch_note,
         staged_paths=staged_paths,
     ) from exc
 
@@ -1125,8 +1134,13 @@ def _proven_exact_commit(
     expected_git_head: str,
     branch: str,
     commit_paths: Sequence[str],
+    commit_message: str,
 ) -> tuple[str, list[str], str] | None:
-    """Return HEAD/paths/status only when the intended exact commit is proven."""
+    """Return HEAD/paths/status when a matching exact-path child commit is observed.
+
+    This does not prove that this invocation created the commit. It only classifies
+    an already-present matching parent, path set, and commit message.
+    """
     try:
         head = run_git_text(root, "rev-parse", "HEAD")
         if COMMIT_PATTERN.fullmatch(head) is None or head == expected_git_head:
@@ -1139,6 +1153,9 @@ def _proven_exact_commit(
         committed = _commit_tree_paths(root, head)
         if set(committed) != set(commit_paths) or len(committed) != len(commit_paths):
             return None
+        observed_message = run_git_text(root, "log", "-1", "--format=%B", head)
+        if observed_message != commit_message:
+            return None
         if _commit_staged_paths(root):
             return None
     except PolicyError:
@@ -1146,7 +1163,7 @@ def _proven_exact_commit(
     try:
         remaining_status = _status_text(root)
     except PolicyError:
-        remaining_status = ""
+        remaining_status = "unavailable"
     return head, committed, remaining_status
 
 
@@ -1158,35 +1175,56 @@ def _restore_own_commit_staging(
     staged_paths: Sequence[str],
 ) -> bool:
     """Unstage only this attempt's paths when HEAD/branch/index are still proven."""
-    if not staged_paths:
-        return False
     try:
         if run_git_text(root, "rev-parse", "HEAD") != expected_git_head:
             return False
         if _current_branch(root) != branch:
             return False
-        _unstage_paths(root, staged_paths)
-        if run_git_text(root, "rev-parse", "HEAD") != expected_git_head:
-            return False
-        if _current_branch(root) != branch:
-            return False
+        if staged_paths:
+            _unstage_paths(root, staged_paths)
+            if run_git_text(root, "rev-parse", "HEAD") != expected_git_head:
+                return False
+            if _current_branch(root) != branch:
+                return False
         if _commit_staged_paths(root):
             return False
         status = _status_records(root)
         if any(index not in {" ", "?"} for index, _work, _path in status):
             return False
-        changed = {path for _index, _work, path in status}
-        if any(path not in changed for path in staged_paths):
-            return False
+        if staged_paths:
+            changed = {path for _index, _work, path in status}
+            if any(path not in changed for path in staged_paths):
+                return False
     except PolicyError:
         return False
     return True
+
+
+def _observe_commit_effect_evidence(
+    root: Path,
+) -> tuple[str | None, str, list[str] | None]:
+    """Re-read HEAD, branch, and staged paths for a final uncertain-effect report."""
+    try:
+        actual_head = run_git_text(root, "rev-parse", "HEAD")
+    except PolicyError:
+        actual_head = None
+    try:
+        observed_branch = _current_branch(root)
+        branch_note = observed_branch or "detached"
+    except PolicyError:
+        branch_note = "unavailable"
+    try:
+        staged_paths = _commit_staged_paths(root)
+    except PolicyError:
+        staged_paths = None
+    return actual_head, branch_note, staged_paths
 
 
 def _git_commit_effect_uncertain(
     *,
     expected_git_head: str,
     actual_head: str | None,
+    branch: str,
     staged_paths: Sequence[str] | None,
 ) -> PolicyError:
     if staged_paths is None:
@@ -1199,7 +1237,7 @@ def _git_commit_effect_uncertain(
         "VEDAOPS_GIT_EFFECT_UNCERTAIN",
         "local commit may have changed local Git state; inspect branch, HEAD, index, and working "
         f"tree before retrying; expected HEAD {expected_git_head}; observed HEAD "
-        f"{actual_head or 'unavailable'}; staged {staged_note}",
+        f"{actual_head or 'unavailable'}; branch {branch}; staged {staged_note}",
     )
 
 

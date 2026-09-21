@@ -71,7 +71,7 @@ Hosted pull-request verification:
 
 - `.github/workflows/ci.yml`
 
-The hosted workflow runs the same lint and test commands on GitHub-hosted Ubuntu infrastructure.
+The hosted workflow runs the same lint and test commands on GitHub-hosted Ubuntu infrastructure. It explicitly provisions Bubblewrap and the pinned PostgreSQL 18 test image so host-specific isolation/substrate tests do not silently disappear merely because the runner image differs from the VPS.
 
 Checks prove only the exact source subject they exercised. Dirty local working-tree content is not implied to have been checked.
 

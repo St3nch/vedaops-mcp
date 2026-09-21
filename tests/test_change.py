@@ -372,7 +372,10 @@ def test_commit_failure_after_staging_restores_index_and_allows_retry(
     assert "docs/retry.txt" in _untracked_names(root)
     assert "hello recovered" in readme.read_text()
     assert (root / "docs/retry.txt").read_text() == "retry me\n"
-    assert _commit_journal(registry)[-1]["state"] == "failed"
+    failed_journals = _commit_journal(registry)
+    assert len(failed_journals) == 1
+    assert failed_journals[0]["state"] == "failed"
+    failed_operation_id = failed_journals[0]["operation_id"]
 
     monkeypatch.setattr(change_module, "run_git_text", original)
     result = project_git_commit(
@@ -391,7 +394,13 @@ def test_commit_failure_after_staging_restores_index_and_allows_retry(
     assert "src/app.py" not in committed
     assert 'MESSAGE = "unrelated dirty"' in (root / "src/app.py").read_text()
     assert "src/app.py" in _unstaged_names(root)
-    retry_journal = _commit_journal(registry)[-1]
+    retry_journals = [
+        item
+        for item in _commit_journal(registry)
+        if item["operation_id"] != failed_operation_id
+    ]
+    assert len(retry_journals) == 1
+    retry_journal = retry_journals[0]
     assert retry_journal["state"] == "succeeded"
     assert "detail" not in retry_journal
 

@@ -84,4 +84,6 @@ Issues write is not part of the accepted App permission set. Ordinary timeline c
 
 The provider executable and operator policy are outside the service-writable state tree. Ownership by the runtime uid is rewrite authority even without a write bit. Before launch, the boundary hashes the executable and requires the operator-recorded installed-file digest. That digest is not the published release-archive digest. The official GitHub MCP child shares the F008 Unix identity and is part of that runtime's trusted computing base.
 
+F008 authorizes a project id to one GitHub repository from operator policy. A declared local project path is provenance and a lexical containment check for trusted F008 files. The runtime does not open that path. `ProtectHome=yes` stays. Repository filesystem access remains with Shadow, and repositories are not chowned to `vedaops-github`.
+
 This decision records the commissioned architecture. It is not Product acceptance of a live App, connector, or runtime, and it does not authorize push, merge, host provisioning, or provider calls.

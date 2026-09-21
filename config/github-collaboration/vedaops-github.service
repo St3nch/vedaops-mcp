@@ -7,6 +7,9 @@
 #     /usr/bin/vedaops-github stdio
 #
 # Do not point this unit at the Shadow user, Shadow environment, or Shadow policy.
+# ProtectHome=yes stays. This process does not mount operator homes or
+# VedaOps project worktrees. Project identity is the operator policy map
+# from a project id to one GitHub owner/repo.
 
 [Unit]
 Description=VedaOps F008 GitHub collaboration boundary

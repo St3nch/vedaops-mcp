@@ -34,9 +34,13 @@ installation_id = "000000"
 [journal]
 directory = "/var/lib/vedaops-github/operations"
 
+# root is operator-declared provenance for the VedaOps project. F008 does
+# not open, own, or traverse it. Leave the checkout with its development
+# owner. Do not relocate it for this service and do not chown it to
+# vedaops-github. Local repository access stays with Shadow.
 [[projects]]
 id = "example-project"
-root = "/srv/vedaops/example-project"
+root = "/home/operator/projects/example-project"
 github_owner = "example-org"
 github_repo = "example-repo"
 

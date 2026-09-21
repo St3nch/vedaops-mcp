@@ -80,17 +80,19 @@ Issues write stays excluded. That avoids granting general issue authority. `gith
 
 ## Authorization
 
-Operator policy is a TOML file outside every project root it names. The example is `config/github-collaboration.toml.example`. Grants are the intersection of one principal, one VedaOps project, one `owner/repo`, and an operation class. The classes are only:
+Operator policy is a TOML file outside every project path it names. The example is `config/github-collaboration.toml.example`. Grants are the intersection of one principal, one VedaOps project id, one `owner/repo`, and an operation class. The classes are only:
 
 `read`, `pr_create`, `pr_update_title`, `pr_update_body`, `pr_comment`, `pr_request_reviewers`.
 
-Any other class, including merge or push, makes the policy invalid. A file inside a managed project is not read for grants and cannot select the private-key path. Shadow project policy is not consulted. `VEDAOPS_AGENT_ID` does not name the F008 principal.
+Any other class, including merge or push, makes the policy invalid. A file inside a managed project is not read for grants and cannot select the private-key path, the provider executable, the journal, or the policy file. Shadow project policy is not consulted. `VEDAOPS_AGENT_ID` does not name the F008 principal.
+
+Each project entry maps one VedaOps project id to one GitHub `owner/repo`. Its `root` value is the absolute path the operator declares for that checkout. F008 stores that string as provenance and uses it only as a lexical boundary: policy, the App key, the provider executable, and the journal must not lie inside a declared project path. The runtime does not stat, own, or traverse that path, and it does not claim to have verified the checkout. Local reads and edits of the repository belong to Shadow and the development account. `ProtectHome=yes` on the F008 service stays; do not mount `/home` into the sandbox and do not chown a development checkout to `vedaops-github`.
 
 Standing collaboration authority, after a later Product acceptance, is an operator grant of those classes to the Steward principal. The software does not record a Product decision, and it does not treat a pull request, review, check, or merge as acceptance.
 
 ## Evidence and recovery
 
-Before a GitHub write, F008 fsyncs a started journal record under the operator journal directory with `effect_dispatched` true. The record includes the operation id, time, principal, project, repository, kind, target, expected source SHA, intention digest, authorization basis, and provider release/commit. It does not store the comment or pull request body, and it does not store the private key.
+Before a GitHub write, F008 fsyncs a started journal record under the operator journal directory with `effect_dispatched` true. The record includes the operation id, time, principal, project, repository, kind, target, expected source SHA, intention digest, authorization basis, and provider release/commit. The project path in that record is the operator-declared path, with `filesystem_verified` false. It does not store the comment or pull request body, and it does not store the private key.
 
 After the provider returns, F008 re-reads the native object. Success requires that re-read to match. A lost response or an ambiguous provider error is `uncertain`: the journal says an effect may have occurred, native state is inspected, a matching object is reported as `causality: unproven`, and the write is not retried. GitHub does not provide compare-and-swap for these writes. A head or base SHA that changes between the pre-read and the post-read is recorded as a limitation, not hidden.
 
@@ -153,7 +155,7 @@ These steps are not done by the implementation:
 3. CHAZ installs the App on the specific repositories that will appear in operator policy, not on all repositories.
 4. CHAZ records the App id and installation id in the root-owned operator policy outside the repositories and outside the journal.
 5. CHAZ, or an authorized operator, downloads the `v1.12.2` Linux tarball, checks the archive digest, installs the executable under `/usr/local/lib/vedaops-github/`, and records that file's SHA-256 as `executable_sha256`.
-6. CHAZ creates the `vedaops-github` account and directories if they do not exist.
+6. CHAZ creates the `vedaops-github` account and the trusted configuration and journal directories if they do not exist. Development checkouts stay on their existing paths and owners.
 7. CHAZ sets `provider_login` to the App's bot login, commonly the App slug plus `[bot]`.
 8. CHAZ authorizes a distinct ChatGPT connector whose command is `vedaops-github stdio` as `vedaops-github`. Do not reuse the Shadow connector.
 9. Only after that connector exists does a Steward run the live verification below.

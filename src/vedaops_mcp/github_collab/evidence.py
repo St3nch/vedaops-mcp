@@ -182,7 +182,11 @@ def start_github_operation(
         "started_at": _timestamp(),
         "principal_id": principal_id,
         "project_id": project.id,
-        "workspace_root": str(project.root),
+        "project_root": {
+            "declared_path": str(project.root),
+            "provenance": "operator_policy",
+            "filesystem_verified": False,
+        },
         "github_repository": github_repository,
         "kind": kind,
         "target": target,

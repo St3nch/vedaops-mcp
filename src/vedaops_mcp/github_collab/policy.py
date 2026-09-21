@@ -2,6 +2,8 @@
 
 Shadow project policy is not read. A file inside a managed project root
 cannot supply or enlarge these grants, and it cannot choose secret paths.
+The project path recorded here is operator-declared provenance. F008 does
+not open, own, or traverse that directory.
 """
 
 from __future__ import annotations
@@ -81,6 +83,13 @@ def current_runtime_identity() -> RuntimeIdentity:
 
 @dataclass(frozen=True, slots=True)
 class GitHubProject:
+    """Operator mapping from one VedaOps project id to one GitHub repository.
+
+    ``root`` is the absolute path the operator declared for that project.
+    It is provenance in evidence and a lexical containment boundary for
+    trusted F008 files. The runtime does not stat it.
+    """
+
     id: str
     root: Path
     owner: str
@@ -251,8 +260,6 @@ def load_policy(path: Path, *, require_runtime_paths: bool = True) -> GitHubPoli
         _require_secret_file(private_key_path)
     if require_runtime_paths and policy.enabled:
         _require_directory(journal_directory, "the F008 journal", private=True)
-        for project in projects:
-            _require_directory(project.root, f"project {project.id} root", private=False)
     return policy
 
 
@@ -355,7 +362,7 @@ def _projects(value: object) -> tuple[GitHubProject, ...]:
                 "each GitHub repository may belong to only one F008 project",
             )
         repositories.add(repository)
-        root = _absolute(table.get("root"), f"project {project_id} root")
+        root = _declared_project_root(table.get("root"), f"project {project_id} root")
         projects.append(GitHubProject(id=project_id, root=root, owner=owner, repo=repo))
     return tuple(projects)
 
@@ -502,23 +509,44 @@ def _optional_absolute(value: object, label: str) -> Path | None:
     return _absolute(value, label)
 
 
+def _declared_project_root(value: object, label: str) -> Path:
+    """Normalize an operator-declared project path without touching it."""
+    return _lexical_absolute(_absolute(value, label))
+
+
+def _lexical_absolute(path: Path) -> Path:
+    absolute = path.expanduser()
+    if not absolute.is_absolute():
+        absolute = absolute.absolute()
+    return Path(os.path.normpath(str(absolute)))
+
+
 def _reject_inside_projects(
     candidate: Path,
     projects: tuple[GitHubProject, ...],
     label: str,
 ) -> None:
-    source = candidate.expanduser().absolute()
-    resolved = candidate.expanduser().resolve()
+    """Refuse a trusted path that the declared project path would contain.
+
+    Project paths are not resolved. Resolving them would require the runtime
+    to traverse operator home directories that ``ProtectHome=yes`` hides.
+    """
+    trusted = [_lexical_absolute(candidate)]
+    try:
+        trusted.append(_lexical_absolute(candidate.expanduser().resolve()))
+    except OSError as exc:
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_UNAVAILABLE",
+            f"{label} is unavailable",
+        ) from exc
     for project in projects:
-        root = project.root.expanduser().absolute()
-        resolved_root = project.root.expanduser().resolve()
-        for child in (source, resolved):
-            for parent in (root, resolved_root):
-                if child == parent or parent in child.parents:
-                    raise GitHubPolicyError(
-                        "VEDAOPS_GITHUB_TRUSTED_PATH_INSIDE_PROJECT",
-                        f"{label} must not live inside managed project {project.id!r}",
-                    )
+        declared = _lexical_absolute(project.root)
+        for child in trusted:
+            if child == declared or declared in child.parents:
+                raise GitHubPolicyError(
+                    "VEDAOPS_GITHUB_TRUSTED_PATH_INSIDE_PROJECT",
+                    f"{label} must not live inside managed project {project.id!r}",
+                )
 
 
 def _policy_file(path: Path) -> Path:

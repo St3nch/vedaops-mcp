@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from fastmcp import Client
 
+from vedaops_mcp.github_collab import policy as github_policy
 from vedaops_mcp.github_collab.allowlist import (
     PROHIBITED_TOOLS,
     PROVIDER_COMMIT,
@@ -331,6 +332,7 @@ def _write_policy(
     binary: Path | None = None,
     journal: Path | None = None,
     extra: str = "",
+    project_roots: tuple[Path, Path] | None = None,
 ) -> Path:
     project_a = root / "projects" / "alpha"
     project_b = root / "projects" / "beta"
@@ -338,6 +340,7 @@ def _write_policy(
     project_b.mkdir(parents=True)
     _chmod(project_a, 0o755)
     _chmod(project_b, 0o755)
+    declared_a, declared_b = project_roots or (project_a, project_b)
     journal_dir = journal or (root / "journal")
     journal_dir.mkdir(mode=0o700, exist_ok=True)
     _chmod(journal_dir, 0o700)
@@ -397,13 +400,13 @@ directory = "{journal_dir}"
 
 [[projects]]
 id = "alpha"
-root = "{project_a}"
+root = "{declared_a}"
 github_owner = "example-org"
 github_repo = "alpha"
 
 [[projects]]
 id = "beta"
-root = "{project_b}"
+root = "{declared_b}"
 github_owner = "example-org"
 github_repo = "beta"
 
@@ -505,6 +508,108 @@ def test_unknown_operation_and_project_file_cannot_grant_authority(tmp_path: Pat
     _chmod(inside, 0o600)
     with pytest.raises(GitHubPolicyError, match="VEDAOPS_GITHUB_TRUSTED_PATH_INSIDE_PROJECT"):
         load_policy(inside)
+
+
+def test_operator_owned_project_root_is_declared_provenance(tmp_path: Path):
+    """Model a chaz-owned checkout with the vedaops-github runtime identity."""
+    sealed = tmp_path / "operator-home"
+    owned = sealed / "projects" / "vedaops-mcp"
+    other = sealed / "projects" / "other"
+    owned.mkdir(parents=True)
+    other.mkdir()
+    owner_uid = owned.stat().st_uid
+    runtime = github_policy.current_runtime_identity()
+    assert owner_uid == os.getuid()
+    assert runtime.uid == 65534
+    assert owner_uid != runtime.uid
+    (owned / "grant.toml").write_text(
+        'operations = ["read", "pr_create", "merge"]\n',
+        encoding="utf-8",
+    )
+    _chmod(sealed, 0o000)
+    try:
+        with pytest.raises(PermissionError):
+            owned.lstat()
+        policy, _path = _policy(tmp_path / "service-state", project_roots=(owned, other))
+        assert policy.project("alpha").root == owned
+        assert policy.project("alpha").repository == "example-org/alpha"
+        project = authorize(
+            policy,
+            principal_id=PRINCIPAL,
+            project_id="alpha",
+            github_repository="example-org/alpha",
+            operation="pr_create",
+        )
+        assert project.id == "alpha"
+        with pytest.raises(GitHubAuthorityError, match="VEDAOPS_GITHUB_REPOSITORY_DENIED"):
+            authorize(
+                policy,
+                principal_id=PRINCIPAL,
+                project_id="alpha",
+                github_repository="example-org/other",
+                operation="read",
+            )
+        with pytest.raises(GitHubAuthorityError, match="VEDAOPS_GITHUB_OPERATION_DENIED"):
+            authorize(
+                policy,
+                principal_id=PRINCIPAL,
+                project_id="beta",
+                github_repository="example-org/beta",
+                operation="pr_create",
+            )
+        assert "merge" not in policy.operations_for(PRINCIPAL, "alpha")
+        provider = FakeGitHub(policy.journal_directory)
+        provider.head_sha = OTHER
+        result = create_pull_request(
+            policy,
+            provider,
+            principal_id=PRINCIPAL,
+            project_id="alpha",
+            github_repository="example-org/alpha",
+            head="feature",
+            base="main",
+            expected_head_sha=HEAD,
+            title="Candidate",
+        )
+        assert result["outcome"] == "failed"
+        recorded = _journals(policy)[0]["project_root"]
+        assert recorded == {
+            "declared_path": str(owned),
+            "provenance": "operator_policy",
+            "filesystem_verified": False,
+        }
+    finally:
+        _chmod(sealed, 0o755)
+
+    service_path = (
+        Path(__file__).resolve().parents[1] / "config/github-collaboration/vedaops-github.service"
+    )
+    service = service_path.read_text(encoding="utf-8")
+    directives = [
+        line.strip()
+        for line in service.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert "ProtectHome=yes" in directives
+    assert "ReadWritePaths=/var/lib/vedaops-github/operations" in directives
+    assert not any("/home" in line or line.startswith("Bind") for line in directives)
+    assert not any(
+        line.startswith("ProtectHome=") and line != "ProtectHome=yes" for line in directives
+    )
+
+
+def test_declared_project_path_cannot_relocate_trusted_files(tmp_path: Path):
+    policy_path = _write_policy(tmp_path)
+    declared = policy_path.parent
+    checkout = tmp_path / "projects" / "alpha"
+    _chmod(declared, 0o755)
+    _chmod(policy_path, 0o644)
+    text = policy_path.read_text(encoding="utf-8").replace(str(checkout), str(declared), 1)
+    policy_path.write_text(text, encoding="utf-8")
+    _chmod(policy_path, 0o444)
+    _chmod(declared, 0o555)
+    with pytest.raises(GitHubPolicyError, match="VEDAOPS_GITHUB_TRUSTED_PATH_INSIDE_PROJECT"):
+        load_policy(policy_path)
 
 
 def test_secret_path_inside_a_project_is_rejected(tmp_path: Path):

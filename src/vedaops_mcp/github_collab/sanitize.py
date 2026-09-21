@@ -27,6 +27,8 @@ _SECRET_TEXT = re.compile(
     r"ghp_[A-Za-z0-9]{20,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|gho_[A-Za-z0-9]{20,}"
+    r"|ghs_[A-Za-z0-9]{20,}"
+    r"|ghu_[A-Za-z0-9]{20,}"
     r"|github_app_[A-Za-z0-9_]{20,}"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
     r"|Bearer [A-Za-z0-9._\-]{8,}"

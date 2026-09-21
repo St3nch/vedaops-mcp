@@ -14,7 +14,16 @@ _REPOSITORY = re.compile(r"https?://[^/]+/([^/]+)/([^/]+)/", re.IGNORECASE)
 
 
 class ProviderTransportError(Exception):
-    """A provider call was sent, or may have been sent, and no response came back."""
+    """The provider stream failed before a trustworthy terminal result arrived.
+
+    ``effect_possible`` is false only when this process established that the
+    request bytes were not written. A missing terminal record is not that proof.
+    """
+
+    def __init__(self, detail: str, *, effect_possible: bool = True) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.effect_possible = effect_possible
 
 
 class ProviderCallError(Exception):
@@ -108,7 +117,14 @@ class GitHubProvider(Protocol):
         state: str,
     ) -> list[PullView]: ...
 
-    def list_comments(self, owner: str, repo: str, number: int) -> list[CommentView]: ...
+    def list_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> list[CommentView]: ...
 
     def list_reviews(
         self,

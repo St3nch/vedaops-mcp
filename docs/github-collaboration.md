@@ -45,7 +45,11 @@ Authentication is GitHub App installation token mode (`--app-id`, `--app-install
 
 VedaOps calls `get_commit` with `detail=none`. `pull_request_read` is limited to its read methods: `get`, `get_diff`, `get_status`, `get_files`, `get_commits`, `get_review_comments`, `get_reviews`, `get_comments`, `get_check_runs`. `get_review_comments` pages with the upstream `after` cursor and `perPage`. An ordinary `page` value is rejected for that method and is not sent as a review-thread offset. The other read methods, including `get_reviews`, use `page` and `perPage`. `actions_list` is limited to `list_workflows`, `list_workflow_runs`, and `list_workflow_jobs`. Artifact listing, log download, and workflow dispatch are rejected before a provider call.
 
-`add_issue_comment` is used only after a pull request read succeeds, and only with a body. Reactions are not sent. `create_pull_request` is not given reviewers or `maintainer_can_modify`.
+`add_issue_comment` is used only after a pull request read succeeds, and only with a body. Reactions are not sent. `create_pull_request` is not given reviewers or `maintainer_can_modify`. Reviewer requests accept GitHub user logins only. `organization/team` syntax is rejected before a provider call. Team reviewer requests are unsupported in this slice.
+
+Pull request titles must be stable under the pinned server's plain-text read representation: no HTML tags, raw angle brackets, HTML entities, carriage returns, or invisible characters. Bodies and timeline comments are compared after the same invisible-character filter the pinned server applies in `sanitize.Content`. That match is visible content, not exact native GitHub bytes. A title or body that differs only by those filtered characters can satisfy the visible-content contract. The journal stores a SHA-256 and the length of a body, not the body text.
+
+Each provider request uses one 30 second deadline for the whole frame, not a fresh wait per read. The client bounds line size, content-length, and frame size. Pipe, framing, and JSON failures become transport errors. After a mutation may have been sent, those errors stay uncertain and are not retried. Free text that merely contains 401, 403, 404, or 422 is not proof that no effect occurred. The only no-effect tool error F008 treats as certain is a JSON object `{"effect":"none","status":401|403|404|422}`.
 
 ## Explicitly absent
 
@@ -92,11 +96,15 @@ Standing collaboration authority, after a later Product acceptance, is an operat
 
 ## Evidence and recovery
 
-Before a GitHub write, F008 fsyncs a started journal record under the operator journal directory with `effect_dispatched` true. The record includes the operation id, time, principal, project, repository, kind, target, expected source SHA, intention digest, authorization basis, and provider release/commit. The project path in that record is the operator-declared path, with `filesystem_verified` false. It does not store the comment or pull request body, and it does not store the private key.
+Before a GitHub write, F008 fsyncs a started journal record under the operator journal directory with `effect_dispatched` true. The record includes the operation id, time, principal, project, repository, kind, target, expected source SHA, intention digest, authorization basis, and provider release/commit. The project path in that record is the operator-declared path, with `filesystem_verified` false. Body evidence is a SHA-256 plus character and byte lengths. The record does not store pull request or comment body text, and it does not store the private key. Every required journal state for an accepted operation, including a terminal record with a bounded diagnostic, must fit in 8192 encoded bytes. Identity fields are not truncated to meet that ceiling.
+
+`effect_dispatched: true` means the provider call was attempted. It is not proof that no GitHub effect occurred. A dispatched record without a terminal state is unresolved and needs reconciliation. F008 does not retry the mutation.
+
+Comment verification reads `pull_request_read` method `get_comments` for at most five pages of 100 comments. If the returned comment id is found in that window and the visible body matches, the write is verified. If the window ends before a short page, the result stays uncertain and does not claim the comment is absent. A lost response can report a matching body only as unproven causality, and only when the bounded scan is complete.
 
 After the provider returns, F008 re-reads the native object. Success requires that re-read to match. A lost response or an ambiguous provider error is `uncertain`: the journal says an effect may have occurred, native state is inspected, a matching object is reported as `causality: unproven`, and the write is not retried. GitHub does not provide compare-and-swap for these writes. A head or base SHA that changes between the pre-read and the post-read is recorded as a limitation, not hidden.
 
-Pull request creation reads the live branch tip with `get_commit` and refuses to create when that SHA differs from `expected_head_sha`. A local remote-tracking ref is not consulted. Success, an already-open match, and uncertain-effect recovery all require the same intended state: head ref, head SHA, base ref, title, body, draft flag, and open state. An open pull request that differs in body or draft is not reported as already satisfied and is not reported as a successful create.
+Pull request creation reads the live branch tips with `get_commit` and refuses to create when the head SHA differs from `expected_head_sha`, or when a supplied `expected_base_sha` differs from the pre-read base SHA. A local remote-tracking ref is not consulted. Success, an already-open match, and uncertain-effect recovery all require the same intended state: head ref, head SHA, base ref, visible title, visible body, draft flag, and open state. When `expected_base_sha` is supplied, the post-effect base SHA must match it too; otherwise the result is uncertain and the create is not retried. When it is omitted, base movement between the pre-read and the post-read is reported as drift and is not treated as compare-and-swap. The record keeps the expected SHA, the pre-dispatch observation, and the post-effect observation as separate fields. An open pull request that differs in visible body, draft, or a supplied expected base SHA is not reported as already satisfied and is not reported as a successful create.
 
 Journal files are mode `0600` in a directory mode `0700`. They are evidence of VedaOps calls. GitHub remains authoritative for pull request state.
 
@@ -126,9 +134,11 @@ Templates that are not applied by this change:
 
 Do not `systemctl enable` the unit. It is a sandbox profile for a foreground stdio process. Creating the user, directories, App, or connector is host and GitHub administration and needs a separate CHAZ action.
 
-Disabling F008 is `enabled = false` in the operator policy, or not running `vedaops-github`. The Shadow tool catalog does not include these tools. Removing the package does not remove Orient, Inspect, Change, or Check.
+Disabling F008 is `enabled = false` in the operator policy, then stopping or restarting the F008 process so it loads that file. Editing the file does not change a policy object already loaded by a running process. The Shadow tool catalog does not include these tools. Removing the package does not remove Orient, Inspect, Change, or Check.
 
-Revocation is: set `enabled = false`, stop any F008 process, delete or shred `/etc/vedaops-github/app.pem`, and uninstall or suspend the GitHub App installation in GitHub. Suspended installation tokens stop working on their own expiry as well. Shadow keeps running. The journal can remain for evidence; it does not contain the key.
+Revocation is: set `enabled = false`, stop the F008 process, delete or shred `/etc/vedaops-github/app.pem`, and uninstall or suspend the GitHub App installation in GitHub. Suspended installation tokens stop working on their own expiry as well. Deleting or replacing the key file does not prove that an already-running child has discarded a cached token or key. Shadow keeps running. The journal can remain for evidence; it does not contain the key.
+
+A later reconstruction should keep the policy file whose SHA the journal names, the installed executable and its recorded digest, the launcher and sandbox settings that were actually used, the operation journal, and the native GitHub object URL or number. A digest of a discarded policy is not enough to reconstruct the grant. This is operator evidence retention, not a second pull request database.
 
 ## Local commands
 
@@ -166,7 +176,7 @@ Run this once, against the configured App, after the setup above. Do not treat i
 
 1. `github_server_info` shows release `v1.12.2`, commit `85598ba6…`, feature `pull_requests_granular`, and `shadow_coupled: false`.
 2. The child initialize version and `validate-catalog` agree with the allowlist. `merge_pull_request` is absent. Independently hash the installed executable and confirm it matches `executable_sha256`. The child's version string is not that proof.
-3. `github_identity_get` on an authorized repository reports the App id and installation id. `get_me` may be unavailable for an installation token; that is a limitation, not success.
+3. `github_identity_get` on an authorized repository reports the configured App id and installation id separately from any actor `get_me` observed. Configured values are not proof of which identity authenticated the native request. `get_me` may be unavailable for an installation token; that is a limitation, not success.
 4. The same read against a repository that is not granted returns a denial and does not call the provider for that repository.
 5. `github_commit_get` on the published head branch returns the live SHA. Compare it with the intended candidate. A local remote-tracking ref is not the source.
 6. One authorized write inside Pull requests write, such as a title update, a reviewer request, or one timeline comment, on a pull request CHAZ has designated for the tracer. Record the journal file before the call if you are watching the directory, then the terminal record and the re-read native state, including body and draft when the operation set them.

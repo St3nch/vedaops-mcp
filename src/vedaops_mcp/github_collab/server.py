@@ -260,7 +260,7 @@ def build_github_server(
         number: int,
         reviewers: list[str],
     ) -> dict[str, Any]:
-        """Request reviewers. This does not approve, request changes, or comment as a review."""
+        """Request GitHub user reviewers. Team reviewers are unsupported in this slice."""
         return request_reviewers(
             policy,
             provider,

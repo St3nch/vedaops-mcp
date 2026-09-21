@@ -26,6 +26,7 @@ from vedaops_mcp.github_collab.policy import (
 )
 
 MAX_OPERATION_RECORD_BYTES = 8192
+_TERMINAL_DETAIL_BUDGET = 500
 
 
 def _timestamp() -> str:
@@ -67,8 +68,50 @@ def _journal_directory(policy: GitHubPolicy) -> Path:
     return root
 
 
+def record_bytes(payload: dict[str, object]) -> bytes:
+    return (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+
+
+def assert_journal_states_fit(started: dict[str, object]) -> None:
+    """Reject an operation whose required journal states cannot fit.
+
+    The ceiling is the encoded record, not the provider body. Identity fields
+    are not truncated to make a record fit.
+    """
+    terminal = dict(started)
+    terminal.update(
+        {
+            "state": "uncertain",
+            "terminal_at": "2026-09-21T00:00:00Z",
+            "dispatched_at": "2026-09-21T00:00:00Z",
+            "effect_dispatched": True,
+            "may_have_occurred": True,
+            "detail": "x" * _TERMINAL_DETAIL_BUDGET,
+            "native_id": "1" * 20,
+            "native_url": "https://github.com/example-org/example-repo/pull/1000000000",
+            "observed_after": {
+                "pull_number": 1_000_000_000,
+                "pre_observed_head_sha": "a" * 40,
+                "pre_observed_base_sha": "b" * 40,
+                "post_observed_head_sha": "c" * 40,
+                "post_observed_base_sha": "d" * 40,
+                "expected_head_sha": "e" * 40,
+                "expected_base_sha": "f" * 40,
+                "comment_id": "1" * 20,
+                "body_sha256": "a" * 64,
+            },
+        }
+    )
+    for payload in (started, terminal):
+        if len(record_bytes(payload)) > MAX_OPERATION_RECORD_BYTES:
+            raise GitHubPolicyError(
+                "VEDAOPS_OPERATION_RECORD_UNAVAILABLE",
+                "durable operation evidence would exceed its record ceiling",
+            )
+
+
 def _write_record(path: Path, payload: dict[str, object]) -> None:
-    raw = (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+    raw = record_bytes(payload)
     if len(raw) > MAX_OPERATION_RECORD_BYTES:
         raise GitHubPolicyError(
             "VEDAOPS_OPERATION_RECORD_UNAVAILABLE",
@@ -202,5 +245,6 @@ def start_github_operation(
     }
     if expected_source_sha is not None:
         payload["expected_source_sha"] = expected_source_sha
+    assert_journal_states_fit(payload)
     _write_record(path, payload)
     return GitHubJournal(path=path, payload=payload)

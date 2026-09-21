@@ -7,9 +7,11 @@ shell and it does not forward the upstream catalog to the caller.
 from __future__ import annotations
 
 import json
+import os
 import select
 import subprocess
 import threading
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -38,8 +40,12 @@ from vedaops_mcp.github_collab.provider import (
 )
 from vedaops_mcp.github_collab.sanitize import scrub_text
 
-_CALL_TIMEOUT_SECONDS = 30
+_CALL_DEADLINE_SECONDS = 30
 _MAX_STDERR_BYTES = 4096
+_MAX_LINE_BYTES = 65_536
+_MAX_FRAME_BYTES = 1_048_576
+_MAX_HEADER_LINES = 32
+_MAX_UNRELATED_MESSAGES = 32
 
 
 class StdioGitHubProvider:
@@ -58,6 +64,9 @@ class StdioGitHubProvider:
             env=self._plan.env,
             cwd=self._plan.env["HOME"],
         )
+        if self._process.stdout is not None:
+            os.set_blocking(self._process.stdout.fileno(), False)
+        self._stdout_buffer = bytearray()
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
         try:
@@ -175,10 +184,25 @@ class StdioGitHubProvider:
             raise ProviderCallError("pull request list was not a list", effect_uncertain=True)
         return [parse_pull(item) for item in payload]
 
-    def list_comments(self, owner: str, repo: str, number: int) -> list[CommentView]:
+    def list_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> list[CommentView]:
         payload = self._tool(
             "pull_request_read",
-            {"method": "get_comments", "owner": owner, "repo": repo, "pullNumber": number},
+            pull_request_read_arguments(
+                owner,
+                repo,
+                number,
+                "get_comments",
+                page,
+                per_page,
+                None,
+            ),
         )
         return parse_comments(payload)
 
@@ -288,14 +312,24 @@ class StdioGitHubProvider:
         )
 
     def _tool(self, name: str, arguments: Mapping[str, Any]) -> object:
-        result = self._request("tools/call", {"name": name, "arguments": dict(arguments)})
+        try:
+            result = self._request("tools/call", {"name": name, "arguments": dict(arguments)})
+        except ProviderTransportError:
+            raise
+        except ProviderCallError:
+            raise
+        except (OSError, json.JSONDecodeError, UnicodeError, ValueError) as exc:
+            raise ProviderTransportError(
+                "provider transport failed",
+                effect_possible=True,
+            ) from exc
         if not isinstance(result, dict):
             raise ProviderCallError("provider tool result was not an object", effect_uncertain=True)
         text = _content_text(result)
         if result.get("isError") is True:
             raise ProviderCallError(
-                text or "provider tool failed",
-                effect_uncertain=_uncertain(text),
+                _safe(text or "provider tool failed"),
+                effect_uncertain=not _explicit_no_effect(text),
             )
         if not text:
             raise ProviderCallError("provider tool result was empty", effect_uncertain=True)
@@ -304,13 +338,14 @@ class StdioGitHubProvider:
             try:
                 return json.loads(text)
             except json.JSONDecodeError as exc:
-                raise ProviderCallError(
+                raise ProviderTransportError(
                     "provider tool result was not valid JSON",
-                    effect_uncertain=True,
+                    effect_possible=True,
                 ) from exc
         return text
 
     def _request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+        deadline = time.monotonic() + _CALL_DEADLINE_SECONDS
         with self._lock:
             request_id = self._next_id
             self._next_id += 1
@@ -322,9 +357,16 @@ class StdioGitHubProvider:
                     "params": dict(params),
                 }
             )
+            skipped = 0
             while True:
-                message = self._read_message()
+                message = self._read_message(deadline)
                 if message.get("id") != request_id:
+                    skipped += 1
+                    if skipped > _MAX_UNRELATED_MESSAGES:
+                        raise ProviderTransportError(
+                            "provider sent too many unrelated messages",
+                            effect_possible=True,
+                        )
                     continue
                 if "error" in message:
                     raise ProviderCallError(
@@ -346,40 +388,112 @@ class StdioGitHubProvider:
     def _send(self, message: Mapping[str, Any]) -> None:
         stdin = self._process.stdin
         if stdin is None or self._process.poll() is not None:
-            raise ProviderTransportError("provider process is not running")
-        stdin.write(json.dumps(message).encode() + b"\n")
-        stdin.flush()
+            raise ProviderTransportError(
+                "provider process is not running",
+                effect_possible=False,
+            )
+        try:
+            stdin.write(json.dumps(message).encode() + b"\n")
+            stdin.flush()
+        except BrokenPipeError as exc:
+            raise ProviderTransportError(
+                "provider pipe closed during request",
+                effect_possible=True,
+            ) from exc
+        except OSError as exc:
+            raise ProviderTransportError(
+                "provider pipe failed during request",
+                effect_possible=True,
+            ) from exc
 
-    def _read_message(self) -> dict[str, Any]:
-        line = self._readline()
+    def _read_message(self, deadline: float) -> dict[str, Any]:
+        try:
+            line = self._readline(deadline)
+        except (OSError, ValueError) as exc:
+            raise ProviderTransportError(
+                "provider frame failed",
+                effect_possible=True,
+            ) from exc
         if line.lower().startswith(b"content-length:"):
-            length = int(line.split(b":", 1)[1].strip())
+            length = _content_length(line)
+            headers = 0
             while True:
-                header = self._readline()
+                header = self._readline(deadline)
+                headers += 1
+                if headers > _MAX_HEADER_LINES:
+                    raise ProviderTransportError(
+                        "provider frame header is too large",
+                        effect_possible=True,
+                    )
                 if header in {b"\n", b"\r\n"}:
                     break
-            stdout = self._process.stdout
-            if stdout is None:
-                raise ProviderTransportError("provider stdout closed")
-            payload = stdout.read(length)
-            message = json.loads(payload)
+            payload = self._read_exact(length, deadline)
+            try:
+                message = json.loads(payload)
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise ProviderTransportError(
+                    "provider frame was not valid JSON",
+                    effect_possible=True,
+                ) from exc
         else:
-            message = json.loads(line)
+            try:
+                message = json.loads(line)
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise ProviderTransportError(
+                    "provider message was not valid JSON",
+                    effect_possible=True,
+                ) from exc
         if not isinstance(message, dict):
-            raise ProviderCallError("provider message was not an object", effect_uncertain=True)
+            raise ProviderTransportError(
+                "provider message was not an object",
+                effect_possible=True,
+            )
         return message
 
-    def _readline(self) -> bytes:
+    def _readline(self, deadline: float) -> bytes:
+        while True:
+            newline = self._stdout_buffer.find(b"\n")
+            if newline >= 0:
+                if newline > _MAX_LINE_BYTES:
+                    raise ProviderTransportError(
+                        "provider line exceeded the size limit",
+                        effect_possible=True,
+                    )
+                line = bytes(self._stdout_buffer[: newline + 1])
+                del self._stdout_buffer[: newline + 1]
+                return line
+            if len(self._stdout_buffer) > _MAX_LINE_BYTES:
+                raise ProviderTransportError(
+                    "provider line exceeded the size limit",
+                    effect_possible=True,
+                )
+            chunk = self._read_available(deadline)
+            self._stdout_buffer.extend(chunk)
+
+    def _read_exact(self, length: int, deadline: float) -> bytes:
+        while len(self._stdout_buffer) < length:
+            self._stdout_buffer.extend(self._read_available(deadline))
+        payload = bytes(self._stdout_buffer[:length])
+        del self._stdout_buffer[:length]
+        return payload
+
+    def _read_available(self, deadline: float) -> bytes:
         stdout = self._process.stdout
         if stdout is None:
-            raise ProviderTransportError("provider stdout closed")
-        ready, _, _ = select.select([stdout], [], [], _CALL_TIMEOUT_SECONDS)
+            raise ProviderTransportError("provider stdout closed", effect_possible=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderTransportError("provider timed out", effect_possible=True)
+        ready, _, _ = select.select([stdout], [], [], remaining)
         if not ready:
-            raise ProviderTransportError("provider timed out")
-        line = stdout.readline()
-        if not line:
-            raise ProviderTransportError("provider stdout closed")
-        return line
+            raise ProviderTransportError("provider timed out", effect_possible=True)
+        try:
+            chunk = os.read(stdout.fileno(), 65536)
+        except BlockingIOError:
+            return b""
+        if not chunk:
+            raise ProviderTransportError("provider stdout closed", effect_possible=True)
+        return chunk
 
     def _drain_stderr(self) -> None:
         stderr = self._process.stderr
@@ -432,19 +546,34 @@ def _content_text(result: Mapping[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _uncertain(text: str) -> bool:
-    lowered = text.lower()
-    certain = (
-        " 401",
-        " 403",
-        " 404",
-        " 422",
-        "status 401",
-        "status 403",
-        "status 404",
-        "status 422",
-    )
-    return not any(marker in lowered for marker in certain)
+def _content_length(line: bytes) -> int:
+    try:
+        raw = line.split(b":", 1)[1].strip()
+        if not raw or raw != raw.strip() or not raw.isdigit():
+            raise ValueError
+        length = int(raw)
+    except (IndexError, ValueError) as exc:
+        raise ProviderTransportError(
+            "provider content-length is malformed",
+            effect_possible=True,
+        ) from exc
+    if length < 0 or length > _MAX_FRAME_BYTES:
+        raise ProviderTransportError(
+            "provider frame exceeds the size limit",
+            effect_possible=True,
+        )
+    return length
+
+
+def _explicit_no_effect(text: str) -> bool:
+    """True only for an explicit structured rejection, not a status substring."""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("effect") == "none" and payload.get("status") in {401, 403, 404, 422}
 
 
 def _safe(value: str) -> str:

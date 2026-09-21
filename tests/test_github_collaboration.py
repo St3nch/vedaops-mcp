@@ -27,9 +27,11 @@ from vedaops_mcp.github_collab.errors import (
     GitHubPolicyError,
     GitHubProviderError,
 )
+from vedaops_mcp.github_collab.evidence import GitHubJournal
 from vedaops_mcp.github_collab.launcher import launch_plan, validate_artifact
 from vedaops_mcp.github_collab.mcp_client import (
     StdioGitHubProvider,
+    _explicit_no_effect,
     pull_request_read_arguments,
 )
 from vedaops_mcp.github_collab.operations import (
@@ -40,6 +42,7 @@ from vedaops_mcp.github_collab.operations import (
     read_identity,
     read_pull_request,
     request_reviewers,
+    update_pull_request_body,
     update_pull_request_title,
 )
 from vedaops_mcp.github_collab.policy import (
@@ -58,6 +61,7 @@ from vedaops_mcp.github_collab.provider import (
     pull_number_from_url,
 )
 from vedaops_mcp.github_collab.server import build_github_server, tool_catalog
+from vedaops_mcp.github_collab.text_contract import title_is_stable, visible_content
 from vedaops_mcp.server import TOOL_CATALOG, build_server
 from vedaops_mcp.settings import Settings
 
@@ -156,9 +160,18 @@ class FakeGitHub:
             if item["state"] == state and item["head_ref"] == head.split(":", 1)[1]
         ]
 
-    def list_comments(self, owner: str, repo: str, number: int) -> list:
-        self.calls.append(("list_comments", number))
-        return [item for item in self.comments if item["pull_number"] == number]
+    def list_comments(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> list:
+        self.calls.append(("list_comments", number, page, per_page))
+        items = [item for item in self.comments if item["pull_number"] == number]
+        start = (page - 1) * per_page
+        return items[start : start + per_page]
 
     def list_reviews(
         self,
@@ -220,7 +233,7 @@ class FakeGitHub:
     def update_pull_request_body(self, owner: str, repo: str, number: int, body: str) -> dict:
         self.calls.append("update_pull_request_body")
         pull = self.get_pull_request(owner, repo, number)
-        pull["body"] = body
+        pull["body"] = visible_content(body)
         return {"id": str(number), "url": pull["html_url"]}
 
     def add_pull_request_comment(self, owner: str, repo: str, number: int, body: str) -> dict:
@@ -230,7 +243,7 @@ class FakeGitHub:
             self.comments.append(
                 {
                     "id": "55",
-                    "body": body,
+                    "body": visible_content(body),
                     "html_url": f"https://github.com/{owner}/{repo}/pull/{number}#issuecomment-55",
                     "user_login": "example-app[bot]",
                     "created_at": "2099-01-01T00:00:00Z",
@@ -240,7 +253,7 @@ class FakeGitHub:
             raise ProviderTransportError("connection reset")
         comment = {
             "id": "55",
-            "body": body,
+            "body": visible_content(body),
             "html_url": f"https://github.com/{owner}/{repo}/pull/{number}#issuecomment-55",
             "user_login": "example-app[bot]",
             "created_at": "2099-01-01T00:00:00Z",
@@ -269,7 +282,7 @@ class FakeGitHub:
         pull = {
             "number": self.next_number,
             "title": title,
-            "body": body,
+            "body": visible_content(body),
             "state": "open",
             "draft": draft,
             "html_url": f"https://github.com/{owner}/{repo}/pull/{self.next_number}",
@@ -913,8 +926,11 @@ def test_title_update_rereads_and_review_request_does_not_submit_review(tmp_path
         method="get_reviews",
     )
     by_login = {item["user_login"]: item for item in reviews["native"]["reviews"]}
-    assert by_login["example-app[bot]"]["independent"] is False
-    assert by_login["reviewer"]["independent"] is True
+    assert by_login["example-app[bot]"]["provider_identity_match"] is True
+    assert by_login["example-app[bot]"]["native_actor_distinct_from_provider"] is False
+    assert by_login["reviewer"]["provider_identity_match"] is False
+    assert by_login["reviewer"]["native_actor_distinct_from_provider"] is True
+    assert "independent" not in by_login["reviewer"]
     assert by_login["reviewer"]["product_acceptance"] is False
 
 
@@ -986,8 +1002,10 @@ def test_identity_reports_app_installation_without_calling_shadow_grants(tmp_pat
         project_id="alpha",
         github_repository="example-org/alpha",
     )
-    assert result["native"]["app_id"] == "123456"
-    assert result["native"]["installation_id"] == "7891011"
+    assert result["native"]["configured_app_id"] == "123456"
+    assert result["native"]["configured_installation_id"] == "7891011"
+    assert result["native"]["provider_observed_actor"]["unavailable"] is True
+    assert "configured App identity is not proof" in " ".join(result["limitations"])
     assert "installation_token_may_have_no_user" in result["limitations"]
     with pytest.raises(GitHubPolicyError, match="VEDAOPS_GITHUB_IDENTITY_UNAVAILABLE"):
         principal_from_environ({"VEDAOPS_AGENT_ID": PRINCIPAL})
@@ -1458,3 +1476,522 @@ projects = {{ "shadow-project" = ["read"] }}
         encoding="utf-8",
     )
     return registry
+
+
+def _body_journal(policy) -> str:
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in policy.journal_directory.glob("*.json")
+    )
+
+
+def test_body_evidence_omits_plaintext_and_fits_the_record(tmp_path: Path):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="old",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    body = "b" * 16384
+    canary = "ghs_CANARYTOKENVALUE1234567890"
+    secret_body = f"note {canary} end"
+    updated = update_pull_request_body(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        body=body,
+    )
+    assert updated["outcome"] == "succeeded"
+    journal = _body_journal(policy)
+    assert body not in journal
+    assert "body_sha256" in journal
+    assert len(journal.encode()) < 8192
+    for record in policy.journal_directory.glob("*.json"):
+        record.unlink()
+    quoted = '"' * 9000 + "héllo\u200b"
+    expanded = update_pull_request_body(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        body=quoted,
+    )
+    assert expanded["outcome"] == "succeeded"
+    uncertain = update_pull_request_body(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        body=secret_body,
+    )
+    provider.transport_on = None
+    lost = FakeGitHub(policy.journal_directory)
+    lost._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="old",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+
+    def _lose(*_args, **_kwargs):
+        raise ProviderCallError(f"failed {canary}", effect_uncertain=True)
+
+    lost.update_pull_request_body = _lose  # type: ignore[method-assign]
+    recovered = update_pull_request_body(
+        policy,
+        lost,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        body=secret_body,
+    )
+    assert recovered["outcome"] == "uncertain"
+    assert recovered["uncertainty"]["retry_performed"] is False
+    combined = _body_journal(policy)
+    assert canary not in combined
+    assert secret_body not in combined
+    assert quoted not in combined
+    assert uncertain["outcome"] == "succeeded"
+
+
+def test_terminal_journal_failure_after_dispatch_stays_unresolved(tmp_path: Path, monkeypatch):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="old",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    original = GitHubJournal.terminal
+
+    def _fail_terminal(self, state, **details):
+        if self.payload.get("effect_dispatched"):
+            from vedaops_mcp.github_collab.errors import GitHubPolicyError
+
+            raise GitHubPolicyError(
+                "VEDAOPS_OPERATION_RECORD_UNCERTAIN",
+                "terminal evidence failed",
+            )
+        return original(self, state, **details)
+
+    monkeypatch.setattr(GitHubJournal, "terminal", _fail_terminal)
+    result = update_pull_request_body(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        body="replacement",
+    )
+    assert result["outcome"] == "uncertain"
+    assert result["effect_dispatched"] is True
+    assert result["uncertainty"]["retry_performed"] is False
+    assert result["code"] == "VEDAOPS_OPERATION_RECORD_UNCERTAIN"
+
+
+def test_visible_content_contract_and_reviewer_identity(tmp_path: Path):
+    assert visible_content("left\u200b right") == "left right"
+    assert title_is_stable("can't \"quote\" AT&T")
+    assert not title_is_stable("<b>bold</b>")
+    assert not title_is_stable("Hello\u200b")
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    with pytest.raises(GitHubPolicyError, match="not stable"):
+        create_pull_request(
+            policy,
+            provider,
+            principal_id=PRINCIPAL,
+            project_id="alpha",
+            github_repository="example-org/alpha",
+            head="feature",
+            base="main",
+            expected_head_sha=HEAD,
+            title="<b>bold</b>",
+        )
+    assert "create_pull_request" not in provider.calls
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="HelloWorld",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    existing = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="Hello\u200bWorld",
+    )
+    assert existing["outcome"] == "existing"
+    assert "create_pull_request" not in provider.calls
+    with pytest.raises(GitHubPolicyError, match="team reviewers are unsupported"):
+        request_reviewers(
+            policy,
+            provider,
+            principal_id=PRINCIPAL,
+            project_id="alpha",
+            github_repository="example-org/alpha",
+            number=7,
+            reviewers=["example-org/team"],
+        )
+    assert not any(
+        isinstance(call, tuple) and call[0] == "request_reviewers" for call in provider.calls
+    )
+    provider.reviews = [
+        {
+            "id": "1",
+            "state": "COMMENTED",
+            "body": "",
+            "html_url": "https://github.com/example-org/alpha/pull/7#pullrequestreview-1",
+            "user_login": "Example-App[bot]",
+            "commit_id": OTHER,
+        },
+        {
+            "id": "2",
+            "state": "COMMENTED",
+            "body": "",
+            "html_url": "https://github.com/example-org/alpha/pull/7#pullrequestreview-2",
+            "user_login": None,
+            "commit_id": HEAD,
+        },
+    ]
+    reviews = read_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        method="get_reviews",
+    )
+    by_id = {item["id"]: item for item in reviews["native"]["reviews"]}
+    assert by_id["1"]["provider_identity_match"] is True
+    assert by_id["1"]["commit_id"] == OTHER
+    assert by_id["2"]["provider_identity_match"] == "unknown"
+    assert by_id["2"]["native_actor_distinct_from_provider"] == "unknown"
+
+
+def test_base_sha_is_part_of_the_create_subject(tmp_path: Path):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="body",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    provider.pulls[0]["base_sha"] = OTHER
+    existing = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        expected_base_sha=BASE,
+        title="Candidate",
+        body="body",
+    )
+    assert existing["outcome"] == "failed"
+    assert existing["code"] == "open_pull_request_exists"
+    assert "create_pull_request" not in provider.calls
+    provider.pulls.clear()
+
+    def _move_base(*_args, **kwargs):
+        pull = provider._add_pull(
+            "example-org",
+            "alpha",
+            title=kwargs["title"],
+            body=kwargs["body"],
+            head=kwargs["head"],
+            base=kwargs["base"],
+            draft=kwargs["draft"],
+        )
+        pull["base_sha"] = OTHER
+        return {"id": str(pull["number"]), "url": pull["html_url"]}
+
+    provider.create_pull_request = _move_base  # type: ignore[method-assign]
+    drifted = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        expected_base_sha=BASE,
+        title="Candidate",
+        body="body",
+    )
+    assert drifted["outcome"] == "uncertain"
+    assert drifted["uncertainty"]["retry_performed"] is False
+    assert drifted["subject"]["pre_observed_base_sha"] == BASE
+    assert drifted["subject"]["post_observed_base_sha"] == OTHER
+    assert drifted["subject"]["expected_base_sha"] == BASE
+    for record in policy.journal_directory.glob("*.json"):
+        record.unlink()
+    provider.pulls.clear()
+    provider.base_sha = BASE
+
+    def _move_without_expectation(*_args, **kwargs):
+        pull = provider._add_pull(
+            "example-org",
+            "alpha",
+            title=kwargs["title"],
+            body=kwargs["body"],
+            head=kwargs["head"],
+            base=kwargs["base"],
+            draft=kwargs["draft"],
+        )
+        pull["base_sha"] = OTHER
+        return {"id": str(pull["number"]), "url": pull["html_url"]}
+
+    provider.create_pull_request = _move_without_expectation  # type: ignore[method-assign]
+    noted = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="body",
+    )
+    assert noted["outcome"] == "succeeded"
+    assert "base SHA changed" in " ".join(noted["limitations"])
+    assert noted["subject"]["expected_base_sha"] is None
+    assert noted["subject"]["post_observed_base_sha"] == OTHER
+
+
+def test_comment_verification_walks_bounded_pages(tmp_path: Path):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    for index in range(100):
+        provider.comments.append(
+            {
+                "id": str(index),
+                "body": "old",
+                "html_url": "https://github.com/example-org/alpha/pull/7#issuecomment-1",
+                "user_login": "example-app[bot]",
+                "created_at": "2000-01-01T00:00:00Z",
+                "pull_number": 7,
+            }
+        )
+
+    def _comment_on_second_page(*_args, **_kwargs):
+        provider.comments.append(
+            {
+                "id": "later",
+                "body": visible_content("noted"),
+                "html_url": "https://github.com/example-org/alpha/pull/7#issuecomment-later",
+                "user_login": "example-app[bot]",
+                "created_at": "2099-01-01T00:00:00Z",
+                "pull_number": 7,
+            }
+        )
+        return {
+            "id": "later",
+            "url": "https://github.com/example-org/alpha/pull/7#issuecomment-later",
+        }
+
+    provider.add_pull_request_comment = _comment_on_second_page  # type: ignore[method-assign]
+    posted = add_pull_request_comment(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        body="noted",
+    )
+    assert posted["outcome"] == "succeeded"
+    comment_pages = [call for call in provider.calls if call[0] == "list_comments"]
+    assert any(call[1] == 7 and call[2] == 2 for call in comment_pages)
+
+
+def _handshake_script(mode: str) -> str:
+    tools = json.dumps(list(PROVIDER_TOOLS))
+    return f"""#!/usr/bin/env python3
+import json, sys
+MODE = {mode!r}
+TOOLS = {tools}
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\\n")
+    sys.stdout.flush()
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "notifications/initialized":
+        continue
+    request_id = message.get("id")
+    if method == "initialize":
+        send({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{
+                "protocolVersion": "2024-11-05",
+                "capabilities": {{"tools": {{}}}},
+                "serverInfo": {{"name": "github-mcp-server", "version": {PROVIDER_RELEASE!r}}},
+            }},
+        }})
+    elif method == "tools/list":
+        send({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{"tools": [{{"name": name}} for name in TOOLS]}},
+        }})
+    elif method == "tools/call":
+        if MODE == "eof":
+            break
+        if MODE == "malformed":
+            sys.stdout.write("{{not-json\\n")
+            sys.stdout.flush()
+            break
+        if MODE == "length":
+            sys.stdout.write("Content-Length: no\\r\\n\\r\\n")
+            sys.stdout.flush()
+            break
+        if MODE == "huge":
+            sys.stdout.write("Content-Length: 99999999\\r\\n\\r\\n")
+            sys.stdout.flush()
+            break
+        if MODE == "notice":
+            send({{"jsonrpc": "2.0", "method": "notifications/message", "params": {{}}}})
+        text = "validation failed status 422"
+        if MODE == "explicit":
+            text = json.dumps({{"effect": "none", "status": 422}})
+        if MODE == "notice":
+            text = json.dumps({{"sha": "{HEAD}", "html_url": "https://github.com/example-org/alpha/commit/{HEAD}"}})
+        send({{
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {{
+                "content": [{{"type": "text", "text": text}}],
+                "isError": MODE != "notice",
+            }},
+        }})
+        break
+"""
+
+
+def test_stdio_transport_failures_are_normalized(tmp_path: Path):
+    assert _explicit_no_effect('{"effect":"none","status":422}')
+    assert not _explicit_no_effect("validation failed status 422")
+
+    def _script(source: str) -> Path:
+        path = tmp_path / f"server-{len(list(tmp_path.iterdir()))}.py"
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    early = _script("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+    policy, _path = _policy(tmp_path / "early", binary=early)
+    with pytest.raises(ProviderTransportError):
+        StdioGitHubProvider(policy)
+
+    partial = _script(
+        "#!/usr/bin/env python3\n"
+        "import sys, time\n"
+        "sys.stdout.write('{')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    )
+    policy, _path = _policy(tmp_path / "partial", binary=partial)
+    from vedaops_mcp.github_collab import mcp_client as client_module
+
+    original = client_module._CALL_DEADLINE_SECONDS
+    client_module._CALL_DEADLINE_SECONDS = 0.2
+    try:
+        with pytest.raises(ProviderTransportError, match="timed out"):
+            StdioGitHubProvider(policy)
+    finally:
+        client_module._CALL_DEADLINE_SECONDS = original
+
+    for mode in ("eof", "malformed", "length", "huge"):
+        binary = _script(_handshake_script(mode))
+        mode_policy, _path = _policy(tmp_path / mode, binary=binary)
+        provider = StdioGitHubProvider(mode_policy)
+        try:
+            with pytest.raises(ProviderTransportError):
+                provider.get_commit("example-org", "alpha", HEAD)
+        finally:
+            provider.close()
+
+    notice = _script(_handshake_script("notice"))
+    notice_policy, _path = _policy(tmp_path / "notice", binary=notice)
+    provider = StdioGitHubProvider(notice_policy)
+    try:
+        assert provider.get_commit("example-org", "alpha", HEAD)["sha"] == HEAD
+    finally:
+        provider.close()
+
+    explicit = _script(_handshake_script("explicit"))
+    explicit_policy, _path = _policy(tmp_path / "explicit", binary=explicit)
+    provider = StdioGitHubProvider(explicit_policy)
+    try:
+        with pytest.raises(ProviderCallError) as caught:
+            provider.get_commit("example-org", "alpha", HEAD)
+        assert caught.value.effect_uncertain is False
+    finally:
+        provider.close()
+
+    textual = _script(_handshake_script("textual"))
+    textual_policy, _path = _policy(tmp_path / "textual", binary=textual)
+    provider = StdioGitHubProvider(textual_policy)
+    try:
+        with pytest.raises(ProviderCallError) as caught:
+            provider.get_commit("example-org", "alpha", HEAD)
+        assert caught.value.effect_uncertain is True
+        assert "422" not in caught.value.detail or "status 422" in caught.value.detail
+    finally:
+        provider.close()

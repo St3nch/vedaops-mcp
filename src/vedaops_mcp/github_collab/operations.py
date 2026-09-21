@@ -32,13 +32,18 @@ from vedaops_mcp.github_collab.provider import (
     url_repository,
 )
 from vedaops_mcp.github_collab.sanitize import scrub_payload, scrub_text
+from vedaops_mcp.github_collab.text_contract import (
+    TEXT_COMPARISON_LIMITATION,
+    texts_match,
+    title_is_stable,
+)
 
 _SHA = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
-_REVIEWER = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99})?$"
-)
+_REVIEWER = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _NOT_PRODUCT_ACCEPTANCE = "native GitHub state is not Product acceptance"
+_COMMENT_PAGE_LIMIT = 5
+_COMMENT_PER_PAGE = 100
 
 
 def read_identity(
@@ -76,15 +81,19 @@ def read_identity(
         project=project,
         repository=project.repository,
         outcome="succeeded",
-        subject={"provider_login": identity.get("login")},
+        subject={"provider_observed_login": identity.get("login")},
         native={
-            "app_id": policy.app_id,
-            "installation_id": policy.installation_id,
+            "configured_app_id": policy.app_id,
+            "configured_installation_id": policy.installation_id,
+            "configured_provider_login": policy.provider_login,
             "provider_release": policy.release,
             "provider_commit": policy.commit,
-            "identity": identity,
+            "provider_observed_actor": identity,
         },
-        limitations=limitations,
+        limitations=[
+            *limitations,
+            "configured App identity is not proof of the actor that authenticated a native request",
+        ],
     )
 
 
@@ -156,7 +165,8 @@ def read_pull_request(
             subject={"pull_number": pull_number},
             native={"reviews": annotated},
             limitations=[
-                "a review author matching the provider login is not an independent reviewer",
+                "a provider-identity match cannot satisfy independent review",
+                "a different GitHub login does not establish independent review",
                 "review state is not Product acceptance",
             ],
         )
@@ -276,7 +286,7 @@ def create_pull_request(
         )
     expected = _sha(expected_head_sha)
     expected_base = _sha(expected_base_sha) if expected_base_sha is not None else None
-    title_text = _title(title)
+    title_text = _stable_title(title)
     body_text = _body(body, allow_empty=True)
     if not isinstance(draft, bool):
         raise GitHubPolicyError("VEDAOPS_GITHUB_SUBJECT_INVALID", "draft must be a boolean")
@@ -302,6 +312,11 @@ def create_pull_request(
         "head": head_branch,
         "observed_base_sha": base_sha,
         "observed_head_sha": head_sha,
+        "pre_observed_base_sha": base_sha,
+        "pre_observed_head_sha": head_sha,
+        "expected_head_sha": expected,
+        "expected_base_sha": expected_base,
+        **_body_evidence(body_text),
     }
     if head_sha != expected or (expected_base is not None and base_sha != expected_base):
         journal = _start(
@@ -351,6 +366,7 @@ def create_pull_request(
             if _create_matches(
                 item,
                 expected_head_sha=expected,
+                expected_base_sha=expected_base,
                 title=title_text,
                 body=body_text,
                 draft=draft,
@@ -415,10 +431,7 @@ def create_pull_request(
             draft=draft,
         )
     except (ProviderTransportError, ProviderCallError) as exc:
-        uncertain = isinstance(exc, ProviderTransportError) or (
-            isinstance(exc, ProviderCallError) and exc.effect_uncertain
-        )
-        if not uncertain:
+        if not _effect_may_have_occurred(exc):
             return _fail_response(journal, project, "pr_create", target, exc)
         return _recover_create(
             journal,
@@ -426,6 +439,7 @@ def create_pull_request(
             project,
             target=target,
             expected_head_sha=expected,
+            expected_base_sha=expected_base,
             title=title_text,
             body=body_text,
             draft=draft,
@@ -441,6 +455,7 @@ def create_pull_request(
             project,
             target=target,
             expected_head_sha=expected,
+            expected_base_sha=expected_base,
             title=title_text,
             body=body_text,
             draft=draft,
@@ -457,6 +472,7 @@ def create_pull_request(
             project,
             target=target,
             expected_head_sha=expected,
+            expected_base_sha=expected_base,
             title=title_text,
             body=body_text,
             draft=draft,
@@ -467,6 +483,7 @@ def create_pull_request(
     if not _create_matches(
         observed,
         expected_head_sha=expected,
+        expected_base_sha=expected_base,
         title=title_text,
         body=body_text,
         draft=draft,
@@ -485,29 +502,32 @@ def create_pull_request(
             journal,
             project,
             "pr_create",
-            subject=target | _pull_subject(observed),
+            subject=_with_post(target, observed),
             native=_pull_native(observed),
             matching_state=False,
-            reason="post-write observation did not match the intended pull request",
+            reason=_create_mismatch_reason(observed, expected_base),
         )
     limitations = [
         _NOT_PRODUCT_ACCEPTANCE,
         "GitHub does not provide compare-and-swap for this write",
+        TEXT_COMPARISON_LIMITATION,
     ]
     if observed["head_sha"].lower() != head_sha:
         limitations.append("head SHA changed between pre-write and post-write reads")
+    if observed["base_sha"].lower() != base_sha:
+        limitations.append("base SHA changed between pre-write and post-write reads")
     journal.terminal(
         "succeeded",
         native_id=str(observed["number"]),
         native_url=observed["html_url"],
-        observed_after=_pull_subject(observed),
+        observed_after=_with_post(target, observed),
     )
     return _finished(
         journal,
         kind="pr_create",
         project=project,
         outcome="succeeded",
-        subject=target | _pull_subject(observed),
+        subject=_with_post(target, observed),
         native=_pull_native(observed),
         limitations=limitations,
     )
@@ -592,7 +612,11 @@ def add_pull_request_comment(
             "comment target is not an observable pull request",
         ) from exc
     intention = _intention({"body": comment_body, "pull_number": pull_number})
-    target = {"pull_number": pull_number, **_pull_subject(current)}
+    target = {
+        "pull_number": pull_number,
+        **_body_evidence(comment_body),
+        **_pull_subject(current),
+    }
     journal = _start(
         policy,
         project,
@@ -612,10 +636,7 @@ def add_pull_request_comment(
             comment_body,
         )
     except (ProviderTransportError, ProviderCallError) as exc:
-        uncertain = isinstance(exc, ProviderTransportError) or (
-            isinstance(exc, ProviderCallError) and exc.effect_uncertain
-        )
-        if not uncertain:
+        if not _effect_may_have_occurred(exc):
             return _fail_response(journal, project, "pr_comment", target, exc)
         return _recover_comment(
             journal,
@@ -626,7 +647,7 @@ def add_pull_request_comment(
             reason=_safe_detail(str(exc)),
         )
     try:
-        comments = provider.list_comments(project.owner, project.repo, pull_number)
+        comments, scan_complete = _comment_pages(provider, project, pull_number)
     except (ProviderTransportError, ProviderCallError) as exc:
         return _recover_comment(
             journal,
@@ -639,17 +660,21 @@ def add_pull_request_comment(
     matched = [
         item
         for item in comments
-        if item["id"] == written["id"] and item["body"] == comment_body
+        if item["id"] == written["id"] and texts_match("body", comment_body, item["body"])
     ]
     if len(matched) != 1:
+        reason = "comment id returned by the provider was not observed afterward"
+        if not scan_complete:
+            reason = "comment verification stopped before the comment range was complete"
         return _recover_comment(
             journal,
             provider,
             project,
             pull_number=pull_number,
             body=comment_body,
-            reason="comment id returned by the provider was not observed afterward",
+            reason=reason,
             comments=comments,
+            scan_complete=scan_complete,
         )
     journal.terminal(
         "succeeded",
@@ -667,6 +692,7 @@ def add_pull_request_comment(
         limitations=[
             _NOT_PRODUCT_ACCEPTANCE,
             ISSUE_COMMENT_PERMISSION["reason"],
+            TEXT_COMPARISON_LIMITATION,
         ],
     )
 
@@ -713,10 +739,7 @@ def request_reviewers(
             requested,
         )
     except (ProviderTransportError, ProviderCallError) as exc:
-        uncertain = isinstance(exc, ProviderTransportError) or (
-            isinstance(exc, ProviderCallError) and exc.effect_uncertain
-        )
-        if not uncertain:
+        if not _effect_may_have_occurred(exc):
             return _fail_response(journal, project, "pr_request_reviewers", target, exc)
         return _recover_reviewers(
             journal,
@@ -798,9 +821,12 @@ def _update_text(
         operation=operation,
     )
     pull_number = _pull_number(number)
+    if field == "title":
+        value = _stable_title(value)
     current = provider.get_pull_request(project.owner, project.repo, pull_number)
     intention = _intention({field: value, "pull_number": pull_number})
-    target = {"pull_number": pull_number, field: value, **_pull_subject(current)}
+    evidence = {field: value} if field == "title" else _body_evidence(value)
+    target = {"pull_number": pull_number, **evidence, **_pull_subject(current)}
     journal = _start(
         policy,
         project,
@@ -822,10 +848,7 @@ def _update_text(
                 project.owner, project.repo, pull_number, value
             )
     except (ProviderTransportError, ProviderCallError) as exc:
-        uncertain = isinstance(exc, ProviderTransportError) or (
-            isinstance(exc, ProviderCallError) and exc.effect_uncertain
-        )
-        if not uncertain:
+        if not _effect_may_have_occurred(exc):
             return _fail_response(journal, project, operation, target, exc)
         return _recover_text(
             journal,
@@ -848,15 +871,22 @@ def _update_text(
             value,
             _safe_detail(str(exc)),
         )
-    if observed[field] != value:
-        journal.terminal(
+    if not texts_match(field, value, observed[field]):
+        if not _terminal_after_dispatch(
+            journal,
             "uncertain",
             may_have_occurred=True,
             native_id=written["id"],
             native_url=written["url"],
             observed_after=_pull_subject(observed),
             detail=f"post-write pull request {field} did not match",
-        )
+        ):
+            return _unwritten_terminal(
+                journal,
+                project,
+                operation,
+                target | _pull_subject(observed),
+            )
         return _uncertain(
             journal,
             project,
@@ -869,17 +899,22 @@ def _update_text(
     limitations = [
         _NOT_PRODUCT_ACCEPTANCE,
         "GitHub does not provide compare-and-swap for this write",
+        TEXT_COMPARISON_LIMITATION,
     ]
     head_changed = observed["head_sha"].lower() != current["head_sha"].lower()
     base_changed = observed["base_sha"].lower() != current["base_sha"].lower()
-    if head_changed or base_changed:
-        limitations.append("head or base SHA changed between pre-write and post-write reads")
-    journal.terminal(
+    if head_changed:
+        limitations.append("head SHA changed between pre-write and post-write reads")
+    if base_changed:
+        limitations.append("base SHA changed between pre-write and post-write reads")
+    if not _terminal_after_dispatch(
+        journal,
         "succeeded",
         native_id=str(observed["number"]),
         native_url=observed["html_url"],
         observed_after=_pull_subject(observed),
-    )
+    ):
+        return _unwritten_terminal(journal, project, operation, target | _pull_subject(observed))
     return _finished(
         journal,
         kind=operation,
@@ -898,6 +933,7 @@ def _recover_create(
     *,
     target: dict[str, Any],
     expected_head_sha: str,
+    expected_base_sha: str | None,
     title: str,
     body: str,
     draft: bool,
@@ -922,6 +958,7 @@ def _recover_create(
         if _create_matches(
             item,
             expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
             title=title,
             body=body,
             draft=draft,
@@ -959,7 +996,7 @@ def _recover_text(
     observed = None
     try:
         observed = provider.get_pull_request(project.owner, project.repo, pull_number)
-        matching = observed[field] == value
+        matching = texts_match(field, value, observed[field])
     except (ProviderTransportError, ProviderCallError) as exc:
         matching = False
         reason = f"{reason}; follow-up read failed: {_safe_detail(str(exc))}"
@@ -973,7 +1010,10 @@ def _recover_text(
         journal,
         project,
         journal.payload["kind"],
-        subject={"pull_number": pull_number, field: value},
+        subject={
+            "pull_number": pull_number,
+            **({field: value} if field == "title" else _body_evidence(value)),
+        },
         native=_pull_native(observed) if observed else None,
         matching_state=matching,
         reason=reason,
@@ -989,34 +1029,41 @@ def _recover_comment(
     body: str,
     reason: str,
     comments: list[CommentView] | None = None,
+    scan_complete: bool | None = None,
 ) -> dict[str, Any]:
     if comments is None:
         try:
-            comments = provider.list_comments(project.owner, project.repo, pull_number)
+            comments, scan_complete = _comment_pages(provider, project, pull_number)
         except (ProviderTransportError, ProviderCallError) as exc:
             comments = []
+            scan_complete = False
             reason = f"{reason}; follow-up read failed: {_safe_detail(str(exc))}"
     started = str(journal.payload.get("started_at", ""))
     matched = [
         item
         for item in comments
-        if item["body"] == body and _not_before(item.get("created_at"), started)
+        if texts_match("body", body, item["body"]) and _not_before(item.get("created_at"), started)
     ]
+    incomplete = scan_complete is False
+    if incomplete:
+        reason = f"{reason}; comment page scan was incomplete"
+    conflicting = not incomplete and len(matched) > 1
     journal.terminal(
         "uncertain",
         may_have_occurred=True,
         detail=reason[:500],
         observed_comment_ids=[item["id"] for item in matched],
+        comment_scan_complete=scan_complete,
     )
     return _uncertain(
         journal,
         project,
         "pr_comment",
-        subject={"pull_number": pull_number},
+        subject={"pull_number": pull_number, "comment_scan_complete": scan_complete},
         native=matched,
-        matching_state=len(matched) == 1,
-        reason=reason if len(matched) <= 1 else "more than one matching comment was observed",
-        conflicting=len(matched) > 1,
+        matching_state=not incomplete and len(matched) == 1,
+        reason=reason if not conflicting else "more than one matching comment was observed",
+        conflicting=conflicting,
     )
 
 
@@ -1161,21 +1208,44 @@ def _create_matches(
     item: PullView,
     *,
     expected_head_sha: str,
+    expected_base_sha: str | None,
     title: str,
     body: str,
     draft: bool,
     base_branch: str,
     head_branch: str,
 ) -> bool:
+    base_identity = (
+        expected_base_sha is None or item["base_sha"].lower() == expected_base_sha.lower()
+    )
     return (
         item["head_ref"] == head_branch
         and item["head_sha"].lower() == expected_head_sha
         and item["base_ref"] == base_branch
-        and item["title"] == title
-        and item["body"] == body
+        and base_identity
+        and texts_match("title", title, item["title"])
+        and texts_match("body", body, item["body"])
         and bool(item["draft"]) is bool(draft)
         and item["state"] == "open"
     )
+
+
+def _create_mismatch_reason(item: PullView, expected_base_sha: str | None) -> str:
+    if expected_base_sha is not None and item["base_sha"].lower() != expected_base_sha.lower():
+        return "post-effect base SHA does not match expected_base_sha"
+    return "post-write observation did not match the intended pull request"
+
+
+def _with_post(target: dict[str, Any], item: PullView) -> dict[str, Any]:
+    posted = _pull_subject(item)
+    pre_head = target.get("pre_observed_head_sha", target.get("observed_head_sha"))
+    pre_base = target.get("pre_observed_base_sha", target.get("observed_base_sha"))
+    return target | posted | {
+        "pre_observed_head_sha": pre_head,
+        "pre_observed_base_sha": pre_base,
+        "post_observed_head_sha": posted["observed_head_sha"],
+        "post_observed_base_sha": posted["observed_base_sha"],
+    }
 
 
 def _pull_subject(item: PullView) -> dict[str, Any]:
@@ -1207,10 +1277,22 @@ def _pull_native(item: PullView) -> dict[str, Any]:
 
 def _annotate_review(policy: GitHubPolicy, review: dict[str, Any]) -> dict[str, Any]:
     login = review.get("user_login")
-    independent = None if policy.provider_login is None else login != policy.provider_login
+    provider_login = policy.provider_login
+    if not isinstance(login, str) or not login or provider_login is None:
+        match: bool | str = "unknown"
+        distinct: bool | str = "unknown"
+    elif login.casefold() == provider_login.casefold():
+        match = True
+        distinct = False
+    else:
+        match = False
+        distinct = True
     annotated = dict(review)
-    annotated["independent"] = independent
+    annotated["author_login"] = login if isinstance(login, str) and login else None
+    annotated["provider_identity_match"] = match
+    annotated["native_actor_distinct_from_provider"] = distinct
     annotated["product_acceptance"] = False
+    annotated.pop("independent", None)
     return annotated
 
 
@@ -1409,17 +1491,113 @@ def _pull_number(value: int) -> int:
     return value
 
 
+def _effect_may_have_occurred(exc: ProviderTransportError | ProviderCallError) -> bool:
+    if isinstance(exc, ProviderTransportError):
+        return exc.effect_possible
+    return exc.effect_uncertain
+
+
+def _body_evidence(body: str) -> dict[str, Any]:
+    raw = body.encode("utf-8")
+    return {
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+        "body_characters": len(body),
+        "body_bytes": len(raw),
+    }
+
+
+def _stable_title(value: str) -> str:
+    title = _title(value)
+    if not title_is_stable(title):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_SUBJECT_UNSTABLE",
+            "title is not stable under the pinned provider plain-text representation",
+        )
+    return title
+
+
+def _comment_pages(
+    provider: GitHubProvider,
+    project: GitHubProject,
+    pull_number: int,
+) -> tuple[list[CommentView], bool]:
+    found: list[CommentView] = []
+    for page in range(1, _COMMENT_PAGE_LIMIT + 1):
+        batch = provider.list_comments(
+            project.owner,
+            project.repo,
+            pull_number,
+            page=page,
+            per_page=_COMMENT_PER_PAGE,
+        )
+        found.extend(batch)
+        if len(batch) < _COMMENT_PER_PAGE:
+            return found, True
+    return found, False
+
+
+def _terminal_after_dispatch(journal: GitHubJournal, state: str, **details: object) -> bool:
+    try:
+        journal.terminal(state, **details)
+    except GitHubPolicyError as exc:
+        if exc.code == "VEDAOPS_OPERATION_RECORD_UNCERTAIN" and journal.payload.get(
+            "effect_dispatched"
+        ):
+            return False
+        raise
+    return True
+
+
+def _unwritten_terminal(
+    journal: GitHubJournal,
+    project: GitHubProject,
+    kind: str,
+    subject: dict[str, Any],
+) -> dict[str, Any]:
+    return _scrubbed(
+        {
+            "outcome": "uncertain",
+            "kind": kind,
+            "project_id": project.id,
+            "github_repository": project.repository,
+            "operation_id": journal.operation_id,
+            "effect_dispatched": True,
+            "subject": subject,
+            "native": None,
+            "product_acceptance": False,
+            "code": "VEDAOPS_OPERATION_RECORD_UNCERTAIN",
+            "limitations": [
+                "terminal evidence could not be written",
+                "the dispatched journal record remains unresolved",
+                "an effect may have occurred",
+                "the write was not retried",
+            ],
+            "uncertainty": {
+                "may_have_occurred": True,
+                "matching_state": False,
+                "causality": "unproven",
+                "retry_performed": False,
+                "conflicting": False,
+                "reason": "terminal journal record could not be written after dispatch",
+            },
+        }
+    )
+
+
 def _reviewers(value: list[str]) -> list[str]:
     if not isinstance(value, list) or not value or len(value) > 10:
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_SUBJECT_INVALID",
-            "reviewers must contain 1 to 10 logins",
+            "reviewers must contain 1 to 10 GitHub user logins",
         )
     if len(value) != len(set(value)):
         raise GitHubPolicyError("VEDAOPS_GITHUB_SUBJECT_INVALID", "reviewers must be unique")
     for login in value:
         if not isinstance(login, str) or _REVIEWER.fullmatch(login) is None:
-            raise GitHubPolicyError("VEDAOPS_GITHUB_SUBJECT_INVALID", "reviewer login is invalid")
+            raise GitHubPolicyError(
+                "VEDAOPS_GITHUB_SUBJECT_INVALID",
+                "reviewer must be a GitHub user login; team reviewers are unsupported",
+            )
     return list(value)
 
 

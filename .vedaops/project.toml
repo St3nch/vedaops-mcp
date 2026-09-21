@@ -1,5 +1,5 @@
 schema_version = 1
 id = "vedaops-mcp"
 name = "VedaOps MCP"
-mutable = false
-capabilities = ["read"]
+mutable = true
+capabilities = ["read", "change", "check"]

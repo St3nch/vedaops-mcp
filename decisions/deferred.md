@@ -4,6 +4,24 @@ Deferred means worth remembering and reconsidering under an observable trigger.
 
 Deferred does not mean backlog, promise, or implementation authorization.
 
+## Deferred-feature lifecycle
+
+Deferred capability records preserve architectural memory. They are **not a backlog, ticket queue, or implementation authority**.
+
+Lifecycle:
+
+1. **Deferred** — the capability, problem, boundary, and review trigger are recorded.
+2. **Trigger observed** — evidence may show that the review trigger has become true.
+3. **Steward reassessment** — the Project Steward decides whether the capability still fits the architecture and whether it is mature enough to commission.
+4. **Product commissioning** — CHAZ explicitly authorizes the work to become active engineering.
+5. **Ticket/spec creation** — only then is a bounded implementation artifact created with subject, scope, acceptance evidence, and authority.
+6. **Implementation/review/integration** — work proceeds under ordinary VedaOps engineering governance.
+7. **Close, revise, split, or defer again** — implementation experience may change the deferred design.
+
+A satisfied review trigger does **not** silently commission work. A deferred item may remain deferred indefinitely, be revised, be split, or be dropped.
+
+Do not create implementation branches, tickets, runtime services, credentials, provider integrations, or external side effects merely because an item appears in this file.
+
 ## F001 — External coding-agent runner
 
 **Problem:** reduce manual burden for bounded external-model review and later isolated Writer work.
@@ -76,13 +94,19 @@ Deferred does not mean backlog, promise, or implementation authorization.
 
 ## F008 — GitHub write integration
 
-**Problem:** allow native PR/review/merge actions without leaving the governed environment.
+**Problem:** allow the Project Steward to perform bounded native GitHub PR/review/check operations without CHAZ manually relaying routine GitHub actions.
 
-**Why not now:** VedaOps must first establish disciplined native Git/GitHub practice and a clean external-effect authorization boundary.
+**Trigger state:** satisfied during the Workflow v1 pilot. Manual PR creation, PR-body maintenance, check inspection, and review-state handling created repeated operator burden.
 
-**Review trigger:** repeated PR/review operations create real manual burden and the semantics are stable.
+**Commissioning state:** deferred. Trigger satisfaction records need and maturity; it does not itself authorize implementation.
 
-**Boundary:** native GitHub objects only; explicit authorization; no shadow workflow state.
+**Architectural direction:** prefer a least-privilege GitHub App with short-lived installation tokens, exact typed operations, source-subject binding, post-effect verification, and GitHub remaining authoritative for native lifecycle state.
+
+**First-slice boundary:** PR/read-check operations only; no generic GitHub API or `gh` surface, branch push, merge, release, deployment, repository administration, or workflow mutation.
+
+**Webhooks:** explicitly deferred within F008 until repeated event-driven need earns the additional persistent-ingress/runtime boundary.
+
+**Detailed deferred brief:** [`docs/deferred/F008-github-integration.md`](../docs/deferred/F008-github-integration.md)
 
 ## F009 — Asynchronous heavy-check service
 

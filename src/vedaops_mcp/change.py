@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict
 
 from vedaops_mcp.authority import AuthorizedProject, get_authorized_project
 from vedaops_mcp.errors import AuthorityError, PolicyError
-from vedaops_mcp.operations import start_operation
+from vedaops_mcp.operations import OperationJournal, start_operation
 from vedaops_mcp.policy import (
     MAX_FILE_BYTES,
     MAX_GIT_RESULT_BYTES,
@@ -708,16 +708,7 @@ def project_git_commit(
         )
         try:
             run_git_text(project.root, "add", "-A", "--", *pathspecs)
-            staged = _nul_paths(
-                run_git_bytes(
-                    project.root,
-                    "diff",
-                    "--cached",
-                    "--name-only",
-                    "-z",
-                    "--no-renames",
-                )
-            )
+            staged = _commit_staged_paths(project.root)
             if set(staged) != set(commit_paths) or len(staged) != len(commit_paths):
                 raise PolicyError(
                     "VEDAOPS_COMMIT_PATH_MISMATCH",
@@ -733,32 +724,29 @@ def project_git_commit(
             )
             new_head = run_git_text(project.root, "rev-parse", "HEAD")
             parent = run_git_text(project.root, "rev-parse", f"{new_head}^")
-            committed = _nul_paths(
-                run_git_bytes(
-                    project.root,
-                    "diff-tree",
-                    "--no-commit-id",
-                    "--name-only",
-                    "-r",
-                    "-z",
-                    "--no-renames",
-                    new_head,
-                )
-            )
+            committed = _commit_tree_paths(project.root, new_head)
             if parent != expected_git_head or set(committed) != set(commit_paths):
                 raise PolicyError(
                     "VEDAOPS_COMMIT_VERIFY_FAILED",
                     "resulting commit does not match the requested parent/path set",
                 )
-            if run_git_bytes(project.root, "diff", "--cached", "--name-only", "-z"):
+            if _commit_staged_paths(project.root):
                 raise PolicyError(
                     "VEDAOPS_COMMIT_VERIFY_FAILED",
                     "index is unexpectedly dirty after the exact commit",
                 )
             remaining_status = _status_text(project.root)
         except Exception as exc:
-            journal.terminal("uncertain", detail=str(exc))
-            raise _git_effect_uncertain("local commit") from exc
+            return _finish_git_commit_attempt(
+                project.root,
+                journal=journal,
+                project_id=project.id,
+                workspace_id=project.workspace_id,
+                branch=branch,
+                expected_git_head=expected_git_head,
+                commit_paths=commit_paths,
+                exc=exc,
+            )
         journal.terminal("succeeded")
         return GitCommitResult(
             operation_id=journal.operation_id,
@@ -1060,6 +1048,159 @@ def project_git_branch_delete(
             current_head=expected_git_head,
             deleted=True,
         )
+
+
+def _finish_git_commit_attempt(
+    root: Path,
+    *,
+    journal: OperationJournal,
+    project_id: str,
+    workspace_id: str,
+    branch: str,
+    expected_git_head: str,
+    commit_paths: Sequence[str],
+    exc: BaseException,
+) -> GitCommitResult:
+    """Classify a failed commit attempt: proven success, restored index, or uncertain."""
+    proven = _proven_exact_commit(
+        root,
+        expected_git_head=expected_git_head,
+        branch=branch,
+        commit_paths=commit_paths,
+    )
+    if proven is not None:
+        journal.terminal("succeeded")
+        return GitCommitResult(
+            operation_id=journal.operation_id,
+            project_id=project_id,
+            workspace_id=workspace_id,
+            branch=branch,
+            git_head_before=expected_git_head,
+            git_head=proven[0],
+            committed_paths=sorted(proven[1]),
+            remaining_status=proven[2],
+        )
+
+    actual_head: str | None = None
+    staged_paths: list[str] | None = None
+    restored = False
+    try:
+        actual_head = run_git_text(root, "rev-parse", "HEAD")
+        staged_paths = _commit_staged_paths(root)
+        current_branch = _current_branch(root)
+        if (
+            actual_head == expected_git_head
+            and current_branch == branch
+            and set(staged_paths) <= set(commit_paths)
+        ):
+            restored = not staged_paths or _restore_own_commit_staging(
+                root,
+                expected_git_head=expected_git_head,
+                branch=branch,
+                staged_paths=staged_paths,
+            )
+    except Exception:
+        restored = False
+
+    if restored:
+        journal.terminal("failed", detail=str(exc))
+        if isinstance(exc, PolicyError) and exc.code != "VEDAOPS_GIT_EFFECT_UNCERTAIN":
+            raise exc
+        raise PolicyError(
+            "VEDAOPS_GIT_UNAVAILABLE",
+            "local commit failed; index was restored to the pre-operation state",
+        ) from exc
+
+    journal.terminal("uncertain", detail=str(exc))
+    raise _git_commit_effect_uncertain(
+        expected_git_head=expected_git_head,
+        actual_head=actual_head,
+        staged_paths=staged_paths,
+    ) from exc
+
+
+def _proven_exact_commit(
+    root: Path,
+    *,
+    expected_git_head: str,
+    branch: str,
+    commit_paths: Sequence[str],
+) -> tuple[str, list[str], str] | None:
+    """Return HEAD/paths/status only when the intended exact commit is proven."""
+    try:
+        head = run_git_text(root, "rev-parse", "HEAD")
+        if COMMIT_PATTERN.fullmatch(head) is None or head == expected_git_head:
+            return None
+        if _current_branch(root) != branch:
+            return None
+        lineage = run_git_text(root, "rev-list", "--parents", "-n", "1", head).split()
+        if lineage != [head, expected_git_head]:
+            return None
+        committed = _commit_tree_paths(root, head)
+        if set(committed) != set(commit_paths) or len(committed) != len(commit_paths):
+            return None
+        if _commit_staged_paths(root):
+            return None
+    except PolicyError:
+        return None
+    try:
+        remaining_status = _status_text(root)
+    except PolicyError:
+        remaining_status = ""
+    return head, committed, remaining_status
+
+
+def _restore_own_commit_staging(
+    root: Path,
+    *,
+    expected_git_head: str,
+    branch: str,
+    staged_paths: Sequence[str],
+) -> bool:
+    """Unstage only this attempt's paths when HEAD/branch/index are still proven."""
+    if not staged_paths:
+        return False
+    try:
+        if run_git_text(root, "rev-parse", "HEAD") != expected_git_head:
+            return False
+        if _current_branch(root) != branch:
+            return False
+        _unstage_paths(root, staged_paths)
+        if run_git_text(root, "rev-parse", "HEAD") != expected_git_head:
+            return False
+        if _current_branch(root) != branch:
+            return False
+        if _commit_staged_paths(root):
+            return False
+        status = _status_records(root)
+        if any(index not in {" ", "?"} for index, _work, _path in status):
+            return False
+        changed = {path for _index, _work, path in status}
+        if any(path not in changed for path in staged_paths):
+            return False
+    except PolicyError:
+        return False
+    return True
+
+
+def _git_commit_effect_uncertain(
+    *,
+    expected_git_head: str,
+    actual_head: str | None,
+    staged_paths: Sequence[str] | None,
+) -> PolicyError:
+    if staged_paths is None:
+        staged_note = "unavailable"
+    elif not staged_paths:
+        staged_note = "none"
+    else:
+        staged_note = ", ".join(staged_paths)
+    return PolicyError(
+        "VEDAOPS_GIT_EFFECT_UNCERTAIN",
+        "local commit may have changed local Git state; inspect branch, HEAD, index, and working "
+        f"tree before retrying; expected HEAD {expected_git_head}; observed HEAD "
+        f"{actual_head or 'unavailable'}; staged {staged_note}",
+    )
 
 
 def _git_effect_uncertain(action: str) -> PolicyError:
@@ -1367,6 +1508,34 @@ def _nul_paths(raw: bytes) -> list[str]:
         return [normalize_relative(item.decode("utf-8")) for item in raw.split(b"\x00") if item]
     except (UnicodeDecodeError, PolicyError) as exc:
         raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "Git path output was malformed") from exc
+
+
+def _commit_staged_paths(root: Path) -> list[str]:
+    return _nul_paths(
+        run_git_bytes(
+            root,
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--no-renames",
+        )
+    )
+
+
+def _commit_tree_paths(root: Path, commit: str) -> list[str]:
+    return _nul_paths(
+        run_git_bytes(
+            root,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            "--no-renames",
+            commit,
+        )
+    )
 
 
 def _unstage_paths(root: Path, paths: Sequence[str]) -> None:

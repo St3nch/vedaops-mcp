@@ -289,6 +289,217 @@ def test_commit_refuses_preexisting_staged_state(tmp_path: Path):
             message="should refuse",
         )
     assert git(root, "rev-parse", "HEAD") == head
+    assert git(root, "diff", "--cached", "--name-only") == "src/app.py"
+    assert "README.md" not in git(root, "diff", "--cached", "--name-only")
+    assert (root / "README.md").read_text() == "changed\n"
+
+
+def _unstaged_names(root: Path) -> set[str]:
+    return {line for line in git(root, "diff", "--name-only").splitlines() if line}
+
+
+def _untracked_names(root: Path) -> set[str]:
+    return {
+        line
+        for line in git(root, "ls-files", "--others", "--exclude-standard").splitlines()
+        if line
+    }
+
+
+def _cached_names(root: Path) -> set[str]:
+    return {line for line in git(root, "diff", "--cached", "--name-only").splitlines() if line}
+
+
+def _commit_journal(registry: Path) -> list[dict]:
+    records = [
+        json.loads(path.read_text())
+        for path in (registry.parent / "operations").glob("*.json")
+        if path.name.endswith(".json")
+    ]
+    return [item for item in records if item["kind"] == "git_commit"]
+
+
+def test_commit_failure_after_staging_restores_index_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+    readme = root / "README.md"
+    project_text_replace(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        path="README.md",
+        expected_sha256=_sha(readme),
+        find="hello world",
+        replacement="hello recovered",
+    )
+    created = project_file_write(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        path="docs/retry.txt",
+        content="retry me\n",
+    )
+    assert created.sha256_after
+    (root / "src/app.py").write_text('MESSAGE = "unrelated dirty"\n')
+
+    original = change_module.run_git_text
+
+    def fail_commit(project_root: Path, *args: str, **kwargs) -> str:
+        if args and args[0] == "commit":
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "simulated commit failure")
+        return original(project_root, *args, **kwargs)
+
+    monkeypatch.setattr(change_module, "run_git_text", fail_commit)
+    with pytest.raises(PolicyError, match="VEDAOPS_GIT_UNAVAILABLE"):
+        project_git_commit(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            paths=["README.md", "docs/retry.txt"],
+            message="test: recovered commit",
+        )
+
+    assert git(root, "rev-parse", "HEAD") == head
+    assert _cached_names(root) == set()
+    assert "README.md" in _unstaged_names(root)
+    assert "src/app.py" in _unstaged_names(root)
+    assert "docs/retry.txt" in _untracked_names(root)
+    assert "hello recovered" in readme.read_text()
+    assert (root / "docs/retry.txt").read_text() == "retry me\n"
+    assert _commit_journal(registry)[-1]["state"] == "failed"
+
+    monkeypatch.setattr(change_module, "run_git_text", original)
+    result = project_git_commit(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        paths=["README.md", "docs/retry.txt"],
+        message="test: recovered commit",
+    )
+    assert set(result.committed_paths) == {"README.md", "docs/retry.txt"}
+    assert result.git_head_before == head
+    assert git(root, "rev-parse", f"{result.git_head}^") == head
+    assert _cached_names(root) == set()
+    committed = git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", result.git_head)
+    assert "src/app.py" not in committed
+    assert 'MESSAGE = "unrelated dirty"' in (root / "src/app.py").read_text()
+    assert "src/app.py" in _unstaged_names(root)
+
+
+def test_commit_does_not_unstage_unrelated_paths_when_index_is_unprovable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+    readme = root / "README.md"
+    project_text_replace(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        path="README.md",
+        expected_sha256=_sha(readme),
+        find="hello world",
+        replacement="hello mixed",
+    )
+    original = change_module.run_git_text
+
+    def fail_after_foreign_stage(project_root: Path, *args: str, **kwargs) -> str:
+        if args and args[0] == "commit":
+            (root / "src/app.py").write_text('MESSAGE = "foreign staged"\n')
+            git(root, "add", "src/app.py")
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "simulated commit failure")
+        return original(project_root, *args, **kwargs)
+
+    monkeypatch.setattr(change_module, "run_git_text", fail_after_foreign_stage)
+    with pytest.raises(PolicyError, match="VEDAOPS_GIT_EFFECT_UNCERTAIN"):
+        project_git_commit(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            paths=["README.md"],
+            message="should not unstage foreign paths",
+        )
+
+    assert git(root, "rev-parse", "HEAD") == head
+    assert _cached_names(root) == {"README.md", "src/app.py"}
+    assert "hello mixed" in readme.read_text()
+    assert 'MESSAGE = "foreign staged"' in (root / "src/app.py").read_text()
+
+    with pytest.raises(PolicyError, match="VEDAOPS_GIT_INDEX_DIRTY"):
+        project_git_commit(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            paths=["README.md"],
+            message="retry still refused",
+        )
+    assert _cached_names(root) == {"README.md", "src/app.py"}
+
+
+def test_commit_head_drift_prevents_index_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root, registry, head = _change_project(tmp_path)
+    readme = root / "README.md"
+    project_text_replace(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=head,
+        path="README.md",
+        expected_sha256=_sha(readme),
+        find="hello world",
+        replacement="hello drift",
+    )
+    original = change_module.run_git_text
+
+    def fail_after_head_drift(project_root: Path, *args: str, **kwargs) -> str:
+        if args and args[0] == "commit":
+            git(root, "restore", "--staged", "--source=HEAD", "--", "README.md")
+            git(root, "commit", "--allow-empty", "-m", "external drift")
+            git(root, "add", "-A", "--", "README.md")
+            raise PolicyError("VEDAOPS_GIT_UNAVAILABLE", "simulated commit failure after drift")
+        return original(project_root, *args, **kwargs)
+
+    monkeypatch.setattr(change_module, "run_git_text", fail_after_head_drift)
+    with pytest.raises(PolicyError, match="VEDAOPS_GIT_EFFECT_UNCERTAIN"):
+        project_git_commit(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            paths=["README.md"],
+            message="should not restore after drift",
+        )
+
+    drifted = git(root, "rev-parse", "HEAD")
+    assert drifted != head
+    assert git(root, "rev-parse", f"{drifted}^") == head
+    assert git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", drifted) == ""
+    assert _cached_names(root) == {"README.md"}
+    assert "hello drift" in readme.read_text()
+
+    with pytest.raises(PolicyError, match="VEDAOPS_GIT_PRECONDITION_FAILED"):
+        project_git_commit(
+            registry,
+            principal_id="test-agent",
+            project_id="example",
+            expected_git_head=head,
+            paths=["README.md"],
+            message="retry with stale HEAD",
+        )
+    assert git(root, "rev-parse", "HEAD") == drifted
+    assert _cached_names(root) == {"README.md"}
 
 
 def test_complete_local_ticket_cycle_without_terminal_git(tmp_path: Path):
@@ -695,7 +906,7 @@ def test_ff_merge_uses_verified_branch_object_not_same_named_tag(tmp_path: Path)
     assert "WrongTag" not in manifest.read_text()
 
 
-def test_commit_wrapper_failure_after_real_commit_is_effect_uncertain(
+def test_commit_wrapper_failure_after_real_commit_returns_proven_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -722,23 +933,22 @@ def test_commit_wrapper_failure_after_real_commit_is_effect_uncertain(
 
     monkeypatch.setattr(change_module, "run_git_text", fail_after_commit)
 
-    with pytest.raises(PolicyError, match="VEDAOPS_GIT_EFFECT_UNCERTAIN"):
-        project_git_commit(
-            registry,
-            principal_id="test-agent",
-            project_id="example",
-            expected_git_head=base_head,
-            paths=["README.md"],
-            message="test: post commit failure",
-        )
+    result = project_git_commit(
+        registry,
+        principal_id="test-agent",
+        project_id="example",
+        expected_git_head=base_head,
+        paths=["README.md"],
+        message="test: post commit failure",
+    )
 
-    assert git(root, "rev-parse", "HEAD") != base_head
-    records = [
-        json.loads(path.read_text())
-        for path in (registry.parent / "operations").glob("*.json")
-    ]
-    commit_records = [item for item in records if item["kind"] == "git_commit"]
-    assert commit_records[-1]["state"] == "uncertain"
+    assert result.git_head != base_head
+    assert result.git_head == git(root, "rev-parse", "HEAD")
+    assert git(root, "rev-parse", f"{result.git_head}^") == base_head
+    assert result.committed_paths == ["README.md"]
+    assert git(root, "diff", "--cached", "--name-only") == ""
+    assert "commit happened" in readme.read_text()
+    assert _commit_journal(registry)[-1]["state"] == "succeeded"
 
 
 def test_manifest_alias_cannot_turn_ordinary_file_into_authority_mutation(tmp_path: Path):

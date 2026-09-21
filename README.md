@@ -15,6 +15,8 @@ The core Product has four responsibilities:
 
 The MCP is not a general shell, workflow database, GitHub replacement, project Product authority, autonomous manager, or institutional-memory system.
 
+For project onboarding and Shadow registration, see [`docs/project-onboarding.md`](docs/project-onboarding.md).
+
 ## MCP-01 read/orientation plane
 
 MCP-01 established the stdio controller foundation: deterministic start, launcher-bound principal identity, external operator policy, project-manifest narrowing, bounded project/Git reads, and exact commit comparison.

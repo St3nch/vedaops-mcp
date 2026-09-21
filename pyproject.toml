@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 vedaops-mcp = "vedaops_mcp.entrypoints:main"
+vedaops-github = "vedaops_mcp.github_collab.entrypoints:main"
 
 [dependency-groups]
 dev = [

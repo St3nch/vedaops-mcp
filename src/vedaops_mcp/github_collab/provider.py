@@ -95,6 +95,7 @@ class GitHubProvider(Protocol):
         method: str,
         page: int = 1,
         per_page: int = 30,
+        after: str | None = None,
     ) -> object: ...
 
     def list_pull_requests(

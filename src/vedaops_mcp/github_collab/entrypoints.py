@@ -18,6 +18,7 @@ from vedaops_mcp.github_collab.policy import (
     GitHubPolicy,
     load_policy,
     principal_from_environ,
+    sha256_file,
 )
 from vedaops_mcp.github_collab.server import build_github_server
 
@@ -42,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     artifact.add_argument("artifact", type=Path)
     artifact.add_argument("--name", required=True)
+    installed = subparsers.add_parser(
+        "hash-executable",
+        help="print the locally derived SHA-256 of an installed provider executable",
+    )
+    installed.add_argument("executable", type=Path)
     launch = subparsers.add_parser(
         "render-launch",
         help="print the child argv and environment keys without reading the private key",
@@ -64,6 +70,15 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
         if args.command == "validate-artifact":
             digest = validate_artifact(args.artifact, args.name)
             print(digest)
+            return 0
+        if args.command == "hash-executable":
+            digest = sha256_file(args.executable)
+            print(digest)
+            print(
+                "locally derived installed-executable digest; "
+                "not the published release-archive digest",
+                file=sys.stderr,
+            )
             return 0
         if args.command == "validate-policy":
             policy = load_policy(args.policy)

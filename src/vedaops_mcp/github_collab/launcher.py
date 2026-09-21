@@ -3,11 +3,14 @@
 The child environment is constructed. It does not inherit the parent process
 environment, so a Shadow token or a toolset override cannot widen the child.
 The private key is passed by path, never by value.
+
+The child is executed as the same Unix user as this process. The pinned
+binary is part of that runtime's trusted computing base. This module does
+not claim OS isolation between the wrapper and the child.
 """
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +20,7 @@ from vedaops_mcp.github_collab.allowlist import (
     RELEASE_ARTIFACTS,
 )
 from vedaops_mcp.github_collab.errors import GitHubPolicyError
-from vedaops_mcp.github_collab.policy import GitHubPolicy
+from vedaops_mcp.github_collab.policy import GitHubPolicy, sha256_file, verify_installed_executable
 
 CHILD_ENV_KEYS = (
     "GITHUB_APP_ID",
@@ -50,11 +53,16 @@ def launch_plan(policy: GitHubPolicy) -> LaunchPlan:
     """Build the only argv and environment the child provider may receive."""
     if not policy.enabled:
         raise GitHubPolicyError("VEDAOPS_GITHUB_DISABLED", "F008 GitHub collaboration is disabled")
-    if policy.binary_path is None or policy.private_key_path is None:
+    if (
+        policy.binary_path is None
+        or policy.executable_sha256 is None
+        or policy.private_key_path is None
+    ):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_PROVIDER_UNAVAILABLE",
-            "binary_path and private_key_path are required to launch the provider",
+            "binary_path, executable_sha256, and private_key_path are required to launch",
         )
+    verify_installed_executable(policy.binary_path, policy.executable_sha256)
     tools = ",".join(PROVIDER_TOOLS)
     argv = (
         str(policy.binary_path),
@@ -67,7 +75,7 @@ def launch_plan(policy: GitHubPolicy) -> LaunchPlan:
     )
     env = {
         "PATH": "/usr/bin:/bin",
-        "HOME": str(policy.journal_directory.parent),
+        "HOME": str(policy.journal_directory),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "GITHUB_APP_ID": policy.app_id,
@@ -98,15 +106,12 @@ def launch_plan(policy: GitHubPolicy) -> LaunchPlan:
 
 
 def artifact_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    """Hash a release archive. This is not the installed executable digest."""
+    return sha256_file(path)
 
 
 def validate_artifact(path: Path, artifact_name: str) -> str:
-    """Hash a release tarball and require the pinned digest."""
+    """Hash a release tarball and require the published archive digest."""
     expected = RELEASE_ARTIFACTS.get(artifact_name)
     if expected is None:
         raise GitHubPolicyError(

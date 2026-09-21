@@ -33,7 +33,9 @@ The Steward connector must spawn `vedaops-github`, not the Shadow process and no
 | Linux x86_64 tarball SHA-256 | `95843162759da2c31dde082dd145be35db82164594796c294414b69790c2290e` |
 | Linux arm64 tarball SHA-256 | `2b30f9fcc061b57456cbe38ddc0f13c88863bad49557508a9196f2d1c4cb17a5` |
 
-The tarball digest is the release artifact identity. It is not the digest of the extracted binary. Do not use a floating `latest` image or tag. The current REST documentation examples also mention `2026-03-10` as an API version header. F008 does not override the pinned server's header. A provider upgrade is a code and policy change because the release, commit, digest, feature, and tool catalog must match together.
+The tarball digest is the published release-archive identity. GitHub does not publish a separate checksum of the extracted executable. After `validate-artifact` accepts the archive, the operator extracts it and records the installed file's SHA-256 with `vedaops-github hash-executable`. That locally derived digest is `executable_sha256` in operator policy. It is not a substitute for the archive digest, and the archive digest is not accepted as the executable digest.
+
+Before every launch, `vedaops-github` hashes `binary_path` and refuses to start the child when the bytes differ from `executable_sha256`. A version string or `tools/list` result does not identify the executable. Do not use a floating `latest` image or tag. The current REST documentation examples also mention `2026-03-10` as an API version header. F008 does not override the pinned server's header. A provider upgrade is a code and policy change because the release, commit, archive digest, installed-file digest, feature, and tool catalog must match together.
 
 Authentication is GitHub App installation token mode (`--app-id`, `--app-installation-id`, `--app-private-key-path`). The private key is a file path. The PEM is not placed in argv or in `GITHUB_APP_PRIVATE_KEY`. A personal access token is not the design. Insiders mode and MCP App form deferral are not enabled. With only `--tools` set, upstream disables the default toolsets and registers that list. F008 still refuses to operate unless `tools/list` matches the allowlist exactly.
 
@@ -41,7 +43,7 @@ Authentication is GitHub App installation token mode (`--app-id`, `--app-install
 
 `actions_list`, `add_issue_comment`, `create_pull_request`, `get_commit`, `get_me`, `list_pull_requests`, `pull_request_read`, `request_pull_request_reviewers`, `update_pull_request_body`, `update_pull_request_title`.
 
-VedaOps calls `get_commit` with `detail=none`. `pull_request_read` is limited to its read methods: `get`, `get_diff`, `get_status`, `get_files`, `get_commits`, `get_review_comments`, `get_reviews`, `get_comments`, `get_check_runs`. `actions_list` is limited to `list_workflows`, `list_workflow_runs`, and `list_workflow_jobs`. Artifact listing, log download, and workflow dispatch are rejected before a provider call.
+VedaOps calls `get_commit` with `detail=none`. `pull_request_read` is limited to its read methods: `get`, `get_diff`, `get_status`, `get_files`, `get_commits`, `get_review_comments`, `get_reviews`, `get_comments`, `get_check_runs`. `get_review_comments` pages with the upstream `after` cursor. An ordinary `page` value is rejected for that method and is not sent as a review-thread offset. `actions_list` is limited to `list_workflows`, `list_workflow_runs`, and `list_workflow_jobs`. Artifact listing, log download, and workflow dispatch are rejected before a provider call.
 
 `add_issue_comment` is used only after a pull request read succeeds, and only with a body. Reactions are not sent. `create_pull_request` is not given reviewers or `maintainer_can_modify`.
 
@@ -70,11 +72,11 @@ Repository permissions for the App installation:
 
 Do not request Contents write, Administration, Workflows write, Checks write, commit-status write, Deployments, secrets, variables, or webhook administration.
 
-### Unresolved: ordinary conversation comments
+### Timeline comments
 
-`add_issue_comment` calls `POST /repos/{owner}/{repo}/issues/{issue_number}/comments`. On 2026-09-21 the GitHub Apps permission table lists that endpoint under both Issues write and Pull requests write, and each row says multiple permissions may be required or a different permission may be used.
+`add_issue_comment` calls `POST /repos/{owner}/{repo}/issues/{issue_number}/comments`. On 2026-09-21 the endpoint documentation says a GitHub App installation token needs at least one of Issues write or Pull requests write. F008 already grants Pull requests write, so ordinary pull request timeline comments do not need Issues write.
 
-The accepted App design does **not** include Issues write. Do not add it while creating the App unless CHAZ explicitly reconciles that permission. Live comment calls may return 403 until that decision. Title updates and reviewer requests stay inside Pull requests write and can be the first live write. F008 still refuses to comment unless the number is an observable pull request.
+Issues write stays excluded. That avoids granting general issue authority. `github_pull_request_comment` still reads the pull request first and refuses the comment unless that number is an observable pull request.
 
 ## Authorization
 
@@ -92,23 +94,26 @@ Before a GitHub write, F008 fsyncs a started journal record under the operator j
 
 After the provider returns, F008 re-reads the native object. Success requires that re-read to match. A lost response or an ambiguous provider error is `uncertain`: the journal says an effect may have occurred, native state is inspected, a matching object is reported as `causality: unproven`, and the write is not retried. GitHub does not provide compare-and-swap for these writes. A head or base SHA that changes between the pre-read and the post-read is recorded as a limitation, not hidden.
 
-Pull request creation reads the live branch tip with `get_commit` and refuses to create when that SHA differs from `expected_head_sha`. A local remote-tracking ref is not consulted. An open pull request that already has the same head, base, and SHA is returned without a second create.
+Pull request creation reads the live branch tip with `get_commit` and refuses to create when that SHA differs from `expected_head_sha`. A local remote-tracking ref is not consulted. Success, an already-open match, and uncertain-effect recovery all require the same intended state: head ref, head SHA, base ref, title, body, draft flag, and open state. An open pull request that differs in body or draft is not reported as already satisfied and is not reported as a successful create.
 
 Journal files are mode `0600` in a directory mode `0700`. They are evidence of VedaOps calls. GitHub remains authoritative for pull request state.
 
 ## Credential isolation
 
-Use a dedicated Unix account, `vedaops-github`, with no login shell. Suggested paths, all outside managed projects and outside Shadow's home:
+Use a dedicated Unix account, `vedaops-github`, with no login shell. Trusted configuration and the provider executable are root-owned and not writable by that account. The journal is the writable state directory.
 
-| Path | Mode | Contents |
+| Path | Owner and mode | Contents |
 | --- | --- | --- |
-| `/var/lib/vedaops-github` | `0700` | service home |
-| `policy/policy.toml` | `0600` | operator grants, no PEM |
-| `secrets/app.pem` | `0400` or `0600` | GitHub App private key |
-| `operations/` | `0700` | journal |
-| `bin/github-mcp-server` | `0755`, not group-writable | extracted pinned binary |
+| `/etc/vedaops-github/policy.toml` | `root:root` `0644` | operator grants, no PEM |
+| `/etc/vedaops-github/app.pem` | `root:vedaops-github` `0440` | GitHub App private key |
+| `/usr/local/lib/vedaops-github/github-mcp-server` | `root:root` `0755` | extracted provider executable |
+| `/var/lib/vedaops-github/operations/` | `vedaops-github` `0700` | journal |
 
-The private key must be owned by `vedaops-github` and must not be group- or world-accessible. The child environment is built from a fixed key list: `PATH`, `HOME` set to the service directory, locale, App id, installation id, key path, feature, and tool list. It does not inherit the parent environment. Shadow, check workers, and project worktrees do not receive this directory, the key, or the journal. Check mount policy is unchanged and does not name these paths.
+The F008 process must be able to read the policy, the key, and the executable, and must not have write permission on those files or their parent directories. `ProtectSystem=strict` with `ReadWritePaths` limited to the journal is the host enforcement. The code refuses a policy, key, or executable that the current uid can write, and it refuses an executable whose parent directory the current uid can write. Root ownership matters because a file owned by `vedaops-github` could still be chmod'd by that user. The supported deployment keeps policy, key, and executable owned by root.
+
+The official GitHub MCP process is started as the same Unix user as `vedaops-github`. It is part of that runtime's trusted computing base. F008 does not claim a separate OS identity or mount namespace between the wrapper and the child. The hash check binds which executable that identity runs. It does not sandbox the child from the wrapper.
+
+The child environment is a fixed key list: `PATH`, `HOME` set to the journal directory, locale, App id, installation id, key path, feature, and tool list. It does not inherit the parent environment. Shadow, check workers, and project worktrees do not receive the key or the journal. Check mount policy is unchanged and does not name these paths.
 
 Templates that are not applied by this change:
 
@@ -125,12 +130,13 @@ Revocation is: set `enabled = false`, stop any F008 process, delete or shred `se
 ## Local commands
 
 ```bash
-export VEDAOPS_GITHUB_POLICY=/var/lib/vedaops-github/policy/policy.toml
+export VEDAOPS_GITHUB_POLICY=/etc/vedaops-github/policy.toml
 export VEDAOPS_GITHUB_PRINCIPAL=example-steward
 uv run vedaops-github validate-policy --policy "$VEDAOPS_GITHUB_POLICY"
 uv run vedaops-github render-launch --policy "$VEDAOPS_GITHUB_POLICY"
 uv run vedaops-github validate-artifact /path/to/github-mcp-server_Linux_x86_64.tar.gz \
   --name github-mcp-server_Linux_x86_64.tar.gz
+uv run vedaops-github hash-executable /usr/local/lib/vedaops-github/github-mcp-server
 uv run vedaops-github validate-catalog /path/to/tools-list.json
 uv run vedaops-github stdio
 ```
@@ -141,11 +147,11 @@ uv run vedaops-github stdio
 
 These steps are not done by the implementation:
 
-1. CHAZ creates a GitHub App owned by the intended account, with the permissions in the table above and without Issues write until that question is reconciled.
-2. CHAZ generates a private key and places only the PEM at the service secret path.
+1. CHAZ creates a GitHub App owned by the intended account, with the permissions in the table above, including Pull requests write and excluding Issues write.
+2. CHAZ generates a private key and places only the PEM at the root-owned secret path.
 3. CHAZ installs the App on the specific repositories that will appear in operator policy, not on all repositories.
-4. CHAZ records the App id and installation id in the operator policy outside the repositories.
-5. CHAZ, or an authorized operator, downloads the `v1.12.2` Linux tarball, checks the digest, and installs the binary for `vedaops-github`.
+4. CHAZ records the App id and installation id in the root-owned operator policy outside the repositories and outside the journal.
+5. CHAZ, or an authorized operator, downloads the `v1.12.2` Linux tarball, checks the archive digest, installs the executable under `/usr/local/lib/vedaops-github/`, and records that file's SHA-256 as `executable_sha256`.
 6. CHAZ creates the `vedaops-github` account and directories if they do not exist.
 7. CHAZ sets `provider_login` to the App's bot login, commonly the App slug plus `[bot]`.
 8. CHAZ authorizes a distinct ChatGPT connector whose command is `vedaops-github stdio` as `vedaops-github`. Do not reuse the Shadow connector.
@@ -156,11 +162,11 @@ These steps are not done by the implementation:
 Run this once, against the configured App, after the setup above. Do not treat it as Product acceptance.
 
 1. `github_server_info` shows release `v1.12.2`, commit `85598ba6…`, feature `pull_requests_granular`, and `shadow_coupled: false`.
-2. The child initialize version and `validate-catalog` agree with the allowlist. `merge_pull_request` is absent.
+2. The child initialize version and `validate-catalog` agree with the allowlist. `merge_pull_request` is absent. Independently hash the installed executable and confirm it matches `executable_sha256`. The child's version string is not that proof.
 3. `github_identity_get` on an authorized repository reports the App id and installation id. `get_me` may be unavailable for an installation token; that is a limitation, not success.
 4. The same read against a repository that is not granted returns a denial and does not call the provider for that repository.
 5. `github_commit_get` on the published head branch returns the live SHA. Compare it with the intended candidate. A local remote-tracking ref is not the source.
-6. One authorized write that stays inside Pull requests write, preferably `github_pull_request_update_title` or `github_pull_request_request_reviewers` on a pull request CHAZ has designated for the tracer. Record the journal file's `effect_dispatched` record from before the call if you are watching the directory, then the terminal record and the re-read SHA, title, and URL.
+6. One authorized write inside Pull requests write, such as a title update, a reviewer request, or one timeline comment, on a pull request CHAZ has designated for the tracer. Record the journal file before the call if you are watching the directory, then the terminal record and the re-read native state, including body and draft when the operation set them.
 7. Confirm the journal file exists outside the project root and does not contain the PEM.
 8. For the uncertain-effect step, interrupt the child after dispatch only in a way CHAZ has allowed, then confirm the result is `uncertain`, `retry_performed` is false, and a second pull request or comment was not created. If no safe interrupt is available, skip this step and say it was not run.
 9. `github_pull_request_read` method `get_reviews` shows reviewer logins. The provider login is not independent.
@@ -168,8 +174,6 @@ Run this once, against the configured App, after the setup above. Do not treat i
 11. Set `enabled = false`, restart only the F008 process, and confirm Shadow's tool list is unchanged and a GitHub write is refused.
 12. Revoke by the procedure above only when CHAZ asks for revocation.
 
-Conversation-comment proof waits on the Issues-write decision.
-
 ## Checks that this repository can run before that setup
 
-`uv run pytest -q tests/test_github_collaboration.py` uses fakes. It does not contact GitHub and does not prove the live App, the real binary's catalog, or network behavior. `validate-artifact` proves a tarball only when an operator supplies that file.
+`uv run pytest -q tests/test_github_collaboration.py` uses fakes. It does not contact GitHub and does not prove the live App, the real binary's catalog, or network behavior. `validate-artifact` proves a supplied release archive. `hash-executable` and the launch check prove only the file whose path is hashed. A passing fake is not proof of the pinned GitHub MCP Server.

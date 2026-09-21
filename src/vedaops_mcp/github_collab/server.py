@@ -130,8 +130,12 @@ def build_github_server(
         method: str,
         page: int = 1,
         per_page: int = 30,
+        after: str | None = None,
     ) -> dict[str, Any]:
-        """Read one pull request fact from the pinned read-method set."""
+        """Read one pull request fact from the pinned read-method set.
+
+        Review threads use ``after`` cursors. ``page`` does not offset them.
+        """
         return read_pull_request(
             policy,
             provider,
@@ -142,6 +146,7 @@ def build_github_server(
             method=method,
             page=page,
             per_page=per_page,
+            after=after,
         )
 
     @mcp.tool(name="github_actions_list", annotations=READ_ONLY)

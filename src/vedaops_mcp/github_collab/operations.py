@@ -121,6 +121,7 @@ def read_pull_request(
     method: str,
     page: int = 1,
     per_page: int = 30,
+    after: str | None = None,
 ) -> dict[str, Any]:
     project = _prepare(
         policy,
@@ -132,6 +133,7 @@ def read_pull_request(
     )
     pull_number = _pull_number(number)
     _page(page, per_page)
+    cursor = _review_cursor(method, page, after)
     if method not in PULL_REQUEST_READ_METHODS:
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_SUBJECT_INVALID",
@@ -159,9 +161,17 @@ def read_pull_request(
         method,
         page,
         per_page,
+        cursor,
     )
     subject: dict[str, Any] = {"pull_number": pull_number, "method": method}
     limitations = ["this observation is current only at observed_at"]
+    if method == "get_review_comments":
+        subject["after"] = cursor
+        limitations.append(
+            "review threads use cursor pagination; pass after, not an ordinary page number"
+        )
+        if _has_next_cursor_page(payload):
+            limitations.append("additional review-thread pages were not read")
     if method == "get" and isinstance(payload, dict):
         subject["head_sha"] = payload.get("head_sha") or _nested_sha(payload, "head")
         subject["base_sha"] = payload.get("base_sha") or _nested_sha(payload, "base")
@@ -332,7 +342,15 @@ def create_pull_request(
         matched = [
             item
             for item in same_head
-            if item["head_sha"].lower() == expected and item["base_ref"] == base_branch
+            if _create_matches(
+                item,
+                expected_head_sha=expected,
+                title=title_text,
+                body=body_text,
+                draft=draft,
+                base_branch=base_branch,
+                head_branch=head_branch,
+            )
         ]
         if len(matched) == 1:
             return _observation(
@@ -403,6 +421,8 @@ def create_pull_request(
             target=target,
             expected_head_sha=expected,
             title=title_text,
+            body=body_text,
+            draft=draft,
             base_branch=base_branch,
             head_branch=head_branch,
             reason=_safe_detail(str(exc)),
@@ -416,6 +436,8 @@ def create_pull_request(
             target=target,
             expected_head_sha=expected,
             title=title_text,
+            body=body_text,
+            draft=draft,
             base_branch=base_branch,
             head_branch=head_branch,
             reason="provider create result did not identify a pull request number",
@@ -430,11 +452,21 @@ def create_pull_request(
             target=target,
             expected_head_sha=expected,
             title=title_text,
+            body=body_text,
+            draft=draft,
             base_branch=base_branch,
             head_branch=head_branch,
             reason=_safe_detail(str(exc)),
         )
-    if not _create_matches(observed, expected, title_text, base_branch, head_branch):
+    if not _create_matches(
+        observed,
+        expected_head_sha=expected,
+        title=title_text,
+        body=body_text,
+        draft=draft,
+        base_branch=base_branch,
+        head_branch=head_branch,
+    ):
         journal.terminal(
             "uncertain",
             may_have_occurred=True,
@@ -628,7 +660,6 @@ def add_pull_request_comment(
         native=matched[0],
         limitations=[
             _NOT_PRODUCT_ACCEPTANCE,
-            "conversation comments use the issue-comment endpoint; Issues write remains unresolved",
             ISSUE_COMMENT_PERMISSION["reason"],
         ],
     )
@@ -862,6 +893,8 @@ def _recover_create(
     target: dict[str, Any],
     expected_head_sha: str,
     title: str,
+    body: str,
+    draft: bool,
     base_branch: str,
     head_branch: str,
     reason: str,
@@ -880,7 +913,15 @@ def _recover_create(
     matched = [
         item
         for item in found
-        if _create_matches(item, expected_head_sha, title, base_branch, head_branch)
+        if _create_matches(
+            item,
+            expected_head_sha=expected_head_sha,
+            title=title,
+            body=body,
+            draft=draft,
+            base_branch=base_branch,
+            head_branch=head_branch,
+        )
     ]
     journal.terminal(
         "uncertain",
@@ -1112,8 +1153,11 @@ def _require_live_sha(project: GitHubProject, commit: dict[str, str], *, ref: st
 
 def _create_matches(
     item: PullView,
+    *,
     expected_head_sha: str,
     title: str,
+    body: str,
+    draft: bool,
     base_branch: str,
     head_branch: str,
 ) -> bool:
@@ -1122,6 +1166,8 @@ def _create_matches(
         and item["head_sha"].lower() == expected_head_sha
         and item["base_ref"] == base_branch
         and item["title"] == title
+        and item["body"] == body
+        and bool(item["draft"]) is bool(draft)
         and item["state"] == "open"
     )
 
@@ -1369,6 +1415,41 @@ def _reviewers(value: list[str]) -> list[str]:
         if not isinstance(login, str) or _REVIEWER.fullmatch(login) is None:
             raise GitHubPolicyError("VEDAOPS_GITHUB_SUBJECT_INVALID", "reviewer login is invalid")
     return list(value)
+
+
+def _review_cursor(method: str, page: int, after: str | None) -> str | None:
+    if method == "get_review_comments" and page != 1:
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_SUBJECT_INVALID",
+            "get_review_comments uses cursor pagination; pass after, not page",
+        )
+    if after is None:
+        return None
+    if method != "get_review_comments":
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_SUBJECT_INVALID",
+            "after is only valid for get_review_comments",
+        )
+    if (
+        not isinstance(after, str)
+        or not after
+        or len(after) > 256
+        or any(ord(character) < 32 or ord(character) == 127 for character in after)
+    ):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_SUBJECT_INVALID",
+            "review-thread cursor is invalid",
+        )
+    return after
+
+
+def _has_next_cursor_page(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    page_info = payload.get("pageInfo")
+    if not isinstance(page_info, dict):
+        return False
+    return page_info.get("hasNextPage") is True
 
 
 def _page(page: int, per_page: int) -> None:

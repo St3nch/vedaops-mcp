@@ -143,17 +143,19 @@ class StdioGitHubProvider:
         method: str,
         page: int = 1,
         per_page: int = 30,
+        after: str | None = None,
     ) -> object:
         return self._tool(
             "pull_request_read",
-            {
-                "method": method,
-                "owner": owner,
-                "repo": repo,
-                "pullNumber": number,
-                "page": page,
-                "perPage": per_page,
-            },
+            pull_request_read_arguments(
+                owner,
+                repo,
+                number,
+                method,
+                page,
+                per_page,
+                after,
+            ),
         )
 
     def list_pull_requests(
@@ -373,6 +375,31 @@ class StdioGitHubProvider:
             if not chunk:
                 return
             self._stderr.extend(chunk[: _MAX_STDERR_BYTES - len(self._stderr)])
+
+
+def pull_request_read_arguments(
+    owner: str,
+    repo: str,
+    number: int,
+    method: str,
+    page: int,
+    per_page: int,
+    after: str | None,
+) -> dict[str, Any]:
+    """Build upstream arguments without pretending page offsets review threads."""
+    arguments: dict[str, Any] = {
+        "method": method,
+        "owner": owner,
+        "repo": repo,
+        "pullNumber": number,
+        "perPage": per_page,
+    }
+    if method == "get_review_comments":
+        if after:
+            arguments["after"] = after
+        return arguments
+    arguments["page"] = page
+    return arguments
 
 
 def _content_text(result: Mapping[str, Any]) -> str:

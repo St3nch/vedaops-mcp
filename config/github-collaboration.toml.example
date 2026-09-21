@@ -1,8 +1,9 @@
 # EXAMPLE ONLY. This file grants nothing and contains no secret.
 #
-# Copy it to an operator-owned path outside every managed project root, then
-# set the real absolute paths, App id, and installation id. Mode 0600, owned
-# by the F008 service user. Do not commit the copy.
+# Copy it to an operator-owned path outside every managed project root and
+# outside the service-writable journal, then set the real paths, App id, and
+# installation id. The runtime copy should be root-owned mode 0644 so
+# vedaops-github can read it and cannot rewrite it. Do not commit the copy.
 #
 # Point the F008 process at it with VEDAOPS_GITHUB_POLICY.
 # The principal is VEDAOPS_GITHUB_PRINCIPAL, not VEDAOPS_AGENT_ID.
@@ -20,8 +21,13 @@ api_version = "2022-11-28"
 feature = "pull_requests_granular"
 app_id = "000000"
 installation_id = "000000"
-# binary_path = "/var/lib/vedaops-github/bin/github-mcp-server"
-# private_key_path = "/var/lib/vedaops-github/secrets/app.pem"
+# binary_path = "/usr/local/lib/vedaops-github/github-mcp-server"
+# executable_sha256 is the SHA-256 of that installed file after the release
+# archive digest has been checked. It is not the published archive digest.
+# Record it with:
+#   vedaops-github hash-executable /usr/local/lib/vedaops-github/github-mcp-server
+# executable_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# private_key_path = "/etc/vedaops-github/app.pem"
 # provider_login = "example-app[bot]"
 
 [journal]
@@ -29,7 +35,7 @@ directory = "/var/lib/vedaops-github/operations"
 
 [[projects]]
 id = "example-project"
-root = "/var/lib/vedaops-github/example-roots/example-project"
+root = "/srv/vedaops/example-project"
 github_owner = "example-org"
 github_repo = "example-repo"
 

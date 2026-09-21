@@ -1,8 +1,8 @@
 """GitHub App permission target for the pinned provider surface.
 
-Accepted permissions are the smallest set verified against the current
-GitHub Apps permission table for the endpoints the pinned tools call.
-Issues write is deliberately absent. See ``ISSUE_COMMENT_PERMISSION``.
+Accepted permissions are the smallest set verified against current GitHub
+documentation for the endpoints the pinned tools call. Issues write stays
+excluded. Pull requests write satisfies ordinary timeline comments.
 """
 
 from __future__ import annotations
@@ -32,27 +32,23 @@ EXCLUDED_REPOSITORY_PERMISSIONS = (
     "webhooks",
 )
 
-# Official permission table, retrieved 2026-09-21:
-# https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
-# POST /repos/{owner}/{repo}/issues/{issue_number}/comments is listed under both
-# repository "Issues" write and repository "Pull requests" write. Each row says
-# multiple permissions may be required, or a different permission may be used.
-# The pinned tool add_issue_comment calls Issues.CreateComment, which is that
-# endpoint. Ordinary conversation comments have no narrower upstream tool.
+# Create an issue comment, retrieved 2026-09-21:
+# https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+# GitHub App installation tokens need at least one of Issues write or
+# Pull requests write. F008 already grants Pull requests write and still
+# comments only after the number is observed to be a pull request.
 ISSUE_COMMENT_PERMISSION = {
-    "status": "unresolved",
+    "status": "satisfied_by_pull_requests_write",
     "accepted_design_includes_issues_write": False,
     "tool": "add_issue_comment",
     "endpoint": "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
-    "documented_rows": ("issues:write", "pull_requests:write"),
-    "documentation": (
-        "https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps"
-    ),
+    "satisfies_endpoint": "pull_requests:write",
+    "documentation": "https://docs.github.com/en/rest/issues/comments#create-an-issue-comment",
     "reason": (
-        "The pinned GitHub MCP Server posts an ordinary pull request conversation "
-        "comment with add_issue_comment, which calls the issue-comment endpoint. "
-        "GitHub lists that endpoint under both Issues write and Pull requests write "
-        "and says multiple permissions may be required or a different permission may "
-        "be used. F008 does not add Issues write to the accepted App design."
+        "Timeline comments use the issue-comment endpoint. Current GitHub "
+        "documentation says an installation token needs at least one of Issues "
+        "write or Pull requests write. Pull requests write satisfies that "
+        "requirement. Issues write is not granted, and the comment is sent only "
+        "after the number is observed to be a pull request."
     ),
 }

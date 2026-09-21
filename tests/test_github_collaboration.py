@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,7 +26,10 @@ from vedaops_mcp.github_collab.errors import (
     GitHubProviderError,
 )
 from vedaops_mcp.github_collab.launcher import launch_plan, validate_artifact
-from vedaops_mcp.github_collab.mcp_client import StdioGitHubProvider
+from vedaops_mcp.github_collab.mcp_client import (
+    StdioGitHubProvider,
+    pull_request_read_arguments,
+)
 from vedaops_mcp.github_collab.operations import (
     add_pull_request_comment,
     create_pull_request,
@@ -81,6 +85,8 @@ class FakeGitHub:
         }
         self.transport_on: str | None = None
         self.reject_on: str | None = None
+        self.distort_body: str | None = None
+        self.distort_draft: bool | None = None
         self.seen_at_create: dict | None = None
         self.next_number = 7
 
@@ -119,9 +125,16 @@ class FakeGitHub:
         method: str,
         page: int = 1,
         per_page: int = 30,
+        after: str | None = None,
     ) -> object:
-        self.calls.append(("read_pull_request", method, page, per_page))
-        return {"method": method, "number": number, "owner": owner, "repo": repo}
+        self.calls.append(("read_pull_request", method, page, per_page, after))
+        return {
+            "method": method,
+            "number": number,
+            "owner": owner,
+            "repo": repo,
+            "pageInfo": {"hasNextPage": False, "endCursor": after},
+        }
 
     def list_pull_requests(
         self,
@@ -256,6 +269,10 @@ class FakeGitHub:
             "requested_reviewers": [],
             "user_login": "example-app[bot]",
         }
+        if self.distort_body is not None:
+            pull["body"] = self.distort_body
+        if self.distort_draft is not None:
+            pull["draft"] = self.distort_draft
         self.next_number += 1
         self.pulls.append(pull)
         return pull
@@ -297,19 +314,26 @@ def _write_policy(
     journal_dir = journal or (root / "journal")
     journal_dir.mkdir(mode=0o700, exist_ok=True)
     _chmod(journal_dir, 0o700)
-    key = private_key or (root / "secrets" / "app.pem")
-    key.parent.mkdir(mode=0o700, exist_ok=True)
-    _chmod(key.parent, 0o700)
+    key_dir = root / "secrets"
+    key_dir.mkdir(exist_ok=True)
+    key = private_key or (key_dir / "app.pem")
+    key.parent.mkdir(exist_ok=True)
     key.write_text(
         "-----BEGIN PRIVATE KEY-----\n" + PEM_CANARY + "\n-----END PRIVATE KEY-----\n",
         encoding="utf-8",
     )
-    _chmod(key, 0o600)
-    binary_path = binary or (root / "bin" / "github-mcp-server")
-    binary_path.parent.mkdir(exist_ok=True)
-    if not binary_path.exists():
+    _chmod(key, 0o400)
+    _chmod(key.parent, 0o555)
+    libexec = root / "libexec"
+    libexec.mkdir(exist_ok=True)
+    binary_path = libexec / "github-mcp-server"
+    if binary is not None:
+        binary_path.write_bytes(Path(binary).read_bytes())
+    elif not binary_path.exists():
         binary_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        _chmod(binary_path, 0o755)
+    executable_sha256 = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+    _chmod(binary_path, 0o555)
+    _chmod(libexec, 0o555)
     granted = operations or [
         "read",
         "pr_create",
@@ -319,7 +343,9 @@ def _write_policy(
         "pr_request_reviewers",
     ]
     other = second_operations or ["read"]
-    policy_path = root / "policy.toml"
+    config = root / "config"
+    config.mkdir(exist_ok=True)
+    policy_path = config / "policy.toml"
     policy_path.write_text(
         f"""
 schema_version = 1
@@ -335,6 +361,7 @@ feature = "{PROVIDER_FEATURE}"
 app_id = "123456"
 installation_id = "7891011"
 binary_path = "{binary_path}"
+executable_sha256 = "{executable_sha256}"
 private_key_path = "{key}"
 provider_login = "example-app[bot]"
 
@@ -367,7 +394,8 @@ operations = {json.dumps(other)}
 """,
         encoding="utf-8",
     )
-    _chmod(policy_path, 0o600)
+    _chmod(policy_path, 0o444)
+    _chmod(config, 0o555)
     return policy_path
 
 
@@ -428,7 +456,7 @@ def test_unknown_operation_and_project_file_cannot_grant_authority(tmp_path: Pat
     hostile = policy.project("alpha").root / ".vedaops" / "github.toml"
     hostile.parent.mkdir()
     hostile.write_text(
-        (tmp_path / "good" / "policy.toml").read_text(encoding="utf-8").replace(
+        path.read_text(encoding="utf-8").replace(
             'operations = ["read"]',
             'operations = ["read", "pr_create", "merge"]',
         ),
@@ -457,9 +485,12 @@ def test_secret_path_inside_a_project_is_rejected(tmp_path: Path):
     stolen = policy.project("alpha").root / "app.pem"
     stolen.write_text("not-a-real-key\n", encoding="utf-8")
     _chmod(stolen, 0o600)
+    _chmod(path.parent, 0o755)
+    _chmod(path, 0o644)
     text = path.read_text(encoding="utf-8").replace(str(policy.private_key_path), str(stolen))
     path.write_text(text, encoding="utf-8")
-    _chmod(path, 0o600)
+    _chmod(path, 0o444)
+    _chmod(path.parent, 0o555)
     with pytest.raises(GitHubPolicyError, match="private key"):
         load_policy(path)
 
@@ -666,7 +697,9 @@ def test_comment_requires_a_pull_request_and_uncertain_loss_does_not_retry(tmp_p
         body="noted",
     )
     assert posted["outcome"] == "succeeded"
-    assert "Issues write" in " ".join(posted["limitations"])
+    limitation_text = " ".join(posted["limitations"])
+    assert "Pull requests write satisfies" in limitation_text
+    assert "Issues write is not granted" in limitation_text
     provider.transport_on = "comment"
     result = add_pull_request_comment(
         policy,
@@ -901,6 +934,167 @@ def test_provider_rejection_does_not_retry(tmp_path: Path):
     assert provider.calls.count("create_pull_request") == 1
     assert _journals(policy)[0]["state"] == "failed"
     assert _journals(policy)[0]["may_have_occurred"] is False
+
+
+def test_installed_executable_digest_is_checked_before_launch(tmp_path: Path):
+    policy, path = _policy(tmp_path)
+    binary = policy.binary_path
+    assert binary is not None
+    assert policy.executable_sha256 == hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert policy.executable_sha256 != policy.artifact_sha256
+    launch_plan(policy)
+
+    _chmod(binary.parent, 0o755)
+    _chmod(binary, 0o644)
+    binary.write_bytes(binary.read_bytes() + b"\n# changed\n")
+    _chmod(binary, 0o555)
+    _chmod(binary.parent, 0o555)
+    with pytest.raises(GitHubPolicyError, match="VEDAOPS_GITHUB_EXECUTABLE_MISMATCH"):
+        launch_plan(policy)
+
+    _chmod(path.parent, 0o755)
+    _chmod(path, 0o644)
+    text = path.read_text(encoding="utf-8").replace(policy.executable_sha256 or "", "0" * 64)
+    path.write_text(text, encoding="utf-8")
+    _chmod(path, 0o444)
+    _chmod(path.parent, 0o555)
+    with pytest.raises(GitHubPolicyError, match="VEDAOPS_GITHUB_EXECUTABLE_MISMATCH"):
+        load_policy(path)
+
+
+def test_service_writable_executable_is_refused(tmp_path: Path):
+    policy, path = _policy(tmp_path)
+    binary = policy.binary_path
+    assert binary is not None
+    _chmod(binary.parent, 0o755)
+    _chmod(binary, 0o755)
+    with pytest.raises(GitHubPolicyError, match="must not be writable"):
+        load_policy(path)
+    _chmod(binary, 0o555)
+    with pytest.raises(GitHubPolicyError, match="must not be writable"):
+        load_policy(path)
+
+
+def test_create_does_not_succeed_when_body_or_draft_differs(tmp_path: Path):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    provider.distort_body = "different body"
+    wrong_body = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="intended body",
+        draft=False,
+    )
+    assert wrong_body["outcome"] == "uncertain"
+    assert wrong_body["outcome"] != "succeeded"
+    for record in policy.journal_directory.glob("*.json"):
+        record.unlink()
+
+    provider = FakeGitHub(policy.journal_directory)
+    provider.distort_draft = True
+    wrong_draft = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="intended body",
+        draft=False,
+    )
+    assert wrong_draft["outcome"] == "uncertain"
+    for record in policy.journal_directory.glob("*.json"):
+        record.unlink()
+
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="other",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    existing = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="intended body",
+    )
+    assert existing["outcome"] == "failed"
+    assert existing["code"] == "open_pull_request_exists"
+    assert "create_pull_request" not in provider.calls
+
+
+def test_review_threads_use_cursor_pagination(tmp_path: Path):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    with pytest.raises(GitHubPolicyError, match="pass after, not page"):
+        read_pull_request(
+            policy,
+            provider,
+            principal_id=PRINCIPAL,
+            project_id="alpha",
+            github_repository="example-org/alpha",
+            number=7,
+            method="get_review_comments",
+            page=2,
+        )
+    assert provider.calls == []
+    with pytest.raises(GitHubPolicyError, match="after is only valid"):
+        read_pull_request(
+            policy,
+            provider,
+            principal_id=PRINCIPAL,
+            project_id="alpha",
+            github_repository="example-org/alpha",
+            number=7,
+            method="get",
+            after="CURSOR1",
+        )
+    observed = read_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        method="get_review_comments",
+        after="CURSOR1",
+    )
+    assert provider.calls[-1] == ("read_pull_request", "get_review_comments", 1, 30, "CURSOR1")
+    assert "pass after, not an ordinary page number" in " ".join(observed["limitations"])
+    arguments = pull_request_read_arguments(
+        "example-org",
+        "alpha",
+        7,
+        "get_review_comments",
+        1,
+        30,
+        "CURSOR1",
+    )
+    assert arguments["after"] == "CURSOR1"
+    assert "page" not in arguments
+    ordinary = pull_request_read_arguments("example-org", "alpha", 7, "get", 2, 30, None)
+    assert ordinary["page"] == 2
+    assert "after" not in ordinary
 
 
 def _fake_server_script(tools: list[str], version: str) -> str:

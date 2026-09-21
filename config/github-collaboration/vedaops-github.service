@@ -16,18 +16,18 @@ Documentation=https://github.com/St3nch/vedaops-mcp/blob/main/docs/github-collab
 Type=simple
 User=vedaops-github
 Group=vedaops-github
-WorkingDirectory=/var/lib/vedaops-github
-Environment=HOME=/var/lib/vedaops-github
+WorkingDirectory=/var/lib/vedaops-github/operations
+Environment=HOME=/var/lib/vedaops-github/operations
 Environment=PATH=/usr/bin:/bin
 Environment=LANG=C.UTF-8
-Environment=VEDAOPS_GITHUB_POLICY=/var/lib/vedaops-github/policy/policy.toml
+Environment=VEDAOPS_GITHUB_POLICY=/etc/vedaops-github/policy.toml
 Environment=VEDAOPS_GITHUB_PRINCIPAL=example-steward
 ExecStart=/usr/bin/vedaops-github stdio
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/vedaops-github
+ReadWritePaths=/var/lib/vedaops-github/operations
 UMask=0077
 RestrictSUIDSGID=yes
 LockPersonality=yes

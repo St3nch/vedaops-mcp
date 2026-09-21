@@ -65,7 +65,7 @@ The candidate commit is neither Product acceptance nor publication. Running a ch
 
 ## F008 GitHub collaboration
 
-F008 is not part of the Shadow tool catalog. It is a separate `vedaops-github` process that can, when an operator policy grants it, read GitHub state and perform ordinary pull request collaboration through a pinned official GitHub MCP Server. Push, merge, review submission, and Product acceptance stay outside that process. Setup, the tool allowlist, and the unresolved Issues-write question for conversation comments are in [`docs/github-collaboration.md`](docs/github-collaboration.md).
+F008 is not part of the Shadow tool catalog. It is a separate `vedaops-github` process that can, when an operator policy grants it, read GitHub state and perform ordinary pull request collaboration through a pinned official GitHub MCP Server. Push, merge, review submission, and Product acceptance stay outside that process. Setup and the tool allowlist are in [`docs/github-collaboration.md`](docs/github-collaboration.md). Timeline comments use Pull requests write. Issues write stays excluded.
 
 Effective permission is the intersection of the principal grant, operator project ceiling, project-manifest narrowing, and operation-specific restrictions.
 

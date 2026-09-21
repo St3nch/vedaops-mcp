@@ -49,6 +49,7 @@ _PROVIDER_KEYS = frozenset(
         "app_id",
         "installation_id",
         "binary_path",
+        "executable_sha256",
         "private_key_path",
         "provider_login",
     }
@@ -95,6 +96,7 @@ class GitHubPolicy:
     app_id: str
     installation_id: str
     binary_path: Path | None
+    executable_sha256: str | None
     private_key_path: Path | None
     provider_login: str | None
     journal_directory: Path
@@ -188,6 +190,7 @@ def load_policy(path: Path, *, require_runtime_paths: bool = True) -> GitHubPoli
     journal_directory = _absolute(journal.get("directory"), "journal directory")
     binary_path = _optional_absolute(provider.get("binary_path"), "binary_path")
     private_key_path = _optional_absolute(provider.get("private_key_path"), "private_key_path")
+    executable_sha256 = _executable_digest(provider.get("executable_sha256"), binary_path)
     policy = GitHubPolicy(
         path=resolved,
         sha256=hashlib.sha256(raw).hexdigest(),
@@ -201,6 +204,7 @@ def load_policy(path: Path, *, require_runtime_paths: bool = True) -> GitHubPoli
         app_id=app_id,
         installation_id=installation_id,
         binary_path=binary_path,
+        executable_sha256=executable_sha256,
         private_key_path=private_key_path,
         provider_login=login if isinstance(login, str) else None,
         journal_directory=journal_directory,
@@ -211,16 +215,29 @@ def load_policy(path: Path, *, require_runtime_paths: bool = True) -> GitHubPoli
     _reject_inside_projects(journal_directory, projects, "the F008 journal")
     if binary_path is not None:
         _reject_inside_projects(binary_path, projects, "the GitHub MCP Server binary")
+        _reject_inside_directory(
+            binary_path,
+            journal_directory,
+            "the GitHub MCP Server binary",
+        )
     if private_key_path is not None:
         _reject_inside_projects(private_key_path, projects, "the GitHub App private key")
+        _reject_inside_directory(
+            private_key_path,
+            journal_directory,
+            "the GitHub App private key",
+        )
+    _reject_inside_directory(resolved, journal_directory, "the F008 policy file")
+    _require_not_runtime_writable(resolved, "the F008 policy file")
+    if require_runtime_paths and binary_path is not None and executable_sha256 is not None:
+        verify_installed_executable(binary_path, executable_sha256)
     if require_runtime_paths and policy.enabled:
         _require_directory(journal_directory, "the F008 journal", private=True)
         for project in projects:
             _require_directory(project.root, f"project {project.id} root", private=False)
         if private_key_path is not None:
             _require_secret_file(private_key_path)
-        if binary_path is not None:
-            _require_binary(binary_path)
+            _require_not_runtime_writable(private_key_path, "the GitHub App private key")
     return policy
 
 
@@ -432,6 +449,7 @@ def _exact_keys(table: Mapping[str, object], allowed: frozenset[str], label: str
     unknown = sorted(set(table) - allowed)
     missing = sorted(key for key in allowed if key not in table and key not in {
         "binary_path",
+        "executable_sha256",
         "private_key_path",
         "provider_login",
         "artifact",
@@ -506,7 +524,21 @@ def _policy_file(path: Path) -> Path:
             "VEDAOPS_GITHUB_POLICY_UNAVAILABLE",
             "the F008 policy file is unavailable",
         ) from exc
-    _owned_regular(info, "the F008 policy file", group_read_allowed=True)
+    if not stat.S_ISREG(info.st_mode):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            "the F008 policy file must be a regular file",
+        )
+    if info.st_uid not in {0, os.getuid()}:
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            "the F008 policy file must be owned by root or the operator",
+        )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            "the F008 policy file must not be group- or world-writable",
+        )
     return resolved
 
 
@@ -549,7 +581,8 @@ def _require_secret_file(path: Path) -> None:
                 "VEDAOPS_GITHUB_POLICY_INSECURE",
                 "the GitHub App private key must not be a symbolic link",
             )
-        info = path.resolve(strict=True).stat()
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
     except GitHubPolicyError:
         raise
     except OSError as exc:
@@ -557,10 +590,95 @@ def _require_secret_file(path: Path) -> None:
             "VEDAOPS_GITHUB_POLICY_UNAVAILABLE",
             "the GitHub App private key is unavailable",
         ) from exc
-    _owned_regular(info, "the GitHub App private key", group_read_allowed=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            "the GitHub App private key must be a regular file",
+        )
+    if info.st_uid not in {0, os.getuid()}:
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            "the GitHub App private key must be owned by root or the service user",
+        )
+    if info.st_mode & (stat.S_IRWXO | stat.S_IWGRP):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            "the GitHub App private key must not be world-accessible or group-writable",
+        )
+    if not os.access(resolved, os.R_OK):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            "the GitHub App private key must be readable by the runtime identity",
+        )
 
 
-def _require_binary(path: Path) -> None:
+def sha256_file(path: Path) -> str:
+    """Hash file bytes. This does not identify a release archive by itself."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_installed_executable(path: Path, expected_sha256: str) -> str:
+    """Hash the executable about to be launched and require the operator digest.
+
+    ``expected_sha256`` is locally derived installation evidence. GitHub
+    publishes the release archive digest, not this executable digest.
+    """
+    if _SHA256.fullmatch(expected_sha256) is None:
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INVALID",
+            "executable_sha256 must be a 64-character sha256 digest",
+        )
+    _require_unwritable_executable(path)
+    try:
+        actual = sha256_file(path)
+    except OSError as exc:
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_UNAVAILABLE",
+            "the GitHub MCP Server binary is unreadable",
+        ) from exc
+    if actual != expected_sha256:
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_EXECUTABLE_MISMATCH",
+            "installed executable digest does not match executable_sha256; "
+            "that value is the locally derived file digest, not the release archive digest",
+        )
+    return actual
+
+
+def _executable_digest(value: object, binary_path: Path | None) -> str | None:
+    if binary_path is None and value is None:
+        return None
+    if binary_path is None or not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INVALID",
+            "binary_path and executable_sha256 must both name the installed executable",
+        )
+    return value
+
+
+def _reject_inside_directory(candidate: Path, container: Path, label: str) -> None:
+    contained = container.expanduser().resolve()
+    for child in (candidate.expanduser().absolute(), candidate.expanduser().resolve()):
+        if child == contained or contained in child.parents:
+            raise GitHubPolicyError(
+                "VEDAOPS_GITHUB_POLICY_INSECURE",
+                f"{label} must not live inside the writable F008 journal",
+            )
+
+
+def _require_not_runtime_writable(path: Path, label: str) -> None:
+    if os.access(path, os.W_OK) or os.access(path.parent, os.W_OK):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            f"{label} must not be writable by the F008 runtime identity",
+        )
+
+
+def _require_unwritable_executable(path: Path) -> None:
     try:
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode):
@@ -568,7 +686,8 @@ def _require_binary(path: Path) -> None:
                 "VEDAOPS_GITHUB_POLICY_INSECURE",
                 "the GitHub MCP Server binary must not be a symbolic link",
             )
-        info = path.resolve(strict=True).stat()
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
     except GitHubPolicyError:
         raise
     except OSError as exc:
@@ -586,31 +705,11 @@ def _require_binary(path: Path) -> None:
             "VEDAOPS_GITHUB_POLICY_INSECURE",
             "the GitHub MCP Server binary must not be group- or world-writable",
         )
-    if info.st_uid not in {0, os.getuid()}:
+    if not os.access(resolved, os.X_OK):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_INSECURE",
-            "the GitHub MCP Server binary must be owned by root or the service user",
+            "the GitHub MCP Server binary must be executable by the runtime identity",
         )
-    if not info.st_mode & stat.S_IXUSR:
-        raise GitHubPolicyError(
-            "VEDAOPS_GITHUB_POLICY_INSECURE",
-            "the GitHub MCP Server binary must be executable by its owner",
-        )
+    _require_not_runtime_writable(resolved, "the GitHub MCP Server binary")
 
 
-def _owned_regular(info: os.stat_result, label: str, *, group_read_allowed: bool) -> None:
-    if not stat.S_ISREG(info.st_mode):
-        raise GitHubPolicyError("VEDAOPS_GITHUB_POLICY_INSECURE", f"{label} must be a regular file")
-    if info.st_uid != os.getuid():
-        raise GitHubPolicyError(
-            "VEDAOPS_GITHUB_POLICY_INSECURE",
-            f"{label} must be owned by the service user",
-        )
-    if group_read_allowed:
-        blocked = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-        detail = f"{label} must not be group- or world-writable"
-    else:
-        blocked = info.st_mode & 0o077
-        detail = f"{label} must not be group- or world-accessible"
-    if blocked:
-        raise GitHubPolicyError("VEDAOPS_GITHUB_POLICY_INSECURE", detail)

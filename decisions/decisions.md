@@ -80,6 +80,8 @@ The provider is the official GitHub MCP Server, pinned in the implementation rat
 
 Ordinary collaboration classes are read, pull request create, title update, body update, conversation comment, and reviewer request. Push, merge, ref mutation, repository file writes, workflow mutation, review submission, release, deployment, administration, and webhooks are outside this boundary.
 
-Issues write is not part of the accepted App permission set. Ordinary conversation comments use an endpoint GitHub documents under both Issues write and Pull requests write. That permission stays unresolved until CHAZ reconciles it.
+Issues write is not part of the accepted App permission set. Ordinary timeline comments use the issue-comment endpoint. Current GitHub documentation says an installation token needs at least one of Issues write or Pull requests write, so the accepted Pull requests write permission is sufficient. The operation still comments only after the number is observed to be a pull request.
+
+The provider executable and operator policy are outside the service-writable state tree. Before launch, the boundary hashes the executable and requires the operator-recorded installed-file digest. That digest is not the published release-archive digest. The official GitHub MCP child shares the F008 Unix identity and is part of that runtime's trusted computing base.
 
 This decision records the commissioned architecture. It is not Product acceptance of a live App, connector, or runtime, and it does not authorize push, merge, host provisioning, or provider calls.

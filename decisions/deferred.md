@@ -98,15 +98,17 @@ Do not create implementation branches, tickets, runtime services, credentials, p
 
 **Trigger state:** satisfied during the Workflow v1 pilot. Manual PR creation, PR-body maintenance, check inspection, and review-state handling created repeated operator burden.
 
-**Commissioning state:** deferred. Trigger satisfaction records need and maturity; it does not itself authorize implementation.
+**Commissioning state:** commissioned for implementation by the F008 assignment. The local implementation is a separate provider boundary recorded in D010. Product acceptance, push, merge, GitHub App creation, connector setup, and host provisioning remain separate.
 
-**Architectural direction:** prefer a least-privilege GitHub App with short-lived installation tokens, exact typed operations, source-subject binding, post-effect verification, and GitHub remaining authoritative for native lifecycle state.
+**Architectural direction:** a least-privilege GitHub App with short-lived installation tokens, the pinned official GitHub MCP Server, an explicit tool allowlist, source-subject binding, post-effect verification, and GitHub remaining authoritative for native lifecycle state.
 
-**First-slice boundary:** PR/read-check operations only; no generic GitHub API or `gh` surface, branch push, merge, release, deployment, repository administration, or workflow mutation.
+**First-slice boundary:** read plus ordinary pull request create, title, body, conversation comment, and reviewer request. No generic GitHub API or `gh` surface, branch push, merge, release, deployment, repository administration, or workflow mutation.
 
-**Webhooks:** explicitly deferred within F008 until repeated event-driven need earns the additional persistent-ingress/runtime boundary.
+**Webhooks:** not part of the implementation. They stay deferred until repeated event-driven need earns a separate ingress boundary.
 
-**Detailed deferred brief:** [`docs/deferred/F008-github-integration.md`](../docs/deferred/F008-github-integration.md)
+**Operator runbook:** [`docs/github-collaboration.md`](../docs/github-collaboration.md)
+
+**Detailed brief:** [`docs/deferred/F008-github-integration.md`](../docs/deferred/F008-github-integration.md)
 
 ## F009 — Asynchronous heavy-check service
 

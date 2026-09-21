@@ -1,15 +1,14 @@
 # F008 — GitHub write integration
 
-**Status:** deferred capability brief  
+**Status:** commissioned architecture, with a local implementation candidate  
 **Trigger state:** satisfied during the Workflow v1 pilot  
-**Commissioning state:** deferred; not implementation authority  
+**Commissioning state:** commissioned for the F008 implementation. Not Product acceptance of a live App or connector.  
 **Product Owner:** CHAZ  
 **Project Steward:** ChatGPT
 
-This document preserves the detailed architectural direction and ecosystem research for F008.
+This document preserves the architectural direction and ecosystem research that led to F008.
 
-The canonical deferred-feature registry remains `decisions/deferred.md`. This brief is not a ticket,
-backlog item, implementation authorization, credential grant, or runtime specification.
+The commissioned boundary is D010 and [`docs/github-collaboration.md`](../github-collaboration.md). This brief remains historical research. It is not a credential grant or a runtime specification. Where the implementation is narrower, the runbook and the code pin win.
 
 ## F008 — GitHub write integration
 
@@ -17,7 +16,7 @@ backlog item, implementation authorization, credential grant, or runtime specifi
 
 **Trigger state:** satisfied during the Workflow v1 pilot. Manual PR creation, PR-body maintenance, check inspection, and review-state handling created repeated operator burden.
 
-**Commissioning state:** deferred. Trigger satisfaction records need and maturity; it does not itself authorize implementation.
+**Commissioning state:** the pilot trigger did not itself authorize implementation. The later F008 assignment commissioned the separate-boundary implementation. Live App, connector, and Product acceptance remain separate.
 
 ### Architectural direction
 

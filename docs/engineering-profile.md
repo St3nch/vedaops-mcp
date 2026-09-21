@@ -154,6 +154,8 @@ The pilot CI workflow:
 
 The live Steward VPS is not used as a normal GitHub self-hosted PR runner. Any future self-hosted or custom-runner path requires a separately reviewed containment model.
 
+F008 GitHub collaboration, when commissioned, is a separate process and grant domain from Shadow. Its operator runbook is [`github-collaboration.md`](github-collaboration.md). A green hosted check remains portable admission only.
+
 Workflow-file changes are executable-infrastructure changes and should be reviewed accordingly.
 
 ## Delivery, release, and recovery

@@ -63,6 +63,10 @@ Because Check intentionally exercises an exact committed subject, the normal loc
 
 The candidate commit is neither Product acceptance nor publication. Running a check before the candidate commit would exercise the previous HEAD, not dirty working-tree bytes.
 
+## F008 GitHub collaboration
+
+F008 is not part of the Shadow tool catalog. It is a separate `vedaops-github` process that can, when an operator policy grants it, read GitHub state and perform ordinary pull request collaboration through a pinned official GitHub MCP Server. Push, merge, review submission, and Product acceptance stay outside that process. Setup, the tool allowlist, and the unresolved Issues-write question for conversation comments are in [`docs/github-collaboration.md`](docs/github-collaboration.md).
+
 Effective permission is the intersection of the principal grant, operator project ceiling, project-manifest narrowing, and operation-specific restrictions.
 
 ## Development principle

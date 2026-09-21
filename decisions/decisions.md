@@ -71,3 +71,15 @@ The new project may reuse proven invariants and test ideas from `linux-vedaops-m
 Historical investment alone does not create architecture authority.
 
 CHAZ retains the final decision about legacy retirement and cutover.
+
+## D010 — F008 is a separate GitHub collaboration boundary
+
+F008 is commissioned as a removable provider boundary beside Shadow, not as a Shadow tool expansion.
+
+The provider is the official GitHub MCP Server, pinned in the implementation rather than floated as `latest`. The VedaOps process in front of it owns principal, project, repository, and operation-class grants, the tool allowlist, exact-subject checks, and the pre-effect journal. Shadow grants do not authorize GitHub. Repository files cannot grant GitHub authority. GitHub remains authoritative for pull request state. The journal is not a pull request database.
+
+Ordinary collaboration classes are read, pull request create, title update, body update, conversation comment, and reviewer request. Push, merge, ref mutation, repository file writes, workflow mutation, review submission, release, deployment, administration, and webhooks are outside this boundary.
+
+Issues write is not part of the accepted App permission set. Ordinary conversation comments use an endpoint GitHub documents under both Issues write and Pull requests write. That permission stays unresolved until CHAZ reconciles it.
+
+This decision records the commissioned architecture. It is not Product acceptance of a live App, connector, or runtime, and it does not authorize push, merge, host provisioning, or provider calls.

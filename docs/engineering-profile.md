@@ -1,8 +1,8 @@
 # VedaOps MCP Engineering Profile
 
 **Project:** VedaOps MCP  
-**Workflow adoption:** VedaOps Engineering Workflow v1 pilot  
-**Profile status:** pilot candidate  
+**Workflow adoption:** VedaOps Engineering Workflow v1
+**Profile status:** active; first adoption pilot complete
 **Product Owner:** CHAZ  
 **Project Steward:** ChatGPT
 
@@ -184,4 +184,7 @@ The Workflow v1 pilot is complete only after native records show:
 6. the live Shadow runtime remained outside the pilot;
 7. a fresh session can reconstruct candidate, evidence, review, acceptance/integration state, and unresolved limitations;
 8. useful friction/lessons are recorded before expanding adoption.
+
+Pilot evidence, review persistence, reconstruction findings, and lessons are recorded in
+[`docs/workflow-v1-pilot-closeout.md`](workflow-v1-pilot-closeout.md).
 

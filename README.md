@@ -17,6 +17,8 @@ The MCP is not a general shell, workflow database, GitHub replacement, project P
 
 For project onboarding and Shadow registration, see [`docs/project-onboarding.md`](docs/project-onboarding.md).
 
+For this repository's Workflow v1 pilot profile and verification route, see [`docs/engineering-profile.md`](docs/engineering-profile.md).
+
 ## MCP-01 read/orientation plane
 
 MCP-01 established the stdio controller foundation: deterministic start, launcher-bound principal identity, external operator policy, project-manifest narrowing, bounded project/Git reads, and exact commit comparison.

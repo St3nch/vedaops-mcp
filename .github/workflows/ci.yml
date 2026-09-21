@@ -10,9 +10,9 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Ruff and pytest
-    runs-on: ubuntu-latest
+  portable-admission:
+    name: Portable admission
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -28,22 +28,17 @@ jobs:
           python-version: "3.12"
           enable-cache: false
 
-      - name: Provision host test prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y bubblewrap
-          test -x /usr/bin/bwrap
-          test -x /usr/bin/prlimit
-          test -x /usr/bin/systemd-run
-          docker pull postgres:18-alpine
-          docker image inspect postgres:18-alpine >/dev/null
-
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
 
       - name: Lint
         run: uv run ruff check .
 
-      - name: Test
-        run: uv run pytest -q --tb=short
+      - name: Compile sources and tests
+        run: uv run python -m compileall -q src tests
 
+      - name: Build wheel
+        run: uv build --wheel --offline --out-dir dist
+
+      - name: Run portable tests
+        run: uv run pytest -q tests/test_cli.py tests/test_settings.py --tb=short

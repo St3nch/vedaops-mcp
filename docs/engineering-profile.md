@@ -71,7 +71,18 @@ Hosted pull-request verification:
 
 - `.github/workflows/ci.yml`
 
-The hosted workflow runs the same lint and test commands on GitHub-hosted Ubuntu infrastructure. It explicitly provisions Bubblewrap and the pinned PostgreSQL 18 test image so host-specific isolation/substrate tests do not silently disappear merely because the runner image differs from the VPS.
+The hosted workflow is a credential-free **portable admission layer** on GitHub-hosted Ubuntu 24.04. It proves clean checkout/setup, locked dependency installation, lint, Python compilation, wheel construction, and a small portable test slice.
+
+The full canonical suite remains:
+
+```bash
+uv run ruff check .
+uv run pytest -q --tb=short
+```
+
+That full suite includes Linux isolation and substrate behavior that depends on host primitives such as Bubblewrap/user namespaces, systemd user scopes, and local Docker/PostgreSQL support. GitHub-hosted CI does not claim those proofs when its runner substrate cannot support them faithfully.
+
+A green hosted check therefore means **portable admission passed**, not **full isolation/substrate verification passed**. Full-suite evidence must be recorded separately on a compatible trusted development/check substrate.
 
 Checks prove only the exact source subject they exercised. Dirty local working-tree content is not implied to have been checked.
 
@@ -132,13 +143,16 @@ GitHub carries native hosted lifecycle state such as Pull Requests, hosted check
 
 The pilot CI workflow:
 
-- uses GitHub-hosted runners;
+- uses a pinned GitHub-hosted Ubuntu 24.04 runner label;
 - grants `GITHUB_TOKEN` only `contents: read`;
 - uses no repository/provider/deployment secret;
 - uses no `pull_request_target`;
 - pins external actions to full commit SHAs;
 - disables persisted checkout credentials;
-- performs no push, release, deployment, or runtime mutation.
+- performs no push, release, deployment, or runtime mutation;
+- reports only portable admission, not full Linux isolation/substrate proof.
+
+The live Steward VPS is not used as a normal GitHub self-hosted PR runner. Any future self-hosted or custom-runner path requires a separately reviewed containment model.
 
 Workflow-file changes are executable-infrastructure changes and should be reviewed accordingly.
 

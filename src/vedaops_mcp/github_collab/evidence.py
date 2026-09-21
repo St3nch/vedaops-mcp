@@ -8,6 +8,7 @@ request database.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -27,6 +28,11 @@ from vedaops_mcp.github_collab.policy import (
 
 MAX_OPERATION_RECORD_BYTES = 8192
 _TERMINAL_DETAIL_BUDGET = 500
+CREATE_CANDIDATE_SAMPLE = 3
+COMMENT_ID_SAMPLE = 8
+RECOVERY_SHA_CHARS = 64
+RECOVERY_REF_CHARS = 128
+RECOVERY_ID_CHARS = 64
 
 
 def _timestamp() -> str:
@@ -72,37 +78,109 @@ def record_bytes(payload: dict[str, object]) -> bytes:
     return (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
 
 
+def _max_url() -> str:
+    return "https://github.com/" + ("o" * 39) + "/" + ("r" * 100) + "/pull/1000000000"
+
+
+RECOVERY_URL_CHARS = len(_max_url())
+
+
+def bound_journal_identifier(value: object) -> str:
+    """Keep a native id inside the modeled journal field width."""
+    text = str(value)
+    if text.isdigit() and 1 <= len(text) <= 20:
+        return text
+    if len(text) == RECOVERY_ID_CHARS and all(
+        character in "0123456789abcdef" for character in text
+    ):
+        return text
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def bound_journal_url(value: object) -> str:
+    """Keep a native URL inside the modeled journal field width."""
+    text = value if isinstance(value, str) else str(value)
+    if 1 <= len(text) <= RECOVERY_URL_CHARS and "\n" not in text and "\r" not in text:
+        return text
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _max_create_candidate() -> dict[str, object]:
+    return {
+        "number": "f" * RECOVERY_ID_CHARS,
+        "html_url": _max_url(),
+        "head_ref": "h" * RECOVERY_REF_CHARS,
+        "head_sha": "a" * RECOVERY_SHA_CHARS,
+        "base_ref": "b" * RECOVERY_REF_CHARS,
+        "base_sha": "c" * RECOVERY_SHA_CHARS,
+        "expected_head_sha": "d" * RECOVERY_SHA_CHARS,
+        "expected_base_sha": "e" * RECOVERY_SHA_CHARS,
+        "pre_observed_head_sha": "f" * RECOVERY_SHA_CHARS,
+        "pre_observed_base_sha": "a" * RECOVERY_SHA_CHARS,
+        "post_observed_head_sha": "b" * RECOVERY_SHA_CHARS,
+        "post_observed_base_sha": "c" * RECOVERY_SHA_CHARS,
+        "visible_title_matched": True,
+        "visible_body_matched": True,
+        "draft_matched": True,
+        "exact_subject_matched": False,
+        "base_drift": True,
+        "causality": "unproven",
+    }
+
+
+def _max_create_observed_after() -> dict[str, object]:
+    return {
+        "discovered_count": 1_000_000,
+        "exact_match_count": 1_000_000,
+        "nonmatching_count": 1_000_000,
+        "candidates_truncated": True,
+        "candidate_numbers_sha256": "a" * 64,
+        "candidates": [_max_create_candidate() for _ in range(CREATE_CANDIDATE_SAMPLE)],
+    }
+
+
+def _max_comment_observed_after() -> dict[str, object]:
+    sample = ["b" * RECOVERY_ID_CHARS for _ in range(COMMENT_ID_SAMPLE)]
+    return {
+        "matching_comment_count": 500,
+        "matching_comment_id_sample": sample,
+        "matching_comment_ids_sha256": "b" * 64,
+        "matching_comment_ids_truncated": True,
+        "comment_scan_complete": False,
+        "conflicting": True,
+    }
+
+
+def modeled_terminal_payloads(started: dict[str, object]) -> tuple[dict[str, object], ...]:
+    """Largest create-recovery and comment-recovery records for this start."""
+    payloads: list[dict[str, object]] = []
+    for observed in (_max_create_observed_after(), _max_comment_observed_after()):
+        terminal = dict(started)
+        terminal.update(
+            {
+                "state": "uncertain",
+                "terminal_at": "2026-09-21T00:00:00Z",
+                "dispatched_at": "2026-09-21T00:00:00Z",
+                "effect_dispatched": True,
+                "may_have_occurred": True,
+                "detail": "x" * _TERMINAL_DETAIL_BUDGET,
+                "native_id": "f" * RECOVERY_ID_CHARS,
+                "native_url": _max_url(),
+                "observed_after": observed,
+            }
+        )
+        payloads.append(terminal)
+    return tuple(payloads)
+
+
 def assert_journal_states_fit(started: dict[str, object]) -> None:
     """Reject an operation whose required journal states cannot fit.
 
-    The ceiling is the encoded record, not the provider body. Identity fields
-    are not truncated to make a record fit.
+    The modeled terminal records are the largest create-recovery and
+    comment-recovery shapes this boundary writes. Identity fields stay at
+    that width; they are not shortened after a mutation has been accepted.
     """
-    terminal = dict(started)
-    terminal.update(
-        {
-            "state": "uncertain",
-            "terminal_at": "2026-09-21T00:00:00Z",
-            "dispatched_at": "2026-09-21T00:00:00Z",
-            "effect_dispatched": True,
-            "may_have_occurred": True,
-            "detail": "x" * _TERMINAL_DETAIL_BUDGET,
-            "native_id": "1" * 20,
-            "native_url": "https://github.com/example-org/example-repo/pull/1000000000",
-            "observed_after": {
-                "pull_number": 1_000_000_000,
-                "pre_observed_head_sha": "a" * 40,
-                "pre_observed_base_sha": "b" * 40,
-                "post_observed_head_sha": "c" * 40,
-                "post_observed_base_sha": "d" * 40,
-                "expected_head_sha": "e" * 40,
-                "expected_base_sha": "f" * 40,
-                "comment_id": "1" * 20,
-                "body_sha256": "a" * 64,
-            },
-        }
-    )
-    for payload in (started, terminal):
+    for payload in (started, *modeled_terminal_payloads(started)):
         if len(record_bytes(payload)) > MAX_OPERATION_RECORD_BYTES:
             raise GitHubPolicyError(
                 "VEDAOPS_OPERATION_RECORD_UNAVAILABLE",
@@ -188,6 +266,13 @@ class GitHubJournal:
             raise ValueError("invalid operation terminal state")
         payload = dict(self.payload)
         payload.update(details)
+        detail = payload.get("detail")
+        if isinstance(detail, str):
+            payload["detail"] = detail[:_TERMINAL_DETAIL_BUDGET]
+        if payload.get("native_id") is not None:
+            payload["native_id"] = bound_journal_identifier(payload["native_id"])
+        if payload.get("native_url") is not None:
+            payload["native_url"] = bound_journal_url(payload["native_url"])
         payload["state"] = state
         payload["terminal_at"] = _timestamp()
         try:

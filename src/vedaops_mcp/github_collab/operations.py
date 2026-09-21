@@ -20,7 +20,13 @@ from vedaops_mcp.github_collab.allowlist import (
     catalog_rejection,
 )
 from vedaops_mcp.github_collab.errors import GitHubPolicyError, GitHubProviderError
-from vedaops_mcp.github_collab.evidence import GitHubJournal, start_github_operation
+from vedaops_mcp.github_collab.evidence import (
+    COMMENT_ID_SAMPLE,
+    CREATE_CANDIDATE_SAMPLE,
+    RECOVERY_URL_CHARS,
+    GitHubJournal,
+    start_github_operation,
+)
 from vedaops_mcp.github_collab.permissions import ISSUE_COMMENT_PERMISSION
 from vedaops_mcp.github_collab.policy import GitHubPolicy, GitHubProject, authorize
 from vedaops_mcp.github_collab.provider import (
@@ -375,18 +381,25 @@ def create_pull_request(
             )
         ]
         if len(matched) == 1:
+            limitations = [
+                "an open pull request already existed for this head and base",
+                "no create call was dispatched",
+                _NOT_PRODUCT_ACCEPTANCE,
+                TEXT_COMPARISON_LIMITATION,
+            ]
+            subject = _with_post(target, matched[0])
+            if _base_drift(target, matched[0]):
+                limitations.append(
+                    "base SHA differs between the pre-read branch tip and the existing pull request"
+                )
             return _observation(
                 kind="pr_create",
                 project=project,
                 repository=project.repository,
                 outcome="existing",
-                subject=target | {"expected_head_sha": expected},
+                subject=subject,
                 native=_pull_native(matched[0]),
-                limitations=[
-                    "an open pull request already existed for this head and base",
-                    "no create call was dispatched",
-                    _NOT_PRODUCT_ACCEPTANCE,
-                ],
+                limitations=limitations,
             )
         journal = _start(
             policy,
@@ -783,7 +796,7 @@ def request_reviewers(
         native_id=str(observed["number"]),
         native_url=observed["html_url"],
         observed_after=_pull_subject(observed)
-        | {"requested_reviewers": observed["requested_reviewers"]},
+        | {"requested_reviewers": _fit_reviewers(observed["requested_reviewers"])},
     )
     return _finished(
         journal,
@@ -952,11 +965,10 @@ def _recover_create(
     except (ProviderTransportError, ProviderCallError) as exc:
         found = []
         reason = f"{reason}; follow-up read failed: {_safe_detail(str(exc))}"
-    matched = [
-        item
-        for item in found
-        if _create_matches(
+    discovered = [
+        _create_candidate(
             item,
+            target=target,
             expected_head_sha=expected_head_sha,
             expected_base_sha=expected_base_sha,
             title=title,
@@ -965,22 +977,46 @@ def _recover_create(
             base_branch=base_branch,
             head_branch=head_branch,
         )
+        for item in found
     ]
-    journal.terminal(
+    exact = [item for item in discovered if item["exact_subject_matched"]]
+    nonmatching = [item for item in discovered if not item["exact_subject_matched"]]
+    conflicting = len(discovered) > 1
+    evidence = _bounded_create_evidence(discovered, exact)
+    if any(item["base_drift"] for item in discovered) and expected_base_sha is None:
+        reason = f"{reason}; base SHA differs between the pre-read and the recovered pull request"
+    if expected_base_sha is not None and nonmatching and not exact:
+        reason = f"{reason}; recovered pull request does not match expected_base_sha"
+    if conflicting:
+        reason = f"{reason}; more than one recovered pull request was observed"
+    if not _terminal_after_dispatch(
+        journal,
         "uncertain",
         may_have_occurred=True,
         detail=reason[:500],
-        observed_after=[_pull_subject(item) for item in matched],
-    )
+        observed_after=evidence,
+    ):
+        return _unwritten_terminal(
+            journal,
+            project,
+            "pr_create",
+            target | {"recovery": evidence},
+        )
     return _uncertain(
         journal,
         project,
         "pr_create",
-        subject=target,
-        native=[_pull_native(item) for item in matched],
-        matching_state=len(matched) == 1,
-        reason=reason if len(matched) <= 1 else "more than one matching pull request was observed",
-        conflicting=len(matched) > 1,
+        subject=target | {"recovery": evidence},
+        native={
+            "discovered": discovered[:CREATE_CANDIDATE_SAMPLE],
+            "exact_matches": exact[:CREATE_CANDIDATE_SAMPLE],
+            "nonmatching": nonmatching[:CREATE_CANDIDATE_SAMPLE],
+            "discovered_count": len(discovered),
+            "exact_match_count": len(exact),
+        },
+        matching_state=len(exact) == 1 and len(discovered) == 1,
+        reason=reason,
+        conflicting=conflicting,
     )
 
 
@@ -1047,21 +1083,28 @@ def _recover_comment(
     incomplete = scan_complete is False
     if incomplete:
         reason = f"{reason}; comment page scan was incomplete"
-    conflicting = not incomplete and len(matched) > 1
-    journal.terminal(
+    evidence = _bounded_comment_evidence(matched, scan_complete)
+    conflicting = bool(evidence["conflicting"])
+    if not _terminal_after_dispatch(
+        journal,
         "uncertain",
         may_have_occurred=True,
         detail=reason[:500],
-        observed_comment_ids=[item["id"] for item in matched],
-        comment_scan_complete=scan_complete,
-    )
+        observed_after=evidence,
+    ):
+        return _unwritten_terminal(
+            journal,
+            project,
+            "pr_comment",
+            {"pull_number": pull_number, **evidence},
+        )
     return _uncertain(
         journal,
         project,
         "pr_comment",
-        subject={"pull_number": pull_number, "comment_scan_complete": scan_complete},
-        native=matched,
-        matching_state=not incomplete and len(matched) == 1,
+        subject={"pull_number": pull_number, **evidence},
+        native=evidence,
+        matching_state=not incomplete and evidence["matching_comment_count"] == 1,
         reason=reason if not conflicting else "more than one matching comment was observed",
         conflicting=conflicting,
     )
@@ -1230,6 +1273,97 @@ def _create_matches(
     )
 
 
+def _base_drift(target: dict[str, Any], item: PullView) -> bool:
+    pre_base = target.get("pre_observed_base_sha")
+    if not isinstance(pre_base, str):
+        return False
+    return item["base_sha"].lower() != pre_base.lower()
+
+
+def _create_candidate(
+    item: PullView,
+    *,
+    target: dict[str, Any],
+    expected_head_sha: str,
+    expected_base_sha: str | None,
+    title: str,
+    body: str,
+    draft: bool,
+    base_branch: str,
+    head_branch: str,
+) -> dict[str, Any]:
+    post_head = _fit_sha(item["head_sha"])
+    post_base = _fit_sha(item["base_sha"])
+    exact = _create_matches(
+        item,
+        expected_head_sha=expected_head_sha,
+        expected_base_sha=expected_base_sha,
+        title=title,
+        body=body,
+        draft=draft,
+        base_branch=base_branch,
+        head_branch=head_branch,
+    )
+    return {
+        "number": _fit_number(item["number"]),
+        "html_url": _fit_url(item["html_url"]),
+        "head_ref": _fit_ref(item["head_ref"]),
+        "head_sha": post_head,
+        "base_ref": _fit_ref(item["base_ref"]),
+        "base_sha": post_base,
+        "expected_head_sha": _fit_sha(expected_head_sha),
+        "expected_base_sha": _fit_sha(expected_base_sha),
+        "pre_observed_head_sha": _fit_sha(target.get("pre_observed_head_sha")),
+        "pre_observed_base_sha": _fit_sha(target.get("pre_observed_base_sha")),
+        "post_observed_head_sha": post_head,
+        "post_observed_base_sha": post_base,
+        "visible_title_matched": texts_match("title", title, item["title"]),
+        "visible_body_matched": texts_match("body", body, item["body"]),
+        "draft_matched": bool(item["draft"]) is bool(draft),
+        "exact_subject_matched": exact,
+        "base_drift": _base_drift(target, item),
+        "causality": "unproven",
+    }
+
+
+def _bounded_create_evidence(
+    discovered: list[dict[str, Any]],
+    exact: list[dict[str, Any]],
+) -> dict[str, Any]:
+    numbers = [str(item["number"]) for item in discovered]
+    digest = hashlib.sha256("\n".join(numbers).encode()).hexdigest() if numbers else None
+    return {
+        "discovered_count": len(discovered),
+        "exact_match_count": len(exact),
+        "nonmatching_count": len(discovered) - len(exact),
+        "candidates_truncated": len(discovered) > CREATE_CANDIDATE_SAMPLE,
+        "candidate_numbers_sha256": digest,
+        "candidates": discovered[:CREATE_CANDIDATE_SAMPLE],
+    }
+
+
+def _bounded_comment_evidence(
+    matched: list[CommentView],
+    scan_complete: bool | None,
+) -> dict[str, Any]:
+    hasher = hashlib.sha256()
+    identifiers: list[str] = []
+    for index, item in enumerate(matched):
+        raw = str(item["id"])
+        if index:
+            hasher.update(b"\n")
+        hasher.update(raw.encode("utf-8", errors="replace"))
+        identifiers.append(_fit_comment_id(raw))
+    return {
+        "matching_comment_count": len(identifiers),
+        "matching_comment_id_sample": identifiers[:COMMENT_ID_SAMPLE],
+        "matching_comment_ids_sha256": hasher.hexdigest() if identifiers else None,
+        "matching_comment_ids_truncated": len(identifiers) > COMMENT_ID_SAMPLE,
+        "comment_scan_complete": scan_complete,
+        "conflicting": len(identifiers) > 1,
+    }
+
+
 def _create_mismatch_reason(item: PullView, expected_base_sha: str | None) -> str:
     if expected_base_sha is not None and item["base_sha"].lower() != expected_base_sha.lower():
         return "post-effect base SHA does not match expected_base_sha"
@@ -1250,13 +1384,73 @@ def _with_post(target: dict[str, Any], item: PullView) -> dict[str, Any]:
 
 def _pull_subject(item: PullView) -> dict[str, Any]:
     return {
-        "pull_number": item["number"],
-        "observed_head_sha": item["head_sha"].lower(),
-        "observed_base_sha": item["base_sha"].lower(),
-        "head_ref": item["head_ref"],
-        "base_ref": item["base_ref"],
-        "state": item["state"],
+        "pull_number": _fit_number(item["number"]),
+        "observed_head_sha": _fit_sha(item["head_sha"]),
+        "observed_base_sha": _fit_sha(item["base_sha"]),
+        "head_ref": _fit_ref(item["head_ref"]),
+        "base_ref": _fit_ref(item["base_ref"]),
+        "state": _fit_state(item["state"]),
     }
+
+
+def _digest(value: object) -> str:
+    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()
+
+
+def _fit_sha(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and _SHA.fullmatch(value.lower()) is not None:
+        return value.lower()
+    return _digest(value)
+
+
+def _fit_ref(value: object) -> str:
+    if isinstance(value, str) and _BRANCH.fullmatch(value) is not None:
+        return value
+    return _digest(value)
+
+
+def _fit_url(value: object) -> str:
+    if (
+        isinstance(value, str)
+        and 1 <= len(value) <= RECOVERY_URL_CHARS
+        and "\n" not in value
+        and "\r" not in value
+    ):
+        return value
+    return _digest(value)
+
+
+def _fit_number(value: object) -> int | str:
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 1_000_000_000:
+        return value
+    return _digest(value)
+
+
+def _fit_state(value: object) -> str:
+    if value in {"open", "closed"}:
+        return str(value)
+    return "unrecognized"
+
+
+def _fit_comment_id(value: object) -> str:
+    text = str(value)
+    if text.isdigit() and 1 <= len(text) <= 20:
+        return text
+    return _digest(text)
+
+
+def _fit_reviewers(values: object) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    fitted: list[str] = []
+    for item in values[:10]:
+        if isinstance(item, str) and _REVIEWER.fullmatch(item) is not None:
+            fitted.append(item)
+        else:
+            fitted.append(_digest(item))
+    return fitted
 
 
 def _pull_native(item: PullView) -> dict[str, Any]:

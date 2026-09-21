@@ -27,7 +27,13 @@ from vedaops_mcp.github_collab.errors import (
     GitHubPolicyError,
     GitHubProviderError,
 )
-from vedaops_mcp.github_collab.evidence import GitHubJournal
+from vedaops_mcp.github_collab.evidence import (
+    MAX_OPERATION_RECORD_BYTES,
+    GitHubJournal,
+    assert_journal_states_fit,
+    modeled_terminal_payloads,
+    record_bytes,
+)
 from vedaops_mcp.github_collab.launcher import launch_plan, validate_artifact
 from vedaops_mcp.github_collab.mcp_client import (
     StdioGitHubProvider,
@@ -1857,7 +1863,7 @@ def test_comment_verification_walks_bounded_pages(tmp_path: Path):
 def _handshake_script(mode: str) -> str:
     tools = json.dumps(list(PROVIDER_TOOLS))
     return f"""#!/usr/bin/env python3
-import json, sys
+import json, os, sys, time
 MODE = {mode!r}
 TOOLS = {tools}
 
@@ -1885,11 +1891,21 @@ while True:
             }},
         }})
     elif method == "tools/list":
+        if MODE == "pipe":
+            descriptor = sys.stdin.fileno()
+            sys.stdin.close()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         send({{
             "jsonrpc": "2.0",
             "id": request_id,
             "result": {{"tools": [{{"name": name}} for name in TOOLS]}},
         }})
+        if MODE == "pipe":
+            time.sleep(30)
+            raise SystemExit(0)
     elif method == "tools/call":
         if MODE == "eof":
             break
@@ -1903,6 +1919,10 @@ while True:
             break
         if MODE == "huge":
             sys.stdout.write("Content-Length: 99999999\\r\\n\\r\\n")
+            sys.stdout.flush()
+            break
+        if MODE == "short":
+            sys.stdout.write("Content-Length: 80\\r\\n\\r\\n{{")
             sys.stdout.flush()
             break
         if MODE == "notice":
@@ -1957,13 +1977,22 @@ def test_stdio_transport_failures_are_normalized(tmp_path: Path):
     finally:
         client_module._CALL_DEADLINE_SECONDS = original
 
-    for mode in ("eof", "malformed", "length", "huge"):
+    expected_detail = {
+        "eof": "stdout closed",
+        "malformed": "not valid JSON",
+        "length": "content-length",
+        "huge": "size limit",
+        "short": "stdout closed",
+        "pipe": "pipe",
+    }
+    for mode, detail in expected_detail.items():
         binary = _script(_handshake_script(mode))
         mode_policy, _path = _policy(tmp_path / mode, binary=binary)
         provider = StdioGitHubProvider(mode_policy)
         try:
-            with pytest.raises(ProviderTransportError):
+            with pytest.raises(ProviderTransportError, match=detail) as caught:
                 provider.get_commit("example-org", "alpha", HEAD)
+            assert caught.value.effect_possible is True
         finally:
             provider.close()
 
@@ -1995,3 +2024,320 @@ def test_stdio_transport_failures_are_normalized(tmp_path: Path):
         assert "422" not in caught.value.detail or "status 422" in caught.value.detail
     finally:
         provider.close()
+
+
+def _lost_create(provider: FakeGitHub, *, base_sha: str):
+    def _dispatch(_owner, _repo, **kwargs):
+        pull = provider._add_pull(
+            "example-org",
+            "alpha",
+            title=kwargs["title"],
+            body=kwargs["body"],
+            head=kwargs["head"],
+            base=kwargs["base"],
+            draft=kwargs["draft"],
+        )
+        pull["base_sha"] = base_sha
+        raise ProviderTransportError("connection reset")
+
+    provider.create_pull_request = _dispatch  # type: ignore[method-assign]
+
+
+def test_create_recovery_keeps_nonmatching_candidates(tmp_path: Path):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    _lost_create(provider, base_sha=BASE)
+    matched = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        expected_base_sha=BASE,
+        title="Candidate",
+        body="body",
+    )
+    assert matched["outcome"] == "uncertain"
+    assert matched["uncertainty"]["matching_state"] is True
+    assert matched["uncertainty"]["conflicting"] is False
+    assert matched["uncertainty"]["causality"] == "unproven"
+    assert matched["uncertainty"]["retry_performed"] is False
+    assert matched["native"]["exact_match_count"] == 1
+    assert matched["native"]["discovered"][0]["exact_subject_matched"] is True
+    assert matched["native"]["discovered"][0]["base_drift"] is False
+    assert matched["native"]["discovered"][0]["post_observed_base_sha"] == BASE
+    assert matched["native"]["discovered"][0]["causality"] == "unproven"
+
+    for record in policy.journal_directory.glob("*.json"):
+        record.unlink()
+    provider.pulls.clear()
+    _lost_create(provider, base_sha=OTHER)
+    drifted = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        expected_base_sha=BASE,
+        title="Candidate",
+        body="body",
+    )
+    candidate = drifted["native"]["discovered"][0]
+    assert drifted["outcome"] == "uncertain"
+    assert drifted["outcome"] != "succeeded"
+    assert drifted["uncertainty"]["matching_state"] is False
+    assert drifted["uncertainty"]["retry_performed"] is False
+    assert candidate["exact_subject_matched"] is False
+    assert candidate["pre_observed_base_sha"] == BASE
+    assert candidate["post_observed_base_sha"] == OTHER
+    assert candidate["expected_base_sha"] == BASE
+    assert candidate["visible_title_matched"] is True
+    assert candidate["causality"] == "unproven"
+    assert drifted["native"]["nonmatching"]
+    assert drifted["uncertainty"]["conflicting"] is False
+    assert "expected_base_sha" in drifted["uncertainty"]["reason"]
+    drifted_journal = _journals(policy)[0]["observed_after"]
+    assert drifted_journal["exact_match_count"] == 0
+    assert drifted_journal["candidates"][0]["post_observed_base_sha"] == OTHER
+    assert drifted_journal["candidates"][0]["causality"] == "unproven"
+
+    for record in policy.journal_directory.glob("*.json"):
+        record.unlink()
+    provider.pulls.clear()
+    _lost_create(provider, base_sha=OTHER)
+    noted = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="body",
+    )
+    noted_candidate = noted["native"]["discovered"][0]
+    assert noted["outcome"] == "uncertain"
+    assert noted_candidate["exact_subject_matched"] is True
+    assert noted_candidate["base_drift"] is True
+    assert noted["subject"]["expected_base_sha"] is None
+    assert noted["uncertainty"]["conflicting"] is False
+    assert "base SHA differs" in noted["uncertainty"]["reason"]
+    assert _journals(policy)[0]["observed_after"]["candidates"][0]["base_drift"] is True
+
+    for record in policy.journal_directory.glob("*.json"):
+        record.unlink()
+    provider.pulls.clear()
+    existing_pull = provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="body",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    existing_pull["base_sha"] = OTHER
+    existing = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="body",
+    )
+    assert existing["outcome"] == "existing"
+    assert existing["subject"]["pre_observed_base_sha"] == BASE
+    assert existing["subject"]["post_observed_base_sha"] == OTHER
+    assert "base SHA differs" in " ".join(existing["limitations"])
+    assert "create_pull_request" not in provider.calls
+
+    provider.pulls.clear()
+    attempts = {"count": 0}
+
+    def _conflict(_owner, _repo, **kwargs):
+        attempts["count"] += 1
+        for _ in range(2):
+            pull = provider._add_pull(
+                "example-org",
+                "alpha",
+                title=kwargs["title"],
+                body=kwargs["body"],
+                head=kwargs["head"],
+                base=kwargs["base"],
+                draft=kwargs["draft"],
+            )
+            pull["base_sha"] = BASE
+        raise ProviderTransportError("connection reset")
+
+    provider.create_pull_request = _conflict  # type: ignore[method-assign]
+    conflict = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        expected_base_sha=BASE,
+        title="Candidate",
+        body="body",
+    )
+    assert conflict["outcome"] == "uncertain"
+    assert conflict["uncertainty"]["conflicting"] is True
+    assert conflict["uncertainty"]["matching_state"] is False
+    assert conflict["native"]["discovered_count"] == 2
+    assert conflict["native"]["exact_match_count"] == 2
+    assert len(conflict["native"]["exact_matches"]) == 2
+    assert conflict["uncertainty"]["retry_performed"] is False
+    assert conflict["uncertainty"]["causality"] == "unproven"
+    assert attempts["count"] == 1
+    stored = _journals(policy)[0]["observed_after"]
+    assert stored["discovered_count"] == 2
+    assert stored["candidates_truncated"] is False
+    assert stored["candidate_numbers_sha256"]
+    assert all(item["causality"] == "unproven" for item in stored["candidates"])
+
+
+def test_comment_recovery_evidence_stays_within_the_journal_ceiling(tmp_path: Path):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    body = "COMMENTBODYCANARY"
+    for index in range(500):
+        provider.comments.append(
+            {
+                "id": str(1000 + index),
+                "body": body,
+                "html_url": f"https://github.com/example-org/alpha/pull/7#issuecomment-{index}",
+                "user_login": "example-app[bot]",
+                "created_at": "2099-01-01T00:00:00Z",
+                "pull_number": 7,
+            }
+        )
+
+    attempts = {"count": 0}
+
+    def _lose(*_args, **_kwargs):
+        attempts["count"] += 1
+        raise ProviderTransportError("connection reset")
+
+    provider.add_pull_request_comment = _lose  # type: ignore[method-assign]
+    result = add_pull_request_comment(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        body=body,
+    )
+    assert result["outcome"] == "uncertain"
+    assert result["uncertainty"]["retry_performed"] is False
+    assert result["uncertainty"]["matching_state"] is False
+    assert result["subject"]["matching_comment_count"] == 500
+    assert result["subject"]["conflicting"] is True
+    assert result["subject"]["comment_scan_complete"] is False
+    assert len(result["subject"]["matching_comment_id_sample"]) == 8
+    assert result["subject"]["matching_comment_ids_truncated"] is True
+    assert attempts["count"] == 1
+    pages = [
+        call
+        for call in provider.calls
+        if isinstance(call, tuple) and call[0] == "list_comments"
+    ]
+    assert [call[2] for call in pages] == [1, 2, 3, 4, 5]
+    journal = _body_journal(policy)
+    assert len(journal.encode()) <= MAX_OPERATION_RECORD_BYTES
+    assert body not in journal
+    recorded = json.loads(journal)
+    observed = recorded["observed_after"]
+    assert observed["matching_comment_count"] == 500
+    assert observed["conflicting"] is True
+    assert observed["comment_scan_complete"] is False
+    assert observed["matching_comment_id_sample"] == [str(1000 + index) for index in range(8)]
+    assert observed["matching_comment_ids_sha256"]
+    assert "1499" not in observed["matching_comment_id_sample"]
+    assert recorded["effect_dispatched"] is True
+    assert recorded["state"] == "uncertain"
+
+
+def test_modeled_terminal_records_fit_the_journal_ceiling() -> None:
+    started = {
+        "schema_version": 1,
+        "domain": "f008",
+        "operation_id": "f" * 32,
+        "state": "started",
+        "started_at": "2026-09-21T00:00:00Z",
+        "principal_id": "p" * 64,
+        "project_id": "a" * 128,
+        "project_root": {
+            "declared_path": "/" + ("d" * 512),
+            "provenance": "operator_policy",
+            "filesystem_verified": False,
+        },
+        "github_repository": ("o" * 39) + "/" + ("r" * 100),
+        "kind": "pr_create",
+        "target": {
+            "base": "b" * 128,
+            "draft": True,
+            "head": "h" * 128,
+            "observed_base_sha": "a" * 64,
+            "observed_head_sha": "b" * 64,
+            "pre_observed_base_sha": "c" * 64,
+            "pre_observed_head_sha": "d" * 64,
+            "expected_head_sha": "e" * 64,
+            "expected_base_sha": "f" * 64,
+            "body_sha256": "c" * 64,
+            "body_characters": 16384,
+            "body_bytes": 65536,
+        },
+        "intention_sha256": "e" * 64,
+        "authorization_basis": (
+            "operator-policy:"
+            + ("a" * 64)
+            + ":principal:"
+            + ("p" * 64)
+            + ":project:"
+            + ("a" * 128)
+            + ":operation:pr_request_reviewers"
+        ),
+        "provider_id": "github-mcp-server",
+        "provider_release": PROVIDER_RELEASE,
+        "provider_commit": PROVIDER_COMMIT,
+        "provider_feature": PROVIDER_FEATURE,
+        "effect_dispatched": False,
+        "may_have_occurred": False,
+        "pid": 2_000_000_000,
+        "expected_source_sha": "a" * 64,
+    }
+    assert_journal_states_fit(started)
+    for terminal in modeled_terminal_payloads(started):
+        assert len(record_bytes(terminal)) <= MAX_OPERATION_RECORD_BYTES
+    started["project_root"] = {
+        "declared_path": "/" + ("d" * 8000),
+        "provenance": "operator_policy",
+        "filesystem_verified": False,
+    }
+    with pytest.raises(GitHubPolicyError, match="record ceiling"):
+        assert_journal_states_fit(started)

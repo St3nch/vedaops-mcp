@@ -182,10 +182,25 @@ class StdioGitHubProvider:
         )
         return parse_comments(payload)
 
-    def list_reviews(self, owner: str, repo: str, number: int) -> list[ReviewView]:
+    def list_reviews(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        page: int = 1,
+        per_page: int = 30,
+    ) -> list[ReviewView]:
         payload = self._tool(
             "pull_request_read",
-            {"method": "get_reviews", "owner": owner, "repo": repo, "pullNumber": number},
+            pull_request_read_arguments(
+                owner,
+                repo,
+                number,
+                "get_reviews",
+                page,
+                per_page,
+                None,
+            ),
         )
         return parse_reviews(payload)
 

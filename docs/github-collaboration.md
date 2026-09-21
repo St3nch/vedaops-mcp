@@ -43,7 +43,7 @@ Authentication is GitHub App installation token mode (`--app-id`, `--app-install
 
 `actions_list`, `add_issue_comment`, `create_pull_request`, `get_commit`, `get_me`, `list_pull_requests`, `pull_request_read`, `request_pull_request_reviewers`, `update_pull_request_body`, `update_pull_request_title`.
 
-VedaOps calls `get_commit` with `detail=none`. `pull_request_read` is limited to its read methods: `get`, `get_diff`, `get_status`, `get_files`, `get_commits`, `get_review_comments`, `get_reviews`, `get_comments`, `get_check_runs`. `get_review_comments` pages with the upstream `after` cursor. An ordinary `page` value is rejected for that method and is not sent as a review-thread offset. `actions_list` is limited to `list_workflows`, `list_workflow_runs`, and `list_workflow_jobs`. Artifact listing, log download, and workflow dispatch are rejected before a provider call.
+VedaOps calls `get_commit` with `detail=none`. `pull_request_read` is limited to its read methods: `get`, `get_diff`, `get_status`, `get_files`, `get_commits`, `get_review_comments`, `get_reviews`, `get_comments`, `get_check_runs`. `get_review_comments` pages with the upstream `after` cursor and `perPage`. An ordinary `page` value is rejected for that method and is not sent as a review-thread offset. The other read methods, including `get_reviews`, use `page` and `perPage`. `actions_list` is limited to `list_workflows`, `list_workflow_runs`, and `list_workflow_jobs`. Artifact listing, log download, and workflow dispatch are rejected before a provider call.
 
 `add_issue_comment` is used only after a pull request read succeeds, and only with a body. Reactions are not sent. `create_pull_request` is not given reviewers or `maintainer_can_modify`.
 
@@ -104,12 +104,13 @@ Use a dedicated Unix account, `vedaops-github`, with no login shell. Trusted con
 
 | Path | Owner and mode | Contents |
 | --- | --- | --- |
-| `/etc/vedaops-github/policy.toml` | `root:root` `0644` | operator grants, no PEM |
+| `/etc/vedaops-github/` | `root:vedaops-github` `0750` | trusted configuration directory |
+| `/etc/vedaops-github/policy.toml` | `root:vedaops-github` `0640` | operator grants, no PEM |
 | `/etc/vedaops-github/app.pem` | `root:vedaops-github` `0440` | GitHub App private key |
 | `/usr/local/lib/vedaops-github/github-mcp-server` | `root:root` `0755` | extracted provider executable |
 | `/var/lib/vedaops-github/operations/` | `vedaops-github` `0700` | journal |
 
-The F008 process must be able to read the policy, the key, and the executable, and must not have write permission on those files or their parent directories. `ProtectSystem=strict` with `ReadWritePaths` limited to the journal is the host enforcement. The code refuses a policy, key, or executable that the current uid can write, and it refuses an executable whose parent directory the current uid can write. Root ownership matters because a file owned by `vedaops-github` could still be chmod'd by that user. The supported deployment keeps policy, key, and executable owned by root.
+The F008 process must be able to read the policy, the key, and the executable. It must not be able to rewrite them. Owning the file is rewrite authority even when the write bit is clear, because that uid can chmod it. The same rule applies to every ancestor directory. A sticky directory does not let the runtime replace another user's entry. `ProtectSystem=strict` with `ReadWritePaths` limited to the journal is the host enforcement of that split. The supported deployment keeps policy, key, and executable owned by root. The hash is the file contents immediately before launch. It is not a kernel-enforced immutable binding.
 
 The official GitHub MCP process is started as the same Unix user as `vedaops-github`. It is part of that runtime's trusted computing base. F008 does not claim a separate OS identity or mount namespace between the wrapper and the child. The hash check binds which executable that identity runs. It does not sandbox the child from the wrapper.
 
@@ -125,7 +126,7 @@ Do not `systemctl enable` the unit. It is a sandbox profile for a foreground std
 
 Disabling F008 is `enabled = false` in the operator policy, or not running `vedaops-github`. The Shadow tool catalog does not include these tools. Removing the package does not remove Orient, Inspect, Change, or Check.
 
-Revocation is: set `enabled = false`, stop any F008 process, delete or shred `secrets/app.pem`, and uninstall or suspend the GitHub App installation in GitHub. Suspended installation tokens stop working on their own expiry as well. Shadow keeps running. The journal can remain for evidence; it does not contain the key.
+Revocation is: set `enabled = false`, stop any F008 process, delete or shred `/etc/vedaops-github/app.pem`, and uninstall or suspend the GitHub App installation in GitHub. Suspended installation tokens stop working on their own expiry as well. Shadow keeps running. The journal can remain for evidence; it does not contain the key.
 
 ## Local commands
 

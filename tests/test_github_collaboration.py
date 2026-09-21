@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -41,9 +42,11 @@ from vedaops_mcp.github_collab.operations import (
     update_pull_request_title,
 )
 from vedaops_mcp.github_collab.policy import (
+    RuntimeIdentity,
     authorize,
     load_policy,
     principal_from_environ,
+    runtime_can_rewrite_trusted_chain,
 )
 from vedaops_mcp.github_collab.provider import (
     ProviderCallError,
@@ -156,8 +159,15 @@ class FakeGitHub:
         self.calls.append(("list_comments", number))
         return [item for item in self.comments if item["pull_number"] == number]
 
-    def list_reviews(self, owner: str, repo: str, number: int) -> list:
-        self.calls.append(("list_reviews", number))
+    def list_reviews(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        page: int = 1,
+        per_page: int = 30,
+    ) -> list:
+        self.calls.append(("list_reviews", number, page, per_page))
         return list(self.reviews)
 
     def list_actions(
@@ -292,6 +302,23 @@ class FakeGitHub:
 
 def _chmod(path: Path, mode: int) -> None:
     os.chmod(path, mode)
+
+
+def _stat(mode: int, uid: int, gid: int = 0) -> os.stat_result:
+    return os.stat_result((mode, 1, 1, 1, uid, gid, 0, 0, 0, 0))
+
+
+@pytest.fixture(autouse=True)
+def service_identity_does_not_own_operator_fixtures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This process owns the fixtures and stands in for the operator.
+
+    Trusted-path checks use another uid, so those files model root-owned
+    configuration relative to the F008 runtime identity.
+    """
+    monkeypatch.setattr(
+        "vedaops_mcp.github_collab.policy.current_runtime_identity",
+        lambda: RuntimeIdentity(65534, frozenset({65534})),
+    )
 
 
 def _write_policy(
@@ -962,15 +989,46 @@ def test_installed_executable_digest_is_checked_before_launch(tmp_path: Path):
         load_policy(path)
 
 
-def test_service_writable_executable_is_refused(tmp_path: Path):
+def test_runtime_ownership_can_rewrite_without_a_write_bit():
+    service = RuntimeIdentity(50, frozenset({50}))
+    root = _stat(0o755, uid=0)
+    parent = _stat(0o555, uid=0)
+    owned = _stat(0o555, uid=50)
+    safe = _stat(0o555, uid=0)
+    assert runtime_can_rewrite_trusted_chain([root, parent, owned], service)
+    assert not runtime_can_rewrite_trusted_chain([root, parent, safe], service)
+    ancestor = _stat(0o777, uid=0)
+    assert runtime_can_rewrite_trusted_chain([root, ancestor, parent, safe], service)
+    sticky = _stat(stat.S_ISVTX | 0o777, uid=0)
+    assert not runtime_can_rewrite_trusted_chain([sticky, safe], service)
+    assert runtime_can_rewrite_trusted_chain([sticky, owned], service)
+    group_directory = _stat(0o775, uid=0, gid=50)
+    assert runtime_can_rewrite_trusted_chain([root, group_directory, safe], service)
+
+
+def test_service_writable_executable_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     policy, path = _policy(tmp_path)
     binary = policy.binary_path
     assert binary is not None
     _chmod(binary.parent, 0o755)
-    _chmod(binary, 0o755)
+    _chmod(binary, 0o666)
     with pytest.raises(GitHubPolicyError, match="must not be writable"):
         load_policy(path)
     _chmod(binary, 0o555)
+    _chmod(binary.parent, 0o777)
+    with pytest.raises(GitHubPolicyError, match="must not be writable"):
+        load_policy(path)
+    _chmod(binary.parent, 0o555)
+    _chmod(tmp_path, 0o777)
+    with pytest.raises(GitHubPolicyError, match="must not be writable"):
+        load_policy(path)
+    _chmod(tmp_path, 0o755)
+    monkeypatch.setattr(
+        "vedaops_mcp.github_collab.policy.current_runtime_identity",
+        lambda: RuntimeIdentity(os.geteuid(), frozenset(os.getgroups()) | {os.getegid()}),
+    )
+    _chmod(binary, 0o555)
+    _chmod(binary.parent, 0o555)
     with pytest.raises(GitHubPolicyError, match="must not be writable"):
         load_policy(path)
 
@@ -1042,6 +1100,80 @@ def test_create_does_not_succeed_when_body_or_draft_differs(tmp_path: Path):
     assert existing["code"] == "open_pull_request_exists"
     assert "create_pull_request" not in provider.calls
 
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="intended body",
+        head="feature",
+        base="main",
+        draft=True,
+    )
+    wrong_existing_draft = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="intended body",
+        draft=False,
+    )
+    assert wrong_existing_draft["outcome"] == "failed"
+    assert "create_pull_request" not in provider.calls
+
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="intended body",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    satisfied = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="intended body",
+        draft=False,
+    )
+    assert satisfied["outcome"] == "existing"
+    assert "create_pull_request" not in provider.calls
+
+    for record in policy.journal_directory.glob("*.json"):
+        record.unlink()
+    provider = FakeGitHub(policy.journal_directory)
+    provider.transport_on = "create"
+    provider.distort_body = "different body"
+    recovered = create_pull_request(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        head="feature",
+        base="main",
+        expected_head_sha=HEAD,
+        title="Candidate",
+        body="intended body",
+        draft=False,
+    )
+    assert recovered["outcome"] == "uncertain"
+    assert recovered["uncertainty"]["matching_state"] is False
+    assert recovered["uncertainty"]["retry_performed"] is False
+
 
 def test_review_threads_use_cursor_pagination(tmp_path: Path):
     policy, _path = _policy(tmp_path)
@@ -1095,6 +1227,26 @@ def test_review_threads_use_cursor_pagination(tmp_path: Path):
     ordinary = pull_request_read_arguments("example-org", "alpha", 7, "get", 2, 30, None)
     assert ordinary["page"] == 2
     assert "after" not in ordinary
+    reviews = pull_request_read_arguments("example-org", "alpha", 7, "get_reviews", 2, 10, None)
+    assert reviews == {
+        "method": "get_reviews",
+        "owner": "example-org",
+        "repo": "alpha",
+        "pullNumber": 7,
+        "page": 2,
+        "perPage": 10,
+    }
+    with pytest.raises(GitHubPolicyError, match="cursor"):
+        read_pull_request(
+            policy,
+            provider,
+            principal_id=PRINCIPAL,
+            project_id="alpha",
+            github_repository="example-org/alpha",
+            number=7,
+            method="get_review_comments",
+            after="x" * 257,
+        )
 
 
 def _fake_server_script(tools: list[str], version: str) -> str:

@@ -110,7 +110,14 @@ class GitHubProvider(Protocol):
 
     def list_comments(self, owner: str, repo: str, number: int) -> list[CommentView]: ...
 
-    def list_reviews(self, owner: str, repo: str, number: int) -> list[ReviewView]: ...
+    def list_reviews(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        page: int = 1,
+        per_page: int = 30,
+    ) -> list[ReviewView]: ...
 
     def list_actions(
         self,

@@ -140,7 +140,13 @@ def read_pull_request(
             "pull request read method is not in the accepted read set",
         )
     if method == "get_reviews":
-        reviews = provider.list_reviews(project.owner, project.repo, pull_number)
+        reviews = provider.list_reviews(
+            project.owner,
+            project.repo,
+            pull_number,
+            page,
+            per_page,
+        )
         annotated = [_annotate_review(policy, review) for review in reviews]
         return _observation(
             kind="pull_request_reviews",

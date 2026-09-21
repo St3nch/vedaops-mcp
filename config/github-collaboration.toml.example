@@ -2,8 +2,9 @@
 #
 # Copy it to an operator-owned path outside every managed project root and
 # outside the service-writable journal, then set the real paths, App id, and
-# installation id. The runtime copy should be root-owned mode 0644 so
-# vedaops-github can read it and cannot rewrite it. Do not commit the copy.
+# installation id. The runtime copy should be mode 0640, owned by
+# root:vedaops-github, so the service can read it and cannot rewrite it.
+# Do not commit the copy.
 #
 # Point the F008 process at it with VEDAOPS_GITHUB_POLICY.
 # The principal is VEDAOPS_GITHUB_PRINCIPAL, not VEDAOPS_AGENT_ID.

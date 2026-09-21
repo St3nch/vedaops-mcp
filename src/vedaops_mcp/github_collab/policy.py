@@ -11,7 +11,7 @@ import os
 import re
 import stat
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,6 +61,22 @@ _GRANT_KEYS = frozenset({"project", "operations"})
 
 POLICY_ENVIRONMENT_VARIABLE = "VEDAOPS_GITHUB_POLICY"
 PRINCIPAL_ENVIRONMENT_VARIABLE = "VEDAOPS_GITHUB_PRINCIPAL"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeIdentity:
+    """Unix identity that must not be able to rewrite trusted F008 files."""
+
+    uid: int
+    gids: frozenset[int]
+
+
+def current_runtime_identity() -> RuntimeIdentity:
+    """Identity of this process. Production runs as ``vedaops-github``."""
+    return RuntimeIdentity(
+        uid=os.geteuid(),
+        gids=frozenset(os.getgroups()) | {os.getegid()},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,16 +244,15 @@ def load_policy(path: Path, *, require_runtime_paths: bool = True) -> GitHubPoli
             "the GitHub App private key",
         )
     _reject_inside_directory(resolved, journal_directory, "the F008 policy file")
-    _require_not_runtime_writable(resolved, "the F008 policy file")
+    _require_not_runtime_replaceable(resolved, "the F008 policy file")
     if require_runtime_paths and binary_path is not None and executable_sha256 is not None:
         verify_installed_executable(binary_path, executable_sha256)
+    if require_runtime_paths and private_key_path is not None:
+        _require_secret_file(private_key_path)
     if require_runtime_paths and policy.enabled:
         _require_directory(journal_directory, "the F008 journal", private=True)
         for project in projects:
             _require_directory(project.root, f"project {project.id} root", private=False)
-        if private_key_path is not None:
-            _require_secret_file(private_key_path)
-            _require_not_runtime_writable(private_key_path, "the GitHub App private key")
     return policy
 
 
@@ -529,15 +544,10 @@ def _policy_file(path: Path) -> Path:
             "VEDAOPS_GITHUB_POLICY_INSECURE",
             "the F008 policy file must be a regular file",
         )
-    if info.st_uid not in {0, os.getuid()}:
+    if not os.access(resolved, os.R_OK):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_INSECURE",
-            "the F008 policy file must be owned by root or the operator",
-        )
-    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise GitHubPolicyError(
-            "VEDAOPS_GITHUB_POLICY_INSECURE",
-            "the F008 policy file must not be group- or world-writable",
+            "the F008 policy file must be readable by the runtime identity",
         )
     return resolved
 
@@ -595,21 +605,17 @@ def _require_secret_file(path: Path) -> None:
             "VEDAOPS_GITHUB_POLICY_INSECURE",
             "the GitHub App private key must be a regular file",
         )
-    if info.st_uid not in {0, os.getuid()}:
-        raise GitHubPolicyError(
-            "VEDAOPS_GITHUB_POLICY_INSECURE",
-            "the GitHub App private key must be owned by root or the service user",
-        )
     if info.st_mode & (stat.S_IRWXO | stat.S_IWGRP):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_INSECURE",
             "the GitHub App private key must not be world-accessible or group-writable",
         )
-    if not os.access(resolved, os.R_OK):
+    if not os.access(path, os.R_OK):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_INSECURE",
             "the GitHub App private key must be readable by the runtime identity",
         )
+    _require_not_runtime_replaceable(path, "the GitHub App private key")
 
 
 def sha256_file(path: Path) -> str:
@@ -670,46 +676,119 @@ def _reject_inside_directory(candidate: Path, container: Path, label: str) -> No
             )
 
 
-def _require_not_runtime_writable(path: Path, label: str) -> None:
-    if os.access(path, os.W_OK) or os.access(path.parent, os.W_OK):
+def runtime_can_rewrite_trusted_chain(
+    chain: Sequence[os.stat_result],
+    identity: RuntimeIdentity,
+) -> bool:
+    """Return whether ``identity`` can replace the last path component.
+
+    Owning a file or directory counts even when its write bit is clear,
+    because that uid can chmod it. A sticky directory does not let the
+    identity replace a child owned by someone else.
+    """
+    if not chain:
+        return True
+    for index, info in enumerate(chain):
+        if index == len(chain) - 1:
+            if _identity_can_rewrite_file(info, identity):
+                return True
+            continue
+        if _directory_can_replace_child(info, chain[index + 1], identity):
+            return True
+    return False
+
+
+def _require_not_runtime_replaceable(path: Path, label: str) -> None:
+    chain = _trusted_file_chain(path, label)
+    if not stat.S_ISREG(chain[-1].st_mode):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            f"{label} must be a regular file",
+        )
+    if runtime_can_rewrite_trusted_chain(chain, current_runtime_identity()):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_INSECURE",
             f"{label} must not be writable by the F008 runtime identity",
         )
 
 
-def _require_unwritable_executable(path: Path) -> None:
+def _trusted_file_chain(path: Path, label: str) -> list[os.stat_result]:
+    absolute = path.expanduser().absolute()
+    current = Path(absolute.anchor)
+    chain: list[os.stat_result] = []
     try:
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise GitHubPolicyError(
-                "VEDAOPS_GITHUB_POLICY_INSECURE",
-                "the GitHub MCP Server binary must not be a symbolic link",
-            )
-        resolved = path.resolve(strict=True)
-        info = resolved.stat()
-    except GitHubPolicyError:
-        raise
+        info = current.lstat()
     except OSError as exc:
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_UNAVAILABLE",
-            "the GitHub MCP Server binary is unavailable",
+            f"{label} is unavailable",
         ) from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise GitHubPolicyError(
+            "VEDAOPS_GITHUB_POLICY_INSECURE",
+            f"{label} must not be a symbolic link",
+        )
+    chain.append(info)
+    if absolute == current:
+        return chain
+    for part in absolute.relative_to(current).parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise GitHubPolicyError(
+                "VEDAOPS_GITHUB_POLICY_UNAVAILABLE",
+                f"{label} is unavailable",
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise GitHubPolicyError(
+                "VEDAOPS_GITHUB_POLICY_INSECURE",
+                f"{label} must not be reached through a symbolic link",
+            )
+        chain.append(info)
+    return chain
+
+
+def _identity_can_rewrite_file(info: os.stat_result, identity: RuntimeIdentity) -> bool:
+    if info.st_uid == identity.uid:
+        return True
+    if info.st_mode & stat.S_IWOTH:
+        return True
+    return bool(info.st_mode & stat.S_IWGRP and info.st_gid in identity.gids)
+
+
+def _directory_can_replace_child(
+    directory: os.stat_result,
+    child: os.stat_result,
+    identity: RuntimeIdentity,
+) -> bool:
+    if directory.st_uid == identity.uid:
+        return True
+    other_writable = bool(directory.st_mode & stat.S_IWOTH)
+    group_writable = bool(directory.st_mode & stat.S_IWGRP and directory.st_gid in identity.gids)
+    if not other_writable and not group_writable:
+        return False
+    sticky = bool(directory.st_mode & stat.S_ISVTX)
+    return not sticky or child.st_uid == identity.uid
+
+
+def _require_unwritable_executable(path: Path) -> None:
+    chain = _trusted_file_chain(path, "the GitHub MCP Server binary")
+    info = chain[-1]
     if not stat.S_ISREG(info.st_mode):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_INSECURE",
             "the GitHub MCP Server binary must be a regular file",
         )
-    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    if runtime_can_rewrite_trusted_chain(chain, current_runtime_identity()):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_INSECURE",
-            "the GitHub MCP Server binary must not be group- or world-writable",
+            "the GitHub MCP Server binary must not be writable by the F008 runtime identity",
         )
-    if not os.access(resolved, os.X_OK):
+    if not os.access(path, os.X_OK):
         raise GitHubPolicyError(
             "VEDAOPS_GITHUB_POLICY_INSECURE",
             "the GitHub MCP Server binary must be executable by the runtime identity",
         )
-    _require_not_runtime_writable(resolved, "the GitHub MCP Server binary")
 
 

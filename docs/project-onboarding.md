@@ -1,18 +1,71 @@
 # VedaOps MCP Project Onboarding Guide
 
-This guide describes how to onboard a repository into VedaOps MCP Shadow without turning onboarding into a permission shortcut.
+This guide is the canonical procedure for onboarding a repository into the VedaOps project workflow.
 
-The goal is simple:
+Onboarding covers two separate authority planes:
+
+1. **VedaOps MCP Shadow** — local repository Orient, Inspect, Change, and Check.
+2. **VedaOps GitHub / F008 GitHub Collaboration** — native GitHub collaboration through the separate `vedaops-github` process, when that plane is intended.
+
+F008 is accepted, live, and part of normal project work. It is optional for each project. A repository that only needs local work is onboarded when Shadow represents it correctly. A repository that also needs pull-request collaboration is onboarded when both planes represent it correctly.
+
+The Shadow goal is:
 
 > A fresh Steward should be able to identify the project, read its accepted context, understand its effective authority, inspect Git state, make only explicitly delegated local changes, and run only operator-approved checks.
 
-Onboarding a repository does **not** grant Product authority, push permission, deployment authority, provider access, or arbitrary execution.
+The F008 goal, when that plane is in scope, is:
+
+> The same Steward, through the separate VedaOps GitHub client, should be able to read the granted repository and perform only the pull-request collaboration classes the operator granted.
+
+Onboarding a repository does **not** grant Product authority, push permission, merge permission, deployment authority, provider spend, release authority, repository administration, or arbitrary execution.
 
 ---
 
 ## 1. Mental model
 
-VedaOps MCP separates four things that are easy to accidentally blur together:
+Project onboarding has two planes. They stay mechanically and conceptually separate.
+
+```text
+Project onboarding
+├── Local development authority
+│   └── VedaOps MCP Shadow
+│       ├── read
+│       ├── change
+│       └── check
+└── GitHub collaboration authority
+    └── VedaOps GitHub / F008
+        ├── read
+        ├── PR create
+        ├── title/body update
+        ├── PR comments
+        └── reviewer requests
+```
+
+| Plane | Process | Principal | Authority source |
+| --- | --- | --- | --- |
+| Local repository | VedaOps MCP Shadow | `chatgpt-shadow` | Shadow operator registry/policy, confirmed with `vedaops_server_info` |
+| GitHub collaboration | `vedaops-github` | `project-steward` | `/etc/vedaops-github/policy.toml` |
+
+These boundaries hold for every project:
+
+- A Shadow grant does not authorize GitHub.
+- An F008 grant does not authorize Shadow.
+- Adding a repository to the VedaOps Steward GitHub App installation gives that installation credential reachability to the repository. It does not grant F008 authority.
+- F008 authority comes from the external operator policy at `/etc/vedaops-github/policy.toml`.
+- Shadow authority comes from its own external operator registry/policy.
+- Repository files cannot enlarge either operator grant.
+- The F008 principal is `project-steward`. The Shadow principal is `chatgpt-shadow`.
+- An F008 project `root` is operator-declared provenance and a lexical trust boundary. F008 does not traverse or own the project checkout.
+- Project development checkouts stay owned by the development user. Do not `chown` them to `vedaops-github`.
+- The VedaOps Steward GitHub App stays installed only on selected repositories.
+- Push, merge, Product acceptance, deployment, provider spend, release authority, and repository administration stay separately governed. Onboarding does not grant them.
+- F008 has no merge class and no push class. Naming either class makes the F008 policy invalid.
+- VedaOps does not keep a second copy of GitHub pull-request lifecycle state. GitHub remains authoritative for that state.
+- Grant the smallest operation set the project actually needs.
+
+### Shadow authority
+
+VedaOps MCP Shadow separates four things that are easy to accidentally blur together:
 
 1. **Project manifest** — what the repository declares it can support.
 2. **Operator policy** — the external capability ceiling for that project.
@@ -32,13 +85,30 @@ A repository cannot grant itself more authority by editing its manifest.
 
 A tool appearing in the MCP catalog also does not mean that tool is authorized for every project. Always inspect the project's **effective capabilities**.
 
-The current capability vocabulary is:
+The Shadow capability vocabulary is:
 
 - `read`
 - `change`
 - `check`
 
 Unknown capability names fail closed.
+
+### F008 authority
+
+F008 evaluates a different intersection, and only inside `vedaops-github`:
+
+```text
+project-steward grant for that project
+∩ project mapping to one github_owner/github_repo
+∩ operation class
+∩ App installation reachability for that selected repository
+```
+
+The operation classes are `read`, `pr_create`, `pr_update_title`, `pr_update_body`, `pr_comment`, and `pr_request_reviewers`.
+
+The App installation and the policy grant answer different questions. Reachability means the installation token can address that selected repository. The grant means `project-steward` may ask F008 to perform those classes there. A call needs both. `VEDAOPS_AGENT_ID` does not name the F008 principal. Shadow project policy is not consulted.
+
+The security model, provider pin, permission table, and one-time connector verification stay in [`github-collaboration.md`](github-collaboration.md). This guide is the per-project onboarding and migration procedure.
 
 ---
 
@@ -56,9 +126,9 @@ Typical repository-owned onboarding material:
 
 The manifest is readable project authority, but ordinary VedaOps Change operations cannot mutate it.
 
-### Operator-owned
+### Operator-owned, VedaOps MCP Shadow
 
-The active registry/policy must live outside managed project roots.
+The active Shadow registry/policy must live outside managed project roots.
 
 Typical Shadow policy:
 
@@ -68,7 +138,7 @@ Typical Shadow policy:
 
 The exact path is launcher/operator configuration. Confirm it with `vedaops_server_info`; do not assume it from this guide.
 
-Operator policy defines:
+Shadow operator policy defines:
 
 - registered project roots;
 - workspace identity;
@@ -77,7 +147,17 @@ Operator policy defines:
 - approved checks;
 - principal grants.
 
-Do not place credentials, provider secrets, deployment secrets, or application DSNs in project manifests or MCP policy merely to make onboarding convenient.
+### Operator-owned, VedaOps GitHub
+
+F008 operator policy lives at `/etc/vedaops-github/policy.toml`. It holds project mappings and the grants under `project-steward`. The file is root-owned and readable by the `vedaops-github` account, which cannot rewrite it.
+
+The VedaOps Steward GitHub App installation, limited to selected repositories, is credential reachability. It is a separate operator fact from the policy grant.
+
+The App private key stays at its root-owned secret path. It does not belong in a project repository, a manifest, Shadow policy, or this guide.
+
+F008 records each project `root` as declared provenance. The policy file, the App key, the provider executable, and the journal sit outside every declared project path. The development user keeps ownership of the checkout.
+
+Do not place credentials, provider secrets, deployment secrets, or application DSNs in project manifests or either operator policy merely to make onboarding convenient.
 
 ---
 
@@ -146,9 +226,9 @@ If identity is missing, `project_git_commit` fails closed rather than falling ba
 
 ---
 
-## 5. Add the project to operator policy
+## 5. Add the project to Shadow operator policy
 
-Use the active policy identified by `vedaops_server_info`.
+Use the active Shadow policy identified by `vedaops_server_info`.
 
 Example registration:
 
@@ -181,11 +261,13 @@ and grant the principal only `read`.
 
 This lets the Steward verify identity, context, manifest validity, and Git state before mutation authority exists.
 
-When Change/Check are later needed, deliberately widen the operator project ceiling and principal grant after the repository manifest already supports them.
+When Change/Check are later needed, deliberately widen the Shadow project ceiling and principal grant after the repository manifest already supports them.
+
+This registration is the Shadow plane. It does not add a GitHub project mapping, an App installation, or an F008 grant.
 
 ---
 
-## 6. Grant the principal
+## 6. Grant the Shadow principal
 
 Example:
 
@@ -204,6 +286,8 @@ projects = { "example-project" = ["read", "change", "check"] }
 ```
 
 The principal ID comes from the trusted launcher through `VEDAOPS_AGENT_ID`.
+
+`chatgpt-shadow` is the Shadow principal. The table above is the Shadow registry shape. The F008 principal is `project-steward` in `/etc/vedaops-github/policy.toml`, and its grants use the separate shape in section 16. Grants are not copied from one file to the other.
 
 Do not treat a model name, chat role, ticket, branch name, or prose statement as a mechanical grant.
 
@@ -276,9 +360,9 @@ If a project has no meaningful configured check yet, report **no configured chec
 
 ---
 
-## 9. Read-only onboarding verification
+## 9. Read-only Shadow onboarding verification
 
-Before enabling mutation, verify the project from the client that will actually use Shadow.
+This section verifies the Shadow plane. Before enabling mutation, verify the project from the client that will actually use Shadow.
 
 ### A. Verify the live controller
 
@@ -465,7 +549,9 @@ Core Shadow does **not** provide:
 - persistent application database administration;
 - project Product decisions.
 
-Those may exist elsewhere under separate authority. Their absence from Shadow is usually a boundary, not a missing onboarding step.
+Bounded pull-request collaboration, when the project needs it, is the F008 plane in the sections below. F008 can read a granted repository and can create a pull request, update its title or body, comment on it, and request reviewers. F008 still has no merge, no push, no review submission, and no Product acceptance. Widening Shadow does not turn those GitHub classes on.
+
+Absence of a capability from Shadow is a boundary. Add it on the F008 plane only when that plane is intended, using the F008 grant procedure below.
 
 ---
 
@@ -529,30 +615,189 @@ For a detached installed runtime, this can be expected. Verify the loaded packag
 
 ---
 
-## 16. Minimal onboarding checklist
+## 16. F008 operator policy
 
-Use this as the short operational path:
+F008 grants live in `/etc/vedaops-github/policy.toml`, outside every project root it names. The repository schema example is [`config/github-collaboration.toml.example`](../config/github-collaboration.toml.example). The live file already contains the provider pin, the journal, the `enabled` flag, and one principal. Per-project onboarding adds a project mapping and a grant. It leaves that surrounding policy in place.
 
-1. Confirm the canonical repository root and current Git state.
-2. Create/verify `.vedaops/project.toml` with next-generation capabilities.
-3. Identify useful authority/current context files.
-4. Configure repository-local Git author identity if Shadow will commit.
-5. Add the project to the external operator policy.
-6. Grant the intended principal, preferably `read` first for a new onboarding.
-7. Configure only real checks the project actually needs.
-8. From the real Shadow client, inspect `vedaops_server_info`.
-9. Verify registration/effective authority with `projects_list` / `project_get`.
-10. Read approved context.
-11. Inspect exact Git status/HEAD.
-12. If authorized, enable `change/check` and verify the effective intersection again.
-13. Let the first genuine project task exercise Change/Check; do not manufacture pointless mutations.
-14. Keep push, deployment, provider spend, and other external effects separately authorized.
+The live policy supports multiple project mappings and multiple grants under one principal.
+
+Project mapping:
+
+```toml
+[[projects]]
+id = "example-project"
+root = "/home/chaz/projects/vedaops/example-project"
+github_owner = "St3nch"
+github_repo = "example-project"
+```
+
+`id` is the VedaOps project id. When both planes name the project, use the same id as `.vedaops/project.toml` and the Shadow registration.
+
+`root` is the absolute path the operator declares for that checkout. F008 stores the string as provenance and uses it as a lexical boundary: the policy file, the App private key, the provider executable, and the journal must sit outside every declared project root. F008 does not stat, own, or traverse the checkout. Local reads and edits stay with Shadow and the development user. `ProtectHome=yes` stays on the F008 service. Do not mount `/home` into the F008 sandbox, and do not `chown` the checkout to `vedaops-github`.
+
+`github_owner` and `github_repo` name the real GitHub repository. Each GitHub repository belongs to only one F008 project. Project ids are unique.
+
+The principal remains the single existing entry. The block below is that entry. Add grants beneath it. Pasting a second copy makes the policy invalid:
+
+```toml
+[[principals]]
+id = "project-steward"
+```
+
+Additional projects are additional grants under that same principal:
+
+```toml
+[[principals.grants]]
+project = "example-project"
+operations = [
+  "read",
+  "pr_create",
+  "pr_update_title",
+  "pr_update_body",
+  "pr_comment",
+  "pr_request_reviewers",
+]
+```
+
+The parser requires principal ids to be unique. A second `[[principals]]` table with `id = "project-steward"` makes the policy invalid. The parser also permits only one grant per principal/project pair. To change what an existing project may do, edit that project's existing grant. A second `[[principals.grants]]` for the same project is invalid.
+
+A normal collaboration grant is the six classes above: read, pull-request creation, title update, body update, timeline comment, and reviewer request. Merge and push are not operation classes.
+
+A read-only grant is valid, and it is the appropriate grant for a completed, archival, or observation-only project. For that project the one grant is:
+
+```toml
+[[principals.grants]]
+project = "example-project"
+operations = ["read"]
+```
+
+That list is the whole grant. It is not appended beside the six-class list. Choose one operation list on purpose. Active pull-request collaboration uses the six classes when that authority has been authorized. Observation uses `["read"]`.
+
+`project-steward` is the principal named by `VEDAOPS_GITHUB_PRINCIPAL` on the VedaOps GitHub launcher. It is a different principal from `chatgpt-shadow`.
+
+Repository files, including `.vedaops/project.toml`, are not an F008 grant. Shadow's project map is not an F008 grant. Installing the VedaOps Steward GitHub App on the repository is not an F008 grant. The installation lets the installation token reach that selected repository. The grant in this file is what `project-steward` may ask F008 to do.
 
 ---
 
-## 17. Fresh-session verification prompt
+## 17. New project onboarding
 
-A useful verification request for a newly onboarded project is:
+Use this sequence for a repository that is missing the planes you intend to use. Stop after the last plane that is in scope.
+
+1. Establish and inspect the real repository and its Git state. Record the canonical root, current branch, HEAD, and whether the worktree is clean. When GitHub collaboration is in scope, confirm `github_owner` and `github_repo` from the real GitHub repository.
+2. Create or verify `.vedaops/project.toml` as in section 3. The manifest narrows what the repository can support. It grants nothing by itself.
+3. When Shadow will commit, set a repository-local Git author identity as in section 4.
+4. Select context files as in section 7. Keep the list to orientation documents.
+5. Add the project to the Shadow operator policy identified by `vedaops_server_info`, as in section 5.
+6. Grant `chatgpt-shadow` `read` first when practical, as in section 6.
+7. Configure only real checks, as in section 8. When the project has no meaningful check, leave the check list empty and say so.
+8. Verify the project through the live Shadow client, as in section 9. Record principal, runtime, policy, effective authority, context, and exact Git state.
+9. When Change and Check are authorized, widen the Shadow project ceiling and the `chatgpt-shadow` grant, then verify the effective intersection again, as in section 10. Leave the project at `read` when mutation is not authorized.
+10. When GitHub collaboration is needed, add the repository to the existing VedaOps Steward GitHub App installation as a selected repository. Keep the installation on selected repositories, and add this repository only. This step creates credential reachability. It does not write an F008 grant.
+11. Add the project mapping to `/etc/vedaops-github/policy.toml` as in section 16. Leave the provider pin, journal, `enabled` flag, and the existing `project-steward` principal id in place.
+12. Add one grant under that existing principal. Choose `operations = ["read"]` or the normal pull-request collaboration list on purpose.
+13. Validate the F008 policy, then restart only `vedaops-github`, as in section 19.
+14. Verify from the real VedaOps GitHub MCP client with the read-only checks in section 19.
+15. Let genuine later project work exercise Shadow writes and F008 writes. Onboarding does not require a manufactured file edit or a manufactured pull request.
+
+Push, merge, Product acceptance, deployment, provider spend, release, and repository administration remain separate authorizations after this sequence.
+
+---
+
+## 18. Existing project onboarding
+
+Onboarding an existing project reconciles what is missing. Inventory the current planes, then add only the absent piece. Keep a correct Shadow manifest, a correct Shadow policy entry, a correct F008 mapping, and a correct grant.
+
+Inventory:
+
+- Shadow manifest: `.vedaops/project.toml` present, next-generation capabilities, and the intended mutability.
+- Shadow policy: project id, canonical root, ceiling, context files, checks, and the `chatgpt-shadow` grant.
+- Live Shadow view: `project_get` effective capabilities match that intent.
+- App reachability: whether this repository is one of the selected repositories on the existing VedaOps Steward GitHub App installation.
+- F008 policy: one `[[projects]]` entry for this id and `owner/repo`, and one `[[principals.grants]]` under `project-steward`.
+- Checkout ownership: the development user owns the working tree.
+- Project posture: active collaboration, or completed, archival, or observation-only.
+
+Then apply the matching case.
+
+**Already in Shadow, absent from F008.** Keep the Shadow manifest and Shadow policy. When the App installation does not yet include the repository, add it as a selected repository. Then add the F008 project mapping and one grant, validate, restart only `vedaops-github`, and run the F008 read-only verification.
+
+**The App already reaches the repository, and F008 policy has no mapping or grant.** Add only the F008 mapping and one grant. Leave the App installation and the Shadow registration as they are.
+
+**F008 policy already maps the project, and the App is not installed on that repository.** Add selected-repository installation access for that repository. Leave unrelated repositories unchanged, and leave the App on selected repositories. Keep the existing mapping and grant when they already match the intended operations.
+
+**A historical repository is not in Shadow yet.** Perform the missing Shadow steps from section 17: manifest, local Git identity when Shadow will commit, context files, Shadow policy, `read` first, real checks, and live Shadow verification. Widen Shadow only when that authority is authorized. An older repository has Shadow coverage only after those steps exist.
+
+**The project is completed, archival, or observation-only.** Use an F008 grant of `operations = ["read"]`. When a broader grant is already present and observation is now the remaining need, edit that existing grant down to `["read"]` as a deliberate operator change. A second grant for the same project is invalid. Keep Shadow at `read` when the repository should stay read-only, and align the manifest and the Shadow ceiling with that choice.
+
+**Both intended planes already match.** Verify them. Recreating an entry that is already correct adds nothing.
+
+A Shadow registration leaves F008 unchanged. An F008 grant leaves Shadow unchanged. Add each plane only when that plane is intended.
+
+---
+
+## 19. Validate, reload, and verify F008
+
+Validate the live policy as `vedaops-github` before any restart. On the accepted live installation:
+
+```bash
+sudo -u vedaops-github \
+  /usr/local/bin/vedaops-github validate-policy \
+  --policy /etc/vedaops-github/policy.toml
+```
+
+When validation succeeds, restart only the VedaOps GitHub user service so that process loads the new policy:
+
+```bash
+systemctl --user restart vedaops-github.service
+```
+
+The running process keeps the policy it loaded at start. The restart above is what loads the edited file, and it restarts `vedaops-github` only. An F008 policy change is not a reason to restart Shadow. When validation fails, correct the policy and validate again before restarting.
+
+After the reload, verify from the real VedaOps GitHub MCP client with reads:
+
+- `github_server_info` — `enabled` is true, `principal_id` is `project-steward`, and the provider release and commit match the pinned provider in [`github-collaboration.md`](github-collaboration.md). `shadow_coupled` is false.
+- `github_identity_get` — call it with the project's id and `owner/repo`. A successful read confirms that pair is granted. Report the configured App id, installation id, and `provider_login` as separate facts, and report the provider release and commit returned with that identity. `github_identity_get` may report authenticated-user lookup unavailable (`authenticated_user_lookup_unavailable`; an installation token may have no user). That limitation is expected for an installation token. Report it. Onboarding can still succeed with that limitation. The configured App id, installation id, and `provider_login` do not identify which actor authenticated a native request.
+- `github_commit_get` — pass the repository's default or published branch as `ref` and record the live SHA. The result comes from GitHub. A local remote-tracking ref is a different fact.
+- `github_actions_list` — use this when workflow, run, or job visibility matters for that repository. The accepted methods list workflows, runs, and jobs.
+
+A later native pull-request write, made because the project actually needs one, can establish the visible bot actor. That actor is still not Product acceptance. Product acceptance remains a human decision.
+
+Onboarding verification stops at these reads. A smoke write, smoke comment, or smoke reviewer request is not the proof. The one-time connector tracer in [`github-collaboration.md`](github-collaboration.md) remains a separate CHAZ-designated check.
+
+A repository with no F008 grant fails closed before a provider call. That denial is the correct result for a project that was left off the F008 plane.
+
+---
+
+## 20. Minimal onboarding checklist
+
+Use this as the short path across both planes. Skip steps 13–16 when the project is Shadow-only.
+
+1. Confirm the canonical repository root, the GitHub `owner/repo` when collaboration is in scope, and the current Git state.
+2. Create or verify `.vedaops/project.toml` with next-generation capabilities.
+3. Identify useful authority and current context files.
+4. Configure repository-local Git author identity if Shadow will commit.
+5. Add the project to the external Shadow operator policy, or keep the existing Shadow entry when it is already correct.
+6. Grant `chatgpt-shadow`, preferably `read` first for a new onboarding.
+7. Configure only real checks the project actually needs.
+8. From the real Shadow client, inspect `vedaops_server_info`.
+9. Verify registration and effective authority with `projects_list` / `project_get`.
+10. Read the approved context.
+11. Inspect exact Git status and HEAD.
+12. If authorized, enable Shadow `change` / `check` and verify the effective intersection again.
+13. If GitHub collaboration is intended, add the repository to the existing VedaOps Steward GitHub App as a selected repository when it is not already selected.
+14. If GitHub collaboration is intended, add the F008 project mapping and one grant under the existing `project-steward` principal. Use `["read"]` for an observation-only project.
+15. Validate `/etc/vedaops-github/policy.toml`, then restart only `vedaops-github`.
+16. From the real VedaOps GitHub client, read `github_server_info`, `github_identity_get`, and `github_commit_get` for the published branch.
+17. Let the first genuine project task exercise writes. Do not manufacture a smoke mutation on either plane.
+18. Keep push, merge, Product acceptance, deployment, provider spend, release, and repository administration separately authorized.
+
+---
+
+## 21. Fresh-session verification prompts
+
+Use the prompt that matches the plane just onboarded. Use both when both planes were in scope.
+
+### Shadow onboarding verification
 
 ```text
 Verify the newly onboarded "<project-id>" project through VedaOps MCP Shadow.
@@ -570,24 +815,54 @@ runtime configuration, or external systems.
 7. Do not broaden permissions or perform a smoke mutation.
 ```
 
-After read-only verification succeeds, capability widening should be a separate deliberate operator action.
+### VedaOps GitHub / F008 onboarding verification
+
+```text
+Verify the "<project-id>" project through VedaOps GitHub / F008.
+
+This is read-only verification. Do not change policy, restart services,
+edit GitHub objects, or perform a smoke write.
+
+1. Inspect github_server_info.
+2. Confirm collaboration is enabled and the principal is project-steward.
+3. Confirm the exact project and owner/repo mapping through an authorized read.
+4. Report the App id, installation id, configured provider login, and the
+   provider release and commit.
+5. Read the live default or published branch SHA with github_commit_get.
+6. Report granted-visible behavior and limitations, including an unavailable
+   authenticated-user lookup when github_identity_get reports one.
+7. Do not perform a smoke write, comment, reviewer request, or pull request.
+```
+
+After read-only verification succeeds, widening either plane is a separate deliberate operator action.
 
 ---
 
-## 18. Reality check
+## 22. Reality check
 
-A successful onboarding means:
+Success means the project is correctly represented on each authority plane the onboarding was intended to include.
+
+For VedaOps MCP Shadow, that means:
 
 - the right repository is registered;
-- the right principal can see only what it should;
+- `chatgpt-shadow` can see only the capabilities it was granted;
 - context is reconstructable;
 - effective authority is explicit;
 - Git state is observable;
 - Change and Check work only when deliberately granted;
-- failures preserve uncertainty instead of guessing;
-- external effects remain separate.
+- failures preserve uncertainty.
 
-It does **not** mean every VedaOps capability belongs inside MCP.
+For VedaOps GitHub, that means:
 
-The boring version is the good version: small surface, explicit authority, exact subjects, native Git semantics, and no magic.
+- the VedaOps Steward App installation reaches that selected repository;
+- one F008 mapping names the real `owner/repo` and a declared root;
+- one grant under `project-steward` lists only the intended operation classes;
+- a fresh client can read server identity, the configured App facts, and the live published-branch SHA;
+- onboarding stood on those reads.
+
+A project intended for one plane is onboarded when that plane is correct. The other plane stays absent until someone deliberately adds it.
+
+Push, merge, Product acceptance, deployment, provider spend, release authority, and repository administration remain outside onboarding.
+
+The boring version is the good version: two small surfaces, explicit authority on each, exact subjects, native Git and GitHub semantics, and no copied lifecycle state.
 

@@ -94,6 +94,8 @@ Each project entry maps one VedaOps project id to one GitHub `owner/repo`. Its `
 
 Standing collaboration authority, after a later Product acceptance, is an operator grant of those classes to the Steward principal. The software does not record a Product decision, and it does not treat a pull request, review, check, or merge as acceptance.
 
+Routine per-project onboarding and existing-project migration are documented in [`project-onboarding.md`](project-onboarding.md). Use that guide to register a repository with VedaOps MCP Shadow and, when GitHub collaboration is intended, to add its F008 project mapping and `project-steward` grant. App installation, the provider pin, and this connector's live verification remain the procedures in this runbook.
+
 ## Evidence and recovery
 
 Before a GitHub write, F008 fsyncs a started journal record under the operator journal directory with `effect_dispatched` true. The record includes the operation id, time, principal, project, repository, kind, target, expected source SHA, intention digest, authorization basis, and provider release/commit. The project path in that record is the operator-declared path, with `filesystem_verified` false. Body evidence is a SHA-256 plus character and byte lengths. The record does not store pull request or comment body text, and it does not store the private key. Every required journal state for an accepted operation, including a terminal record with a bounded diagnostic, must fit in 8192 encoded bytes. Identity fields are not truncated to meet that ceiling.

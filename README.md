@@ -15,7 +15,7 @@ The core Product has four responsibilities:
 
 The MCP is not a general shell, workflow database, GitHub replacement, project Product authority, autonomous manager, or institutional-memory system.
 
-For project onboarding and Shadow registration, see [`docs/project-onboarding.md`](docs/project-onboarding.md).
+For project onboarding across VedaOps MCP Shadow and optional F008 GitHub collaboration, see [`docs/project-onboarding.md`](docs/project-onboarding.md).
 
 For this repository's Workflow v1 pilot profile and verification route, see [`docs/engineering-profile.md`](docs/engineering-profile.md).
 

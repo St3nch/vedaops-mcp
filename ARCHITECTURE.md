@@ -171,11 +171,13 @@ No arbitrary SQL, persistent role administration, backup/restore, reset, or pers
 
 ## 11. External coding agents
 
-Governed Grok Build or other external coding-agent control remains worthwhile future capability.
+Legacy direct Grok control, and direct orchestration of an external coding agent, are outside current Shadow architecture. They are not backlog.
 
-It should use a separately deployed agent runner with provider-specific implementation behind a small VedaOps-facing contract.
+The old Grok-control tool family is intentionally retired.
 
-Potential earned semantics are start bounded run, status, result, cancel, and resume only if subject and authority preservation can be proven.
+Manual use of a designated coding or review model remains possible outside this controller, under normal VedaOps governance.
+
+No generic agent-runner capability is proposed here. No implementation work is commissioned.
 
 The controller should not know Grok marketplace internals, user configuration layers, or Observatory-specific dispatcher conventions.
 

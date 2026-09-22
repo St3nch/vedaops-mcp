@@ -66,6 +66,7 @@ from vedaops_mcp.github_collab.provider import (
     parse_write,
     pull_number_from_url,
 )
+from vedaops_mcp.github_collab.sanitize import scrub_payload, scrub_text
 from vedaops_mcp.github_collab.server import build_github_server, tool_catalog
 from vedaops_mcp.github_collab.text_contract import title_is_stable, visible_content
 from vedaops_mcp.server import TOOL_CATALOG, build_server
@@ -77,6 +78,19 @@ BASE = "c" * 40
 CANARY = "ghp_CANARYTOKENVALUE1234567890"
 PEM_CANARY = "CANARYSECRETVALUE1234567890"
 PRINCIPAL = "project-steward"
+_LEGACY_GHS = "ghs_LEGACYCANARYVALUE1234567890"
+_MODERN_GHS = (
+    "ghs_99_"
+    "eyJCANARYheader."
+    "eyJCANARYpayload-part_two."
+    "CANARYsignature-end"
+)
+_PREFIXED_MODERN_GHS = (
+    "ghs_CANARYAPPID1234567890_"
+    "eyJCANARYheader."
+    "eyJCANARYpayload-part_two."
+    "CANARYsignature-end"
+)
 
 
 class FakeGitHub:
@@ -1488,6 +1502,144 @@ def _body_journal(policy) -> str:
     return "\n".join(
         path.read_text(encoding="utf-8") for path in policy.journal_directory.glob("*.json")
     )
+
+
+def test_installation_tokens_are_redacted_without_eating_prose():
+    legacy = _LEGACY_GHS
+    modern = _MODERN_GHS
+    prefixed = _PREFIXED_MODERN_GHS
+    suffix = "CANARYsignature-end"
+    header = "eyJCANARYheader"
+    payload = "eyJCANARYpayload-part_two"
+
+    cleaned, redacted = scrub_text(f"keep {legacy} keep")
+    assert redacted is True
+    assert cleaned == "keep *** keep"
+
+    cleaned, redacted = scrub_text(f"keep {modern} keep")
+    assert redacted is True
+    assert cleaned == "keep *** keep"
+    assert suffix not in cleaned
+    assert header not in cleaned
+    assert payload not in cleaned
+
+    cleaned, redacted = scrub_text(f"keep {prefixed} keep")
+    assert redacted is True
+    assert cleaned == "keep *** keep"
+    assert prefixed.split("_", 1)[1] not in cleaned
+    assert suffix not in cleaned
+
+    diagnostic = f"provider read failed before {modern}. retry later with status=401"
+    cleaned, redacted = scrub_text(diagnostic)
+    assert redacted is True
+    assert cleaned == "provider read failed before ***. retry later with status=401"
+    assert modern not in cleaned
+    assert suffix not in cleaned
+
+    prose = "the label ghs_short remains in the note"
+    assert scrub_text(prose) == (prose, False)
+    short_legacy = "ghs_" + ("A" * 19)
+    assert scrub_text(f"keep {short_legacy} keep") == (f"keep {short_legacy} keep", False)
+    exact_legacy = "ghs_" + ("B" * 20)
+    assert scrub_text(f"keep {exact_legacy}. next") == ("keep ***. next", True)
+
+    ghp = "ghp_CANARYTOKENVALUE1234567890"
+    gho = "gho_CANARYTOKENVALUE1234567890"
+    ghu = "ghu_CANARYTOKENVALUE1234567890"
+    pat = "github_pat_CANARY_TOKEN_VALUE_1234567890"
+    app = "github_app_CANARYTOKENVALUE1234567890"
+    bearer = "Bearer CANARY.TOKEN-VALUE_123456"
+    pem = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "CANARYSECRETVALUE1234567890\n"
+        "-----END PRIVATE KEY-----"
+    )
+    mixed = (
+        f"A {legacy} B {modern} C {prefixed} D {ghp} E {gho} "
+        f"F {ghu} G {pat} H {app} I {bearer} J {pem} K"
+    )
+    cleaned, redacted = scrub_text(mixed)
+    assert redacted is True
+    assert cleaned == "A *** B *** C *** D *** E *** F *** G *** H *** I *** J *** K"
+    rendered = cleaned
+    for secret in (
+        legacy,
+        modern,
+        prefixed,
+        suffix,
+        header,
+        payload,
+        ghp,
+        gho,
+        ghu,
+        pat,
+        app,
+        bearer,
+        pem,
+        "CANARYSECRETVALUE1234567890",
+    ):
+        assert secret not in rendered
+
+    observed = {
+        "outcome": "uncertain",
+        "detail": diagnostic,
+        "nested": ["keep", f"see {prefixed} please"],
+        "token": modern,
+    }
+    cleaned_payload, payload_redacted = scrub_payload(observed)
+    dumped = json.dumps(cleaned_payload)
+    assert payload_redacted is True
+    assert cleaned_payload["outcome"] == "uncertain"
+    assert cleaned_payload["detail"] == (
+        "provider read failed before ***. retry later with status=401"
+    )
+    assert cleaned_payload["nested"] == ["keep", "see *** please"]
+    assert "token" not in cleaned_payload
+    assert modern not in dumped
+    assert prefixed not in dumped
+    assert suffix not in dumped
+    assert header not in dumped
+
+
+def test_journal_and_result_scrub_the_entire_installation_token(tmp_path: Path):
+    policy, _path = _policy(tmp_path)
+    provider = FakeGitHub(policy.journal_directory)
+    provider._add_pull(
+        "example-org",
+        "alpha",
+        title="Candidate",
+        body="old",
+        head="feature",
+        base="main",
+        draft=False,
+    )
+    legacy = _LEGACY_GHS
+    modern = _MODERN_GHS
+    prefixed = _PREFIXED_MODERN_GHS
+    detail = f"provider read failed before {legacy} and {modern} and {prefixed}. retry later"
+
+    def _lose(*_args, **_kwargs):
+        raise ProviderCallError(detail, effect_uncertain=True)
+
+    provider.update_pull_request_body = _lose  # type: ignore[method-assign]
+    result = update_pull_request_body(
+        policy,
+        provider,
+        principal_id=PRINCIPAL,
+        project_id="alpha",
+        github_repository="example-org/alpha",
+        number=7,
+        body="ordinary note",
+    )
+    rendered = json.dumps(result)
+    journal = _body_journal(policy)
+    expected = "provider read failed before *** and *** and ***. retry later"
+    assert result["outcome"] == "uncertain"
+    assert result["uncertainty"]["reason"] == expected
+    assert expected in journal
+    for secret in (legacy, modern, prefixed, "CANARYsignature-end", "eyJCANARYheader"):
+        assert secret not in rendered
+        assert secret not in journal
 
 
 def test_body_evidence_omits_plaintext_and_fits_the_record(tmp_path: Path):

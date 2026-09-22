@@ -22,17 +22,20 @@ _SECRET_KEYS = frozenset(
         "token",
     }
 )
+# Installation tokens are opaque and variable-length. Legacy bodies are
+# alphanumeric. Stateless tokens are ghs_<app>_<jwt> and also contain
+# underscores, hyphens, and dots. A dot counts only when another token
+# character follows, so a sentence period after the secret stays put.
+_GHS_TOKEN = r"ghs_(?:[A-Za-z0-9_-]|\.(?=[A-Za-z0-9_-])){20,}"
 _SECRET_TEXT = re.compile(
-    r"(?:"
-    r"ghp_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|gho_[A-Za-z0-9]{20,}"
-    r"|ghs_[A-Za-z0-9]{20,}"
-    r"|ghu_[A-Za-z0-9]{20,}"
-    r"|github_app_[A-Za-z0-9_]{20,}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
-    r"|Bearer [A-Za-z0-9._\-]{8,}"
-    r")"
+    rf"(?:ghp_[A-Za-z0-9]{{20,}}"
+    rf"|github_pat_[A-Za-z0-9_]{{20,}}"
+    rf"|gho_[A-Za-z0-9]{{20,}}"
+    rf"|{_GHS_TOKEN}"
+    rf"|ghu_[A-Za-z0-9]{{20,}}"
+    rf"|github_app_[A-Za-z0-9_]{{20,}}"
+    rf"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+    rf"|Bearer [A-Za-z0-9._\-]{{8,}})"
 )
 
 

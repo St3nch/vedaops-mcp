@@ -313,6 +313,8 @@ context_files = ["README.md", "AGENTS.md", "CURRENT.md"]
 
 Do not stuff the context list with the whole repository. Context files are orientation material, not a substitute for bounded file reads and search.
 
+A successful `project_context_get` returns those documents under a byte budget. It can still omit part of a document. Section 9.C is the intake check for returned byte counts, per-document truncation, and aggregate truncation.
+
 ---
 
 ## 8. Configure checks only when the project has real checks
@@ -358,6 +360,8 @@ Important:
 
 If a project has no meaningful configured check yet, report **no configured checks**. Do not invent a ceremonial check just to make onboarding look complete.
 
+A legacy executable task is not yet a Shadow check. Grant `check` on an existing project only after the section 18 review. A migrated check also passes that section's substrate checklist.
+
 ---
 
 ## 9. Read-only Shadow onboarding verification
@@ -399,7 +403,17 @@ Confirm:
 
 ### C. Read approved context
 
-Use `project_context_get` and confirm each configured context document is accessible and not unexpectedly truncated.
+Use `project_context_get` for the configured context files.
+
+A successful call means the controller returned a bounded result. It does not mean every authority document arrived complete. Before treating authority intake as complete, inspect:
+
+- **Returned byte counts.** Compare the result's `returned_bytes` with `total_bytes`, and each document's `bytes_returned` with `bytes_total`.
+- **Per-document truncation.** Read each document's `truncated` flag.
+- **Aggregate truncation.** Read the result's `truncated` flag. It is true when any configured document was truncated, including a later document cut short because the aggregate budget was already spent.
+
+When a document is truncated, read the missing portion with `project_file_read` before claiming that document was taken in. Pass that document's path, set `offset_bytes` to the number of bytes already returned, and keep `max_bytes` bounded. Advance `offset_bytes` by each response's `bytes_returned` until that read reports `truncated = false`.
+
+A document that was never listed in `context_files` is outside this result. Read it with `project_file_read` when the onboarding relies on it.
 
 ### D. Inspect Git
 
@@ -414,6 +428,22 @@ Use `project_git_status` and establish:
 Do not mutate merely to prove that mutation exists.
 
 A real later change is better evidence than a fake smoke edit.
+
+### E. Keep evidence states separate
+
+Use this distinction on both planes, and when recording the historical audit in section 18. These are separate facts. Establishing one leaves the others still to be established:
+
+1. **Source implementation exists.** A source revision contains the capability.
+2. **The installed artifact contains it.** The deployed package or file tree includes that implementation.
+3. **The running instance exposes it.** The live process serves it.
+4. **The client catalog advertises it.** A client's tool list names it.
+5. **Project configuration enables it.** The manifest, operator policy, or project tooling turns it on for that project.
+6. **The principal is granted it.** The effective grant includes it.
+7. **Recorded execution proves use.** A journal, log, commit, or other record shows that it ran.
+8. **Live commissioning proves operational use.** A current exercise shows it operating on the intended subject.
+9. **Product acceptance authorizes or accepts it.** CHAZ has accepted that capability or that use.
+
+A parser failure establishes that the parser did not accept the input. A catalog entry establishes that the catalog lists the name. Neither one, by itself, is proof that a capability is absent, that it was used, or that a principal is authorized to use it.
 
 ---
 
@@ -431,7 +461,7 @@ For Change, normally verify:
 - project is active;
 - requested operation satisfies its own restrictions.
 
-Check similarly requires `check` through the capability intersection **and** a configured approved check ID.
+Check similarly requires `check` through the capability intersection **and** a configured approved check ID. On an existing project, complete the section 18 check-authority review before adding that grant. A migrated check also passes the substrate checklist there.
 
 After policy changes, re-run `vedaops_server_info` / `project_get` and verify the effective result. Do not infer success from the policy file alone.
 
@@ -689,9 +719,9 @@ Use this sequence for a repository that is missing the planes you intend to use.
 4. Select context files as in section 7. Keep the list to orientation documents.
 5. Add the project to the Shadow operator policy identified by `vedaops_server_info`, as in section 5.
 6. Grant `chatgpt-shadow` `read` first when practical, as in section 6.
-7. Configure only real checks, as in section 8. When the project has no meaningful check, leave the check list empty and say so.
-8. Verify the project through the live Shadow client, as in section 9. Record principal, runtime, policy, effective authority, context, and exact Git state.
-9. When Change and Check are authorized, widen the Shadow project ceiling and the `chatgpt-shadow` grant, then verify the effective intersection again, as in section 10. Leave the project at `read` when mutation is not authorized.
+7. Configure only real checks, as in section 8. When the project has no meaningful check, leave the check list empty and say so. When migrating legacy behavior, finish the section 18 audit and check-authority review before adding a check.
+8. Verify the project through the live Shadow client, as in section 9. Record principal, runtime, policy, effective authority, context with its truncation inspection, and exact Git state.
+9. When Change and Check are authorized, widen the Shadow project ceiling and the `chatgpt-shadow` grant, then verify the effective intersection again, as in section 10. The section 18 check-authority review is part of authorizing `check` on an existing project. Leave the project at `read` when mutation is not authorized.
 10. When GitHub collaboration is needed, add the repository to the existing VedaOps Steward GitHub App installation as a selected repository. Keep the installation on selected repositories, and add this repository only. This step creates credential reachability. It does not write an F008 grant.
 11. Add the project mapping to `/etc/vedaops-github/policy.toml` as in section 16. Leave the provider pin, journal, `enabled` flag, and the existing `project-steward` principal id in place.
 12. Add one grant under that existing principal. Choose `operations = ["read"]` or the normal pull-request collaboration list on purpose.
@@ -725,7 +755,7 @@ Then apply the matching case.
 
 **F008 policy already maps the project, and the App is not installed on that repository.** Add selected-repository installation access for that repository. Leave unrelated repositories unchanged, and leave the App on selected repositories. Keep the existing mapping and grant when they already match the intended operations.
 
-**A historical repository is not in Shadow yet.** Perform the missing Shadow steps from section 17: manifest, local Git identity when Shadow will commit, context files, Shadow policy, `read` first, real checks, and live Shadow verification. Widen Shadow only when that authority is authorized. An older repository has Shadow coverage only after those steps exist.
+**A historical repository is not in Shadow yet.** Perform the missing Shadow steps from section 17: manifest, local Git identity when Shadow will commit, context files, Shadow policy, `read` first, real checks, and live Shadow verification. Widen Shadow only when that authority is authorized. An older repository has Shadow coverage only after those steps exist. When that repository actually used legacy MCP tasks, adapters, domain bridges, project-specific operational tooling, or controller automation, complete the historical capability audit below before those behaviors are translated into Shadow capabilities or checks. A repository with none of that project-specific behavior continues with the ordinary missing-Shadow steps.
 
 **The project is completed, archival, or observation-only.** Use an F008 grant of `operations = ["read"]`. When a broader grant is already present and observation is now the remaining need, edit that existing grant down to `["read"]` as a deliberate operator change. A second grant for the same project is invalid. Keep Shadow at `read` when the repository should stay read-only, and align the manifest and the Shadow ceiling with that choice.
 
@@ -733,17 +763,83 @@ Then apply the matching case.
 
 A Shadow registration leaves F008 unchanged. An F008 grant leaves Shadow unchanged. Add each plane only when that plane is intended.
 
+### Historical capability audit
+
+Run this audit when the project previously had legacy project-specific behavior: MCP tasks, adapters, domain bridges, operational tooling, or controller automation. Write one compact entry per material capability into the migration record already in use. This step adds no audit directory and no new canonical document.
+
+For each material capability, record:
+
+| Field | What to record |
+| --- | --- |
+| Capability or task | The legacy task, adapter, domain bridge, operational tool, or controller automation. |
+| Evidence of actual use versus mere availability | Which evidence state from section 9.E shows use, and which shows only that the capability existed or was listed. |
+| Side-effect class | The class the evidence supports: read-only inspection, local repository mutation, test execution, external or hosted write, credential or secret use, persistent runtime change, provider spend, or another class actually observed. |
+| Current architectural destination | Shadow `read`, `change`, or `check`; an F008 operation class; operator-run validation; or no surface on either plane. |
+| Disposition | Carry forward, narrow, leave outside this onboarding, or intentional retirement. |
+| Unresolved evidence | What is still unknown or conflicting. |
+
+Translate a capability only after its row exists. A source file, a catalog name, or a configuration entry fills the availability side of the evidence row. Use and authority stay on their own evidence.
+
+Ordinary project-specific development configuration belongs in project/operator configuration under the common Shadow interface. Domain semantics may instead remain in the project's own API or service, or in another separately bounded semantic integration. Operational, provider, and persistent-runtime behavior may belong behind a separate service boundary. Historical migration does not create a separate generic MCP tool catalog for each project.
+
+### Check-authority review
+
+Before the operator grants Shadow `check` to an existing project, review that project's current governance:
+
+- **MCP-run tests.** Determine whether this project's repository tests are permitted to run through MCP, and which named checks are in that set.
+- **Committed subject and dirty tree.** Shadow checks the exact committed subject captured into the worker, as in section 13. Record whether the project's own rules still describe a dirty working tree, and keep those two subjects distinct.
+- **Duration and resources.** Record timeout, memory, and suite length. Large or many-minute validation stays operator-run.
+- **Operator-only and full-suite validation.** Name the suites that stay outside MCP, including a full suite reserved for the operator.
+- **Side effects behind task names.** Read what a legacy task executes. A test-shaped name can still write, deploy, spend, or touch shared state.
+
+Leave legacy executable tasks unregistered until this review names an operator-approved check. Copying a legacy argv into `[[projects.checks]]` is not that review.
+
+### Migrated-check substrate compatibility
+
+For each check this onboarding will migrate, confirm it fits the restricted worker:
+
+- **Environment variable and DSN names.** Compare the names the check reads with the names the selected substrate injects. A `postgres18` check receives `VEDAOPS_POSTGRES_URL` for the disposable database. A historical `DATABASE_URL`, a TCP DSN, or a name read from a project `.env` is a separate fact to resolve in the check.
+- **Unix socket versus TCP.** The PostgreSQL substrate is a Unix socket. A check that opens a TCP host and port needs a matching integration.
+- **Runtime and dependencies.** The argv's interpreter, packages, and tools are present in the selected `system` runtime or the already provisioned `project_venv`.
+- **Database-creation privileges.** When the check creates databases, roles, or extensions, confirm the disposable role can do that work.
+- **Cleanup.** The check removes what it creates, and it tolerates removal of the disposable subject when the worker finishes.
+- **Temporary versus persistent storage.** The check uses the disposable substrate. A persistent application database is a different operation. Onboarding does not create one.
+- **Forbidden host-resource assumptions.** The check does not need operator home, controller policy, controller credentials, an SSH agent, the Docker socket, another project's files, or unrestricted network.
+- **Docker fallback or other hidden host access.** The check has no Docker fallback, socket probe, or other path that reaches the host when the restricted path fails.
+
+Fix a mismatch in the project check or in its integration. The restricted worker stays restricted. Onboarding does not widen it to recover a legacy assumption.
+
+### Intentional retirement
+
+Record disposition **intentional retirement** when functionality is deliberately left behind. Name the capability and a short reason in the same audit notes. A later agent can then treat the absence as a finished decision. Absence with no disposition remains unfinished evidence.
+
+Legacy Grok-control and orchestration is one such retirement. Shadow has no Grok or external-agent control surface. This onboarding leaves that functionality retired.
+
+### One historical outcome: Observatory
+
+An independent legacy-to-Shadow review concluded that Observatory's current onboarding needed no new Shadow core capability. The pattern worth keeping is the one above: project-specific configuration under the common governed interface.
+
+Observatory was onboarded read-only, with `mutable = false`, `capabilities = ["read"]`, and no checks. Further change or check authority for Observatory is a later operator decision, made if real development resumes and the current need justifies the grant.
+
+That posture is Observatory's current scope. Another project uses the capability intersection its own work requires.
+
 ---
 
 ## 19. Validate, reload, and verify F008
 
-Validate the live policy as `vedaops-github` before any restart. On the accepted live installation:
+Validate the live policy as `vedaops-github` before any restart. On the accepted live installation, run the validator from that account's operations directory:
 
 ```bash
 sudo -u vedaops-github \
-  /usr/local/bin/vedaops-github validate-policy \
-  --policy /etc/vedaops-github/policy.toml
+  env HOME=/var/lib/vedaops-github/operations \
+  sh -c '
+    cd /var/lib/vedaops-github/operations
+    exec /usr/local/bin/vedaops-github validate-policy \
+      --policy /etc/vedaops-github/policy.toml
+  '
 ```
+
+The working directory matters because FastMCP/Pydantic probes `.env` in the caller's current directory. Invoking the validator from `/home/chaz` makes that probe run where the `vedaops-github` account intentionally cannot traverse, so validation fails before it reads the policy. `HOME` and the current directory above are the operations directory that account can use. Home-directory permissions and the service protections, including `ProtectHome=yes`, stay as they are.
 
 When validation succeeds, restart only the VedaOps GitHub user service so that process loads the new policy:
 
@@ -778,15 +874,15 @@ Use this as the short path across both planes. Skip steps 13–16 when the proje
 4. Configure repository-local Git author identity if Shadow will commit.
 5. Add the project to the external Shadow operator policy, or keep the existing Shadow entry when it is already correct.
 6. Grant `chatgpt-shadow`, preferably `read` first for a new onboarding.
-7. Configure only real checks the project actually needs.
+7. Configure only real checks the project actually needs. When legacy project-specific behavior existed, record the section 18 audit first. Before `check` on an existing project, complete that section's check-authority review, and run its substrate checklist for each migrated check.
 8. From the real Shadow client, inspect `vedaops_server_info`.
 9. Verify registration and effective authority with `projects_list` / `project_get`.
-10. Read the approved context.
+10. Read the approved context. Inspect returned byte counts, per-document truncation, and aggregate truncation. Read any missing portion with bounded `project_file_read` offsets before calling authority intake complete.
 11. Inspect exact Git status and HEAD.
-12. If authorized, enable Shadow `change` / `check` and verify the effective intersection again.
+12. If authorized, enable Shadow `change` / `check` and verify the effective intersection again. Grant `check` only after the section 18 review.
 13. If GitHub collaboration is intended, add the repository to the existing VedaOps Steward GitHub App as a selected repository when it is not already selected.
 14. If GitHub collaboration is intended, add the F008 project mapping and one grant under the existing `project-steward` principal. Use `["read"]` for an observation-only project.
-15. Validate `/etc/vedaops-github/policy.toml`, then restart only `vedaops-github`.
+15. Validate `/etc/vedaops-github/policy.toml` from the section 19 working directory, then restart only `vedaops-github`.
 16. From the real VedaOps GitHub client, read `github_server_info`, `github_identity_get`, and `github_commit_get` for the published branch.
 17. Let the first genuine project task exercise writes. Do not manufacture a smoke mutation on either plane.
 18. Keep push, merge, Product acceptance, deployment, provider spend, release, and repository administration separately authorized.
@@ -809,9 +905,15 @@ runtime configuration, or external systems.
 2. Confirm the project is registered and active.
 3. Report canonical root, workspace, manifest validity, declared/operator/
    effective capabilities, effective mutability, context files, and checks.
-4. Read the approved project context.
+4. Read the approved project context. Inspect returned byte counts,
+   per-document truncation, and aggregate truncation. When a document
+   is truncated, read the remainder with bounded project_file_read
+   offsets before treating authority intake as complete.
 5. Inspect Git status and HEAD.
-6. Report exact observations and uncertainty.
+6. Report exact observations and uncertainty. Keep source, installed
+   artifact, running instance, client catalog, project configuration,
+   principal grant, recorded use, live commissioning, and Product
+   acceptance as separate facts.
 7. Do not broaden permissions or perform a smoke mutation.
 ```
 
@@ -846,7 +948,7 @@ For VedaOps MCP Shadow, that means:
 
 - the right repository is registered;
 - `chatgpt-shadow` can see only the capabilities it was granted;
-- context is reconstructable;
+- context is reconstructable, with any truncated document completed through `project_file_read`;
 - effective authority is explicit;
 - Git state is observable;
 - Change and Check work only when deliberately granted;

@@ -71,7 +71,7 @@ GitHub owns pull requests, hosted reviews, GitHub checks, branch protections, ho
 
 VedaOps may integrate with GitHub, but it must preserve native GitHub identity rather than create a duplicate PR/review/release model.
 
-GitHub writes are external effects and require explicit authorization.
+GitHub writes are external effects and require explicit authorization. F008 is its own mechanical authority domain. A Shadow grant does not authorize a GitHub operation, and a project file cannot grant one.
 
 ## 7. Skills
 

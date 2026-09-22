@@ -1,0 +1,39 @@
+# Sandbox profile for the F008 stdio process.
+# This is not a listener and must not be enabled at boot.
+# Applying it on a host is provisioning and needs separate CHAZ authorization.
+#
+# The connector spawns the process as the F008 user, for example:
+#   systemd-run --uid=vedaops-github --pipe --collect --unit=vedaops-github-session \
+#     /usr/bin/vedaops-github stdio
+#
+# Do not point this unit at the Shadow user, Shadow environment, or Shadow policy.
+# ProtectHome=yes stays. This process does not mount operator homes or
+# VedaOps project worktrees. Project identity is the operator policy map
+# from a project id to one GitHub owner/repo.
+
+[Unit]
+Description=VedaOps F008 GitHub collaboration boundary
+Documentation=https://github.com/St3nch/vedaops-mcp/blob/main/docs/github-collaboration.md
+
+[Service]
+Type=simple
+User=vedaops-github
+Group=vedaops-github
+WorkingDirectory=/var/lib/vedaops-github/operations
+Environment=HOME=/var/lib/vedaops-github/operations
+Environment=PATH=/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=VEDAOPS_GITHUB_POLICY=/etc/vedaops-github/policy.toml
+Environment=VEDAOPS_GITHUB_PRINCIPAL=example-steward
+ExecStart=/usr/bin/vedaops-github stdio
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/vedaops-github/operations
+UMask=0077
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+# Intentionally no WantedBy. Do not systemctl enable this unit.

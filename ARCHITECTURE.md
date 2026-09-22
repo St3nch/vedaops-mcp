@@ -135,11 +135,9 @@ Push, merge publication, release, and deployment remain outside the default deve
 
 Use native GitHub concepts.
 
-Potential integration may read actual remote state, PR identity/head, checks, reviews, and protection state.
+F008 is a separate collaboration process from Shadow. It authorizes a principal, project, repository, and operation class; journals the call outside the project; and speaks to a pinned official GitHub MCP Server. Shadow grants do not authorize it. The first slice reads GitHub state and can create a pull request, update its title or body, add a conversation comment, and request reviewers. Push, merge, ref changes, file writes, workflow mutation, review submission, release, and deployment stay outside that slice.
 
-Writes such as PR creation, review submission, merge, or release are external effects requiring explicit authorization.
-
-Do not create VedaOps shadow objects for GitHub objects.
+Do not create VedaOps shadow objects for GitHub objects. The operator runbook is `docs/github-collaboration.md`.
 
 ## 10. PostgreSQL
 
